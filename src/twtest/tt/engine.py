@@ -52,10 +52,11 @@ class TTEngine(Engine):
         gguf_dir: str,
         tokenizer_path: str,
         mesh_shape: tuple[int, int] = (1, 4),
-        max_concurrency: int = 8,
+        max_concurrency: int = 1,
+        max_seq_len: int | None = None,
         chunked_prefill: bool = False,
         trace_region_bytes: int = 128 << 20,
-        use_trace: bool = False,
+        use_trace: bool = True,
     ):
         import ttnn
 
@@ -86,8 +87,28 @@ class TTEngine(Engine):
         # per-sequence tensor. Continuous batching needs that -- slots are
         # refilled independently, so sequences sit at different positions, and
         # the plain update_cache path writes one index for the whole batch.
+        # Default to the model's full context. The K/V cache is the only thing
+        # that grows with it -- 12 sparse-attention layers of
+        # (batch, 2 kv-heads, seq, 256) in bf16, replicated per device, which is
+        # 6.4 GB per sequence at 262144 -- and decode latency is flat in position
+        # (measured 496 ms at 4 and 501 ms at 65536), because the step is
+        # dominated by the MoE and DeltaNet and the attention budget is fixed at
+        # 2048. So long context costs memory, not time.
+        seq = max_seq_len if max_seq_len is not None else self.config.context_length
+        kv_bytes = 2 * max_concurrency * 2 * seq * self.config.head_dim * 2 * (
+            self.config.num_layers // 4
+        )
+        budget = 7 << 30  # what is left per device after 24.94 GB of weights
+        if kv_bytes > budget:
+            raise ValueError(
+                f"K/V cache for {max_concurrency} slots at {seq} tokens is "
+                f"{kv_bytes / 1e9:.1f} GB per device, over the ~{budget / 1e9:.0f} GB "
+                "left after weights. Lower max_concurrency or max_seq_len: the two "
+                "trade directly, and one slot at the full 262144 context fits."
+            )
         self.model = TTModel(
-            self.config, self.weights, self.host_store, self.mesh, traceable_kv=True
+            self.config, self.weights, self.host_store, self.mesh,
+            max_seq_len=seq, traceable_kv=True,
         )
         # Fused gate|up experts: one sparse_matmul instead of two, verified
         # token-for-token identical. Two runs per mode, 25 samples each:
@@ -127,35 +148,18 @@ class TTEngine(Engine):
                 "TTModel.prefill runs one sequence at a time"
             )
         self._chunked_prefill = False
-        # Trace replays a captured step with a single dispatch and is worth
-        # 2.05x at batch 1, 1.54x at 16 and 1.35x at 32 -- verified token-for-token
-        # against eager *through TTModel directly*. It is off here because the
-        # same decoder driven through this engine emits garbage (' Paris.' becomes
-        # '!!!!'), and the cause is not yet isolated. Excluded, each reproduced
-        # correctly standalone: reset_slot between replays, repeated post-capture
-        # allocation, max_seq_len 256 vs 4096, a 128 MB trace region, distinct
-        # per-slot tokens, the filler-token pattern in idle slots, the live slot's
-        # index, lazily-loaded weights, the LM head's first allocation landing
-        # after capture, and capturing/replaying on a worker thread while the mesh
-        # was opened on the main one.
+        # Trace replays a captured step with a single dispatch, and for a single
+        # user that is the whole game: 2.02x at batch 1 (516 -> 255 ms), 1.52x at
+        # 16, 1.29x at 32, ~1.01x by 48 where each op carries enough device work
+        # to hide the dispatch cost. Verified token-for-token against eager.
         #
-        # What is known, from differential instrumentation inside the engine:
-        #   * every bound input the trace reads (embed, ngram, rope_cos, rope_sin,
-        #     cur_pos) is bit-identical to what an eager step writes -- maxdiff 0.0
-        #     on all five, every step. The inputs are not the problem.
-        #   * interleaving a full eager model.step -- before *or* after the replay,
-        #     on an unrelated shadow state -- makes the output correct.
-        #   * a bare synchronize, a read-back of the output, a tiny eager op, a
-        #     large allocate-and-free, and blocking=True all leave it corrupted.
-        #
-        # So it is not synchronisation, not the inputs, and not allocation size:
-        # something a full step re-establishes in device state is missing on
-        # replay. The workaround costs an entire eager step -- exactly what the
-        # trace exists to avoid -- so it is a diagnostic, not a fix.
-        #
-        # Correct and slower beats fast and wrong, so it stays opt-in until a
-        # failing reproduction exists outside the engine. Turning it on without
-        # that reproduction serves corrupted text.
+        # This was off by default while a captured decoder was correct through
+        # TTModel and corrupt through this engine. The cause was the LM head:
+        # `output.weight` loads lazily and greedy_tokens/logits allocate their own
+        # intermediates, and in this engine all of that first happened *after* the
+        # capture region, landing on memory the recorded graph depends on.
+        # TracedDecoder now runs them before capturing. Above batch 48 the gain is
+        # ~1 %, so capture is not worth its memory there.
         self._use_trace = use_trace and max_concurrency < 48
         self._decoder = None
         self._admit: queue.SimpleQueue = queue.SimpleQueue()

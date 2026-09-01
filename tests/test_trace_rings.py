@@ -56,25 +56,30 @@ def test_reset_handles_ring_lists() -> None:
     )
 
 
-def test_engine_does_not_enable_trace_by_default() -> None:
-    """Trace is correct through TTModel and wrong through TTEngine.
+def test_engine_enables_trace_for_the_single_user_path() -> None:
+    """Trace is the whole latency story at batch 1: 516 ms -> 255 ms.
 
-    Standalone, a captured decoder matches eager token-for-token (2.05x at batch
-    1, 1.35x at 32). Driven through TTEngine the same decoder emits garbage --
-    ' Paris.' becomes '!!!!'. Every candidate was excluded by a standalone
-    reproduction that passed: reset_slot between replays, repeated post-capture
-    allocation, max_seq_len, trace region size, distinct per-slot tokens, the
-    filler-token pattern, the live slot's index, and the worker-thread boundary.
-
-    Until a failing reproduction exists outside the engine, the default stays off:
-    a wrong answer served fast is worse than a right one served slower.
+    It was off by default while a captured decoder was correct through TTModel
+    and corrupt through TTEngine. The cause was allocation ordering, not the
+    graph: `output.weight` loads lazily and greedy_tokens/logits allocate their
+    own intermediates, and in the engine all of that first happened *after*
+    `begin_trace_capture`, landing on memory the recorded graph depends on.
+    Every standalone harness happened to preload the weights and call the LM head
+    before capturing, which is why none of them could reproduce it.
     """
     import inspect
 
     from twtest.tt.engine import TTEngine
+    from twtest.tt.traced import TracedDecoder
 
     sig = inspect.signature(TTEngine.__init__)
-    assert sig.parameters["use_trace"].default is False, (
-        "TTEngine must not enable trace by default -- the traced engine path "
-        "produces corrupted output for a cause that is not yet isolated"
+    assert sig.parameters["use_trace"].default is True
+
+    src = inspect.getsource(TracedDecoder.__init__)
+    assert "model.logits(" in src and "greedy_tokens(" in src, (
+        "TracedDecoder must exercise the LM head before capturing; allocating it "
+        "afterwards corrupts the replay"
+    )
+    assert src.index("model.logits(") < src.index("begin_trace_capture"), (
+        "the LM head warmup must come before the capture region"
     )

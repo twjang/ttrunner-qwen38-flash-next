@@ -54,6 +54,16 @@ class TracedDecoder:
         model.step([warmup_token] * self.batch, state)
         ttnn.synchronize_device(model.mesh)
 
+        # Everything the steady-state loop allocates must exist before capture.
+        # The warmup step above covers the decode graph, but not the LM head:
+        # `output.weight` is loaded lazily and `greedy_tokens`/`logits` allocate
+        # their own intermediates, and in the engine those first happen *after*
+        # the capture region. Force them now.
+        warm_hidden = model.step([warmup_token] * self.batch, state)
+        model.logits(warm_hidden)
+        model.greedy_tokens(warm_hidden)
+        ttnn.synchronize_device(model.mesh)
+
         model._skip_copy = True
         try:
             self.trace_id = ttnn.begin_trace_capture(model.mesh, cq_id=cq_id)
@@ -62,6 +72,7 @@ class TracedDecoder:
         finally:
             model._skip_copy = False
         ttnn.synchronize_device(model.mesh)
+
 
     # -- host-side input refresh -------------------------------------------
 
