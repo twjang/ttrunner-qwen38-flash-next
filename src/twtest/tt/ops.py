@@ -52,6 +52,17 @@ def grouped_rms_norm(
     return ttnn.multiply(normed, weight)
 
 
+def reshape_to(x: ttnn.Tensor, shape) -> ttnn.Tensor:
+    """`ttnn.reshape`, skipped when the tensor already has that shape.
+
+    Not free to call for nothing: a reshape costs ~36 us on device even when it
+    only changes rank and no data moves, roughly half an arithmetic op of the same
+    size. At batch 1 the hyper-connection mean asks for a shape the tensor already
+    has, 97 times per token -- 98 of the step's 914 reshapes.
+    """
+    return x if list(x.shape) == list(shape) else ttnn.reshape(x, shape)
+
+
 def rms_norm(x: ttnn.Tensor, weight: ttnn.Tensor, eps: float) -> ttnn.Tensor:
     return ttnn.rms_norm(x, epsilon=eps, weight=weight, compute_kernel_config=HIFI4)
 
@@ -91,7 +102,7 @@ def gated_residual_mix(
     per_stream = ttnn.reshape(gated, (shape[0], rows, hc_count, hidden_size))
     summed = ttnn.sum(per_stream, dim=-2, keepdim=True)
     mixed = ttnn.multiply(
-        ttnn.reshape(summed, (shape[0], shape[1], shape[2], hidden_size)), 1.0 / hc_count
+        reshape_to(summed, (shape[0], shape[1], shape[2], hidden_size)), 1.0 / hc_count
     )
 
     inject = None

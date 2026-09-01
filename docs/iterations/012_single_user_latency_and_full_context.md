@@ -287,3 +287,25 @@ That is the honest end state for the single-user path with the ops ttnn offers:
 * the remaining 20-40x to a memory-bound floor is 6355 ops x ~36 us, and closing
   it means fewer ops: a gather-based grouped GEMM for the MoE, a fused
   hyper-connection gate, and a layout pass to delete the 1231 shape ops.
+
+### One safe slice of that, taken
+
+Not all of the 1231 layout ops need a refactor. Counting reshapes whose target is
+the shape the tensor already has:
+
+```
+B=1  reshape: 98 no-op of 914 (10.7%)   all [1, 1, 1, 2560]
+B=1  permute: 0 identity of 317
+```
+
+All 98 are the hyper-connection gate's stream mean, which asks for
+`(shape[0], shape[1], shape[2], hidden)` after summing -- at batch 1 that is what
+`summed` already is, 97 times per token. `ops.reshape_to` skips a reshape when the
+shape matches, which is identity by construction rather than an approximation.
+
+Worth ~3.5 ms of the 229 ms traced step (1.5 %) -- inside run-to-run noise on any
+single measurement, which is why it is justified by op count rather than by a
+stopwatch. Tokens unchanged: `[11, 427, 378, 490, 17045, 291]`.
+
+The permutes have no such free slice: none of the 317 is an identity, so those
+need the layout work.
