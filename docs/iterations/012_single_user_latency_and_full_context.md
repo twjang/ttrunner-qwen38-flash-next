@@ -186,3 +186,43 @@ So prefill stays off. `TTEngine` refuses `chunked_prefill`, and
 `tests/test_prefill_contract.py` locks the three shape contracts so the next
 attempt starts from a path that runs and is merely wrong, rather than one that
 dies in `concat`.
+
+---
+
+## Observation 4 — where the single-user step actually goes, and what is left
+
+Every earlier profile was taken at batch 64. At batch 1 the distribution is
+similar, with the hyper-connection gate taking a larger share (instrumented, so
+the total is inflated ~40 % by per-section syncs; the shares are the signal):
+
+| section | per call | calls | share |
+|---|---|---|---|
+| deltanet | 5.576 ms | 36 | 28.6 % |
+| moe_routed | 4.166 ms | 48 | 28.5 % |
+| hc_gate | 1.261 ms | 97 | 17.4 % |
+| reinject | 0.445 ms | 96 | 6.1 % |
+| shared_expert | 0.737 ms | 48 | 5.0 % |
+| qsa_attention | 2.664 ms | 12 | 4.6 % |
+| all_reduce | 0.285 ms | 84 | 3.4 % |
+| ple | 3.842 ms | 1 | 0.5 % |
+
+Two things follow.
+
+**The engine is at device speed.** A traced step measured standalone is 255 ms;
+through the engine it is 229 ms per step (4.81 s for 21 steps). There is no host
+bubble left to overlap — tokenizer, sampling and the queue cost nothing
+measurable against the step.
+
+**What remains is not dispatch.** Trace already removes the per-op host cost, so
+the 229 ms is kernel execution on very small tensors. At batch 1 the MoE selects
+exactly `top_k` = 10 of 512 experts, so there is no union waste at all, and the
+hyper-connection gate runs 97 times per token at ~11 ops each — roughly a
+thousand kernel launches whose cost is a per-launch minimum rather than
+arithmetic. A rough bandwidth bound says the step reads on the order of 1-2 GB
+per device per token, which at DRAM speed would be single-digit milliseconds, so
+this is 20-40x off a memory-bound floor.
+
+That gap is real headroom, but closing it means fewer, larger kernels: a
+gather-based grouped GEMM for the MoE, and a fused hyper-connection gate. Both
+are custom-kernel projects rather than a rearrangement of the ops ttnn offers,
+and the measurements above are what a successor would start from.
