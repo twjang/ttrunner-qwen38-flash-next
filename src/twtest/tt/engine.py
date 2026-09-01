@@ -1,0 +1,350 @@
+"""Async inference engine over the ttnn device model.
+
+The mesh is a single resource and tt-metal is not re-entrant, so all device work
+happens on one dedicated worker thread. Concurrency comes from the scheduler
+above it: many requests may be in flight, each with its own `TTState`, and the
+worker interleaves them token by token. That is the same continuous-batching
+shape vLLM uses -- admit new sequences as slots free up, evict finished ones --
+decoding every active sequence in a single batched device step.
+
+All sequences share one `TTState` of `max_concurrency` slots and advance in
+lockstep; a finished sequence frees its slot and `TTModel.reset_slot` clears it
+for the next admission, so the batch never has to drain. This is what makes the
+device numbers reachable through the API: stepping sequences one at a time cost
+a full step *per sequence*, so 32 concurrent requests ran ~32x slower than the
+batched path they now share.
+
+Slot count is a real trade-off, and the measured step times are flat in batch up
+to a point -- 518 ms at 1, 561 at 16, 572 at 32, 742 at 64 -- so 32 slots buy
+32x the concurrency for 10 % more latency than a single sequence, while 64 slots
+cost 43 % for the next doubling.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import queue
+import threading
+import time
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+
+from ..engine import Engine, EngineStats, GenerationRequest, TokenEvent
+
+
+@dataclass
+class _Sequence:
+    request: GenerationRequest
+    out_queue: "queue.SimpleQueue"
+    slot: int | None = None
+    next_token: int | None = None
+    emitted: int = 0
+    prompt_pos: int = 0
+    done: bool = False
+    finish_reason: str | None = None
+    created: float = field(default_factory=time.time)
+
+
+class TTEngine(Engine):
+    def __init__(
+        self,
+        cache_dir: str,
+        gguf_dir: str,
+        tokenizer_path: str,
+        mesh_shape: tuple[int, int] = (1, 4),
+        max_concurrency: int = 8,
+        chunked_prefill: bool = False,
+        trace_region_bytes: int = 128 << 20,
+        use_trace: bool = False,
+    ):
+        import ttnn
+
+        from ..gguf.reader import GGUFModel
+        from ..reference.config import Qwen4ExpConfig
+        from ..reference.tokenizer import Qwen4ExpTokenizer
+        from ..reference.weights import WeightStore
+        from .model import TTModel
+        from .weights import TTWeights
+
+        # CCL is dead without this: every collective fails on
+        # `fabric_context_ != nullptr` inside the control plane.
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+        # The trace region has to be reserved at open time; a decode step records
+        # on the order of 5 000 ops, so it needs real space.
+        self.mesh = ttnn.open_mesh_device(
+            ttnn.MeshShape(*mesh_shape), trace_region_size=trace_region_bytes
+        )
+
+        gguf = GGUFModel.from_dir(gguf_dir)
+        self.config = Qwen4ExpConfig.from_gguf(gguf.metadata)
+        self.config.validate()
+        # Host store serves only the two gather tensors (token_embd and the
+        # 51 B-param n-gram table); everything else lives on device.
+        self.host_store = WeightStore(gguf, cache_bytes=2 << 30, row_cache_bytes=8 << 30)
+        self.weights = TTWeights(cache_dir, self.mesh)
+        # traceable_kv=True: paged_update_cache takes the cache index as a
+        # per-sequence tensor. Continuous batching needs that -- slots are
+        # refilled independently, so sequences sit at different positions, and
+        # the plain update_cache path writes one index for the whole batch.
+        self.model = TTModel(
+            self.config, self.weights, self.host_store, self.mesh, traceable_kv=True
+        )
+        # Fused gate|up experts: one sparse_matmul instead of two, verified
+        # token-for-token identical. Two runs per mode, 25 samples each:
+        #
+        #            split                 fused
+        #     B=1    522.4 / 520.3 ms      504.8 / 523.0 ms      (neutral)
+        #     B=32   57.57 / 57.97 tok/s   59.51 / 58.49 tok/s   (+2 %)
+        #     B=64   86.66 / 86.60 tok/s   97.47 / 97.36 tok/s   (+12 %)
+        #
+        # An earlier single run showed 0.94x at B=1 and B=32 and this was gated on
+        # slot count because of it; that run had just written 40 GB of new weight
+        # files and was reading them cold (6.1 s load against 5.3 s here). Once
+        # the constant conv taps stopped being re-sliced every token the fused
+        # path is neutral-to-better everywhere, so it is simply on when the
+        # weights exist. Falls back silently when they do not -- they are an
+        # optional artefact of scripts/fuse_expert_gate_up.py.
+        if "blk.0.ffn_gateup_exps.weight" in self.weights:
+            self.model.fuse_expert_gate_up = True
+        self.tokenizer = Qwen4ExpTokenizer(
+            tokenizer_path, self.config.chat_template,
+            [t for t in (self.config.eos_token_id, 248044) if t is not None],
+        )
+        self.stop_token_ids = tuple(self.tokenizer.eos_token_ids)
+        self.model_name = "Qwen3.8-Flash-Next"
+
+        self._stats = EngineStats()
+        self._max_concurrency = max_concurrency
+        # Chunked prefill (gated_delta_attn_seq over 128 tokens at a time) is
+        # perhaps 10x faster than replaying the decode step per prompt token, but
+        # `TTModel.prefill` is single-sequence: it consumes a whole prompt before
+        # returning, which a shared lockstep batch cannot express. Prompts are fed
+        # through the batched step path instead. Rejected loudly rather than
+        # ignored, so a caller asking for it is not silently given something else.
+        if chunked_prefill:
+            raise NotImplementedError(
+                "chunked_prefill is incompatible with batched decoding: "
+                "TTModel.prefill runs one sequence at a time"
+            )
+        self._chunked_prefill = False
+        # Trace replays a captured step with a single dispatch and is worth
+        # 2.05x at batch 1, 1.54x at 16 and 1.35x at 32 -- verified token-for-token
+        # against eager *through TTModel directly*. It is off here because the
+        # same decoder driven through this engine emits garbage (' Paris.' becomes
+        # '!!!!'), and the cause is not yet isolated. Excluded, each reproduced
+        # correctly standalone: reset_slot between replays, repeated post-capture
+        # allocation, max_seq_len 256 vs 4096, a 128 MB trace region, distinct
+        # per-slot tokens, the filler-token pattern in idle slots, the live slot's
+        # index, lazily-loaded weights, the LM head's first allocation landing
+        # after capture, and capturing/replaying on a worker thread while the mesh
+        # was opened on the main one.
+        #
+        # What is known, from differential instrumentation inside the engine:
+        #   * every bound input the trace reads (embed, ngram, rope_cos, rope_sin,
+        #     cur_pos) is bit-identical to what an eager step writes -- maxdiff 0.0
+        #     on all five, every step. The inputs are not the problem.
+        #   * interleaving a full eager model.step -- before *or* after the replay,
+        #     on an unrelated shadow state -- makes the output correct.
+        #   * a bare synchronize, a read-back of the output, a tiny eager op, a
+        #     large allocate-and-free, and blocking=True all leave it corrupted.
+        #
+        # So it is not synchronisation, not the inputs, and not allocation size:
+        # something a full step re-establishes in device state is missing on
+        # replay. The workaround costs an entire eager step -- exactly what the
+        # trace exists to avoid -- so it is a diagnostic, not a fix.
+        #
+        # Correct and slower beats fast and wrong, so it stays opt-in until a
+        # failing reproduction exists outside the engine. Turning it on without
+        # that reproduction serves corrupted text.
+        self._use_trace = use_trace and max_concurrency < 48
+        self._decoder = None
+        self._admit: queue.SimpleQueue = queue.SimpleQueue()
+        self._shutdown = threading.Event()
+        self._worker = threading.Thread(target=self._device_loop, name="tt-device", daemon=True)
+        self._worker.start()
+
+    # -- Engine interface ---------------------------------------------------
+
+    def encode(self, text: str) -> list[int]:
+        return self.tokenizer.encode(text)
+
+    def decode(self, token_ids: list[int]) -> str:
+        return self.tokenizer.decode(token_ids)
+
+    def apply_chat_template(self, messages: list[dict], add_generation_prompt: bool = True) -> str:
+        return self.tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt)
+
+    @property
+    def stats(self) -> EngineStats:
+        return self._stats
+
+    # -- device worker -------------------------------------------------------
+
+    def _device_loop(self) -> None:
+        import torch
+
+        from ..reference.generate import SamplingParams, sample
+
+        B = self._max_concurrency
+        state = self.model.new_state(batch=B)
+        slots: list[_Sequence | None] = [None] * B
+        free: list[int] = list(range(B))
+
+        # Captured here rather than in __init__: it runs a warmup step, which
+        # compiles every kernel and takes tens of seconds, and it must happen on
+        # the device thread. A failure (most often no room for the trace buffer
+        # alongside 24.94 GB of weights) is not fatal -- eager is correct, just
+        # slower -- so it degrades instead of refusing to serve.
+        if self._use_trace:
+            try:
+                from .traced import TracedDecoder
+
+                decoder = TracedDecoder(self.model, state)
+                decoder.reset()
+                self._decoder = decoder
+            except Exception as exc:
+                self._decoder = None
+                print(f"[tt] trace capture failed, falling back to eager: {exc}")
+
+        def advance(tokens: list[int]):
+            if self._decoder is not None:
+                return self._decoder.step(tokens)
+            return self.model.step(tokens, state)
+        # A slot with no sequence still occupies a lane in the batched step; it is
+        # fed a harmless token and its logits are dropped. Shrinking the batch to
+        # the live count instead would mean a differently-shaped state (and a new
+        # trace) every time a request arrives or finishes.
+        FILLER = 0
+
+        def params_of(seq: _Sequence) -> SamplingParams:
+            r = seq.request
+            return SamplingParams(
+                max_tokens=r.max_tokens, temperature=r.temperature, top_p=r.top_p,
+                top_k=r.top_k, seed=r.seed, stop_token_ids=r.stop_token_ids,
+            )
+
+        def retire(slot: int, seq: _Sequence) -> None:
+            seq.out_queue.put(None)
+            slots[slot] = None
+            free.append(slot)
+            self._stats.running = sum(x is not None for x in slots)
+
+        while not self._shutdown.is_set():
+            while free:
+                try:
+                    seq = self._admit.get_nowait()
+                except queue.Empty:
+                    break
+                slot = free.pop()
+                self.model.reset_slot(state, slot)
+                seq.slot = slot
+                slots[slot] = seq
+                self._stats.running = sum(x is not None for x in slots)
+            if all(x is None for x in slots):
+                try:
+                    seq = self._admit.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                slot = free.pop()
+                self.model.reset_slot(state, slot)
+                seq.slot = slot
+                slots[slot] = seq
+                self._stats.running = sum(x is not None for x in slots)
+
+            # One token per slot: the next prompt token while the prompt is still
+            # being consumed, otherwise the token this slot sampled last round.
+            tokens: list[int] = []
+            sampling: list[int] = []          # slots whose logits we will read
+            for i, seq in enumerate(slots):
+                if seq is None:
+                    tokens.append(FILLER)
+                    continue
+                prompt = seq.request.prompt_token_ids
+                if seq.prompt_pos < len(prompt):
+                    tokens.append(prompt[seq.prompt_pos])
+                    seq.prompt_pos += 1
+                    if seq.prompt_pos >= len(prompt):
+                        sampling.append(i)     # last prompt token -> first output
+                else:
+                    tokens.append(seq.next_token)
+                    sampling.append(i)
+
+            # Greedy decoding needs one integer per sequence, not the whole
+            # vocabulary: gathering [B, 248320] off four devices costs 194 ms at
+            # B=32 against 38 ms for a device-side argmax. Taken only when every
+            # slot sampling this step is greedy -- any slot needing a real
+            # distribution (temperature > 0) forces the full gather, which then
+            # serves the greedy slots too.
+            greedy_only = all(
+                slots[i] is not None and slots[i].request.temperature <= 0 for i in sampling
+            )
+            try:
+                hidden = advance(tokens)
+                logits = None
+                argmax = self.model.greedy_tokens(hidden) if greedy_only else None
+                if argmax is None:             # uneven vocab shard, or sampling needed
+                    logits = self.model.logits(hidden)
+            except Exception as exc:           # a device fault kills every slot
+                for i, seq in enumerate(slots):
+                    if seq is not None:
+                        seq.out_queue.put(exc)
+                        retire(i, seq)
+                continue
+
+            for i in sampling:
+                seq = slots[i]
+                if seq is None:
+                    continue
+                try:
+                    params = params_of(seq)
+                    if argmax is not None:
+                        token = argmax[i]
+                    else:
+                        generator = None
+                        if params.seed is not None:
+                            generator = torch.Generator().manual_seed(params.seed + seq.emitted)
+                        token = sample(logits[i], params, generator)
+                    seq.next_token = token
+                    seq.emitted += 1
+                    self._stats.completion_tokens += 1
+
+                    if token in params.stop_token_ids:
+                        seq.out_queue.put(TokenEvent(token, "", seq.emitted, finish_reason="stop"))
+                        retire(i, seq)
+                    elif seq.emitted >= params.max_tokens:
+                        seq.out_queue.put(TokenEvent(token, self.decode([token]), seq.emitted - 1))
+                        seq.out_queue.put(TokenEvent(-1, "", seq.emitted, finish_reason="length"))
+                        retire(i, seq)
+                    else:
+                        seq.out_queue.put(TokenEvent(token, self.decode([token]), seq.emitted - 1))
+                except Exception as exc:
+                    seq.out_queue.put(exc)
+                    retire(i, seq)
+
+    # -- request path ---------------------------------------------------------
+
+    async def generate(self, request: GenerationRequest) -> AsyncIterator[TokenEvent]:
+        out: queue.SimpleQueue = queue.SimpleQueue()
+        seq = _Sequence(request=request, out_queue=out)
+        self._stats.prompt_tokens += len(request.prompt_token_ids)
+        self._stats.queued += 1
+        self._admit.put(seq)
+
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                item = await loop.run_in_executor(None, out.get)
+                if item is None:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            self._stats.queued = max(0, self._stats.queued - 1)
+
+    async def close(self) -> None:
+        import ttnn
+
+        self._shutdown.set()
+        self._worker.join(timeout=5)
+        ttnn.close_mesh_device(self.mesh)
