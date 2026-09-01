@@ -124,3 +124,65 @@ text ' Paris.\n\nThe French city in Europe'
 higher because a 5-token prompt costs 5 device steps before the first output
 token — prompts are fed one token per step, and batched chunked prefill is the
 open item there.
+
+---
+
+## Observation 3 — chunked prefill: 11.3x, and still wrong
+
+The full context is only useful if a long prompt can be loaded into it. Prompts
+are fed one token per device step, so at 229 ms/step a 100k-token prompt is over
+six hours before the first output token. A 262144-token context that takes hours
+to fill is a number, not a capability.
+
+`TTModel.prefill` exists for this and was stale in three ways, all now fixed:
+
+* `_causal_conv_chunk` and `_ple_chunk` held their windows as single
+  `[1,1,C,state_len]` tensors; the decode path had moved to *rings* of single
+  columns. They now consume and produce rings — and the order matters, because
+  the two decode modes index it oppositely: `trace_safe_rings` reads
+  `state[age-1]` (newest first) while the rotating path at step 0 reads
+  `state[0]` as the oldest. Handing back the wrong order is silent, the conv
+  simply runs with its taps permuted.
+* `_linear_attention_chunk` used the *global* head counts from before the
+  DeltaNet was head-sharded, and prepared its inputs from `from_dev`, which
+  returns device 0's copy. For a head-sharded tensor that is device 0's heads, so
+  all four devices would have run the recurrence on the same quarter of them. It
+  now gathers, prepares each device's own heads, and shards the eight prepared
+  tensors back on dim 0.
+* the prefill MoE named `ffn_gate_exps`/`ffn_up_exps` while the model runs fused,
+  which loads the split halves *lazily on top of* the fused tensor — another
+  ~11 GB per device, and an out-of-memory at the first MoE layer rather than a
+  slow path. It now selects the same weights decode does.
+
+The payoff is real:
+
+```
+prefill     128 tok in  5.77 s (  45.0 ms/tok)
+step path   128 tok in 65.15 s ( 509.0 ms/tok)     11.3x
+```
+
+**And the tokens do not match.** Not drift over a long prompt — it differs from
+the first chunk:
+
+```
+len=  4  prefill->154171  step->  2880   hidden maxdiff 28.9
+len= 16  prefill->   695  step-> 14274   hidden maxdiff 45.1
+len= 64  prefill->   351  step->    71   hidden maxdiff 26.2
+```
+
+Narrowed: after 128 tokens the layer-0 recurrent state is within 0.06 of the
+sequential path — plausibly just precision, since the chunked op computes the
+same recurrence a different way — while the final hidden is off by 45, so the
+error amplifies through the stack rather than starting large. `prepare()` does
+apply the q/k l2-norm and the q scale, so that is not the missing piece.
+
+One measurement of mine was itself wrong along the way and is worth recording:
+the first layer-by-layer diff reported the conv window off by 11.7, which is an
+artifact. The decode ring is *rotating*, so after 128 steps it sits at phase
+`128 % 3 = 2` while prefill leaves it at phase 0; comparing index to index
+compares different ages. The `recurrent` column was the honest signal.
+
+So prefill stays off. `TTEngine` refuses `chunked_prefill`, and
+`tests/test_prefill_contract.py` locks the three shape contracts so the next
+attempt starts from a path that runs and is merely wrong, rather than one that
+dies in `concat`.

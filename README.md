@@ -64,11 +64,29 @@ Correct and slower beats fast and wrong.
 End-to-end through the engine, greedy, 12 output tokens after a 5-token prompt
 (so 17 device steps produce 12 tokens — prompts are fed one token per step):
 
+The server defaults to a single user: one slot at the model's full 262144-token
+context, traced. Per-token cost is flat in position (496 ms at 4, 501 ms at
+65536) because the step is dominated by the MoE and DeltaNet and the
+sparse-attention budget is fixed at 2048 — long context costs memory, not time.
+The K/V cache is 6.4 GB per sequence at full length, so slots and context trade
+directly and the engine checks them against the DRAM budget at construction.
+
+| slots | context | ms/token | ms/step |
+|---|---|---|---|
+| 1 | **262144** | 300.5 | **229** |
+| 2 | 131072 | 319.0 | — |
+| 3 | 65536 | 323.7 | — |
+
+Throughput-oriented configurations (more slots, shorter context):
+
 | concurrency | tok/s | vs single |
 |---|---|---|
-| 1 | 1.41 | — |
 | 8 | 10.18 | 7.2× |
 | 32 | **37.84** | 30.5× |
+
+Prompts are fed one token per step. `TTModel.prefill` is 11.3× faster
+(45.0 vs 509.0 ms/token) but disagrees with the decode path from the first
+chunk, so it is not enabled — see `docs/iterations/012`.
 
 ## Layout
 

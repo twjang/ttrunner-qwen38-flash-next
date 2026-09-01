@@ -882,21 +882,38 @@ class TTModel:
         weighted sum, and the rolling window stays a slice.
         """
         k = self.cfg.conv_kernel
+        depth = k - 1
+        # The decode path keeps this window as a *ring* of single [1,1,C,1]
+        # columns, so prefill has to speak the same representation: it consumes
+        # the ring left by any earlier chunk and leaves one the decode step can
+        # pick up. (Before this it took a single [1,1,C,k-1] tensor and died in
+        # concat the moment the two paths met.)
         if state is None:
-            state = ttnn.zeros(
-                (1, 1, channels, k - 1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh
-            )
-        window = ttnn.concat([state, x], dim=-1)                    # [1,1,C,k-1+seq]
-        # copy into the persistent buffer rather than returning the slice view,
-        # so the decode path's in-place update always targets a real buffer
-        ttnn.copy(ttnn.slice(window, (0, 0, 0, seq), (1, 1, channels, seq + k - 1)), state)
-        new_state = state
+            state = [
+                ttnn.zeros((1, 1, channels, 1), dtype=ttnn.bfloat16,
+                           layout=ttnn.TILE_LAYOUT, device=self.mesh)
+                for _ in range(depth)
+            ]
+        # oldest first, then this chunk: [1,1,C,depth+seq]
+        window = ttnn.concat([*state, x], dim=-1)
         acc = None
-        for tap in range(k):
+        for tap, w_tap in enumerate(self.conv_taps(("ssm_chunk", channels), weight, channels, k)):
             piece = ttnn.slice(window, (0, 0, 0, tap), (1, 1, channels, tap + seq))
-            w_tap = ttnn.slice(weight, (0, 0, 0, tap), (1, 1, channels, tap + 1))
-            term = ttnn.multiply(piece, w_tap)
-            acc = term if acc is None else ttnn.add(acc, term)
+            acc = ttnn.multiply(piece, w_tap) if acc is None else ttnn.add(
+                acc, ttnn.multiply(piece, w_tap)
+            )
+        # The ring the next decode step reads: the final `depth` columns. The two
+        # decode modes index it in *opposite* orders, so the one that follows
+        # decides the layout here -- trace_safe_rings reads state[age-1], newest
+        # first, while the rotating path at step 0 reads state[0] as the oldest.
+        # Handing back the wrong order is silent: the conv still runs, with the
+        # window's taps permuted.
+        total = depth + seq
+        cols = [
+            ttnn.slice(window, (0, 0, 0, total - depth + i), (1, 1, channels, total - depth + i + 1))
+            for i in range(depth)
+        ]                                   # oldest .. newest
+        new_state = list(reversed(cols)) if self.trace_safe_rings else cols
         return ttnn.silu(acc), new_state
 
     def _linear_attention_chunk(
@@ -912,14 +929,19 @@ class TTModel:
         from .deltanet import CHUNK, prepare
 
         cfg = self.cfg
-        n_v, n_k, hd = cfg.linear_num_v_heads, cfg.linear_num_k_heads, cfg.linear_head_dim
+        # Local head counts: the DeltaNet weights are head-sharded, so each device
+        # owns a different slice of the heads and its own conv channels. Using the
+        # global counts here (as this path did before) both mis-shapes the reshape
+        # and, worse, silently prepares only device 0's heads for all four.
+        n_v, n_k, hd = self.n_v_local, self.n_k_local, cfg.linear_head_dim
 
         qkv = ttnn.linear(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
         z = ttnn.linear(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
         conv_out, st.conv = self._causal_conv_chunk(
-            ttnn.transpose(qkv, -2, -1), self.w.blk(layer, "ssm_conv1d.weight"), st.conv, cfg.conv_dim, seq
+            ttnn.transpose(qkv, -2, -1), self.w.blk(layer, "ssm_conv1d.weight"),
+            st.conv, self.conv_dim_local, seq,
         )
-        qkv = ttnn.transpose(conv_out, -2, -1)                       # [1,1,seq,conv_dim]
+        qkv = ttnn.transpose(conv_out, -2, -1)              # [1,1,seq,conv_dim_local]
 
         a = ttnn.linear(mixed, self.w.blk(layer, "ssm_alpha.weight"), compute_kernel_config=HIFI4)
         b = ttnn.linear(mixed, self.w.blk(layer, "ssm_beta.weight"), compute_kernel_config=HIFI4)
@@ -928,26 +950,38 @@ class TTModel:
             ttnn.softplus(ttnn.add(a, self.w.blk(layer, "ssm_dt.bias"))),
         )
 
-        # host preparation
-        qkv_h = self.from_dev(qkv).reshape(1, seq, cfg.conv_dim).float()
-        g_h = self.from_dev(g).reshape(1, seq, n_v).float()
-        b_h = torch.sigmoid(self.from_dev(b).reshape(1, seq, n_v).float())
-        kd = cfg.linear_key_dim
-        q_h = qkv_h[..., :kd].reshape(1, seq, n_k, hd)
-        k_h = qkv_h[..., kd : 2 * kd].reshape(1, seq, n_k, hd)
-        v_h = qkv_h[..., 2 * kd :].reshape(1, seq, n_v, hd)
-        reps = n_v // n_k
-        q_h = q_h.repeat(1, 1, reps, 1)
-        k_h = k_h.repeat(1, 1, reps, 1)
+        # Host preparation, per device. `from_dev` would return device 0's copy,
+        # which for head-sharded tensors is only its own heads -- every device
+        # would then run the recurrence on device 0's q/k/v. Gather all four,
+        # prepare each device's heads separately, and shard the results back on
+        # dim 0, which prepare() lays out as batch*heads.
+        def gather(t, width):
+            full = ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=-1))
+            return full.reshape(1, seq, self.n_dev, width).permute(2, 0, 1, 3).float()
 
-        prep = prepare(q_h, k_h, v_h, g_h, b_h)
-        prep.pop("_meta")
+        kd = self.key_dim_local
+        qkv_all = gather(qkv, self.conv_dim_local)          # [n_dev, 1, seq, conv_dim_local]
+        g_all = gather(g, n_v)
+        b_all = torch.sigmoid(gather(b, n_v))
+        reps = n_v // n_k
+
+        per_dev = []
+        for d in range(self.n_dev):
+            qkv_h = qkv_all[d]
+            q_h = qkv_h[..., :kd].reshape(1, seq, n_k, hd).repeat(1, 1, reps, 1)
+            k_h = qkv_h[..., kd : 2 * kd].reshape(1, seq, n_k, hd).repeat(1, 1, reps, 1)
+            v_h = qkv_h[..., 2 * kd :].reshape(1, seq, n_v, hd)
+            prep = prepare(q_h, k_h, v_h, g_all[d], b_all[d])
+            prep.pop("_meta")
+            per_dev.append(prep)
+
         dev = {
             name: ttnn.from_torch(
-                t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.mesh,
-                mesh_mapper=self.replicate,
+                torch.cat([p[name] for p in per_dev], dim=0),
+                dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.mesh,
+                mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
             )
-            for name, t in prep.items()
+            for name in per_dev[0]
         }
         initial = None
         if st.recurrent is not None:
@@ -959,15 +993,20 @@ class TTModel:
         )
         if st.recurrent is None:
             st.recurrent = ttnn.zeros(
-                (n_v, 1, hd, hd), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.mesh
+                (n_v, 1, hd, hd), dtype=self.state_dtype, layout=ttnn.TILE_LAYOUT,
+                device=self.mesh,
             )
         ttnn.copy(ttnn.reshape(final_state, (n_v, 1, hd, hd)), st.recurrent)
 
-        # [BH, NC, C, Dv] -> [1, 1, seq, n_v*hd]
+        # [BH, NC, C, Dv] -> [1, 1, seq*n_v, hd], per device
         n_chunks = out.shape[1]
-        out_h = self.from_dev(out).reshape(n_v, n_chunks * CHUNK, hd)[:, :seq]
-        out_h = out_h.permute(1, 0, 2).reshape(1, 1, seq * n_v, hd)
-        out_d = self.to_dev(out_h, ttnn.bfloat16)
+        out_all = ttnn.to_torch(out, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0))
+        out_all = out_all.reshape(self.n_dev, n_v, n_chunks * CHUNK, hd)[:, :, :seq]
+        out_h = out_all.permute(0, 2, 1, 3).reshape(self.n_dev, 1, seq * n_v, hd)
+        out_d = ttnn.from_torch(
+            out_h, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh,
+            mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
+        )
 
         z_heads = ttnn.reshape(z, (1, 1, seq * n_v, hd))
         normed = ttnn.rms_norm(
@@ -975,7 +1014,7 @@ class TTModel:
             compute_kernel_config=HIFI4,
         )
         gated = ttnn.multiply(normed, ttnn.sigmoid(z_heads))
-        gated = ttnn.reshape(gated, (1, 1, seq, cfg.linear_value_dim))
+        gated = ttnn.reshape(gated, (1, 1, seq, self.value_dim_local))
         return ttnn.linear(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
 
     def _attention_chunk(
@@ -1048,6 +1087,33 @@ class TTModel:
     def prefill(self, token_ids: list[int], state: TTState, chunk: int = 128, moe_chunk: int = 16):
         """Consume a prompt in chunks; returns the final hidden state for the last token.
 
+        **Not correct yet -- do not wire this into the engine.** It runs, and it is
+        worth having: 128 prompt tokens in 5.77 s against 65.15 s through the
+        decode path, 11.3x, which is the difference between a 100k-token prompt
+        being minutes or hours. But it does not agree with feeding the same prompt
+        one token at a time, and the disagreement is structural rather than drift:
+
+            len=  4  prefill->154171  step->  2880   hidden maxdiff 28.9
+            len= 16  prefill->   695  step-> 14274   hidden maxdiff 45.1
+            len= 64  prefill->   351  step->    71   hidden maxdiff 26.2
+
+        It differs from the very first chunk, so it is not error accumulation over
+        a long prompt. Narrowed so far: after a 128-token prompt the layer-0
+        DeltaNet recurrent state is within 0.06 of the sequential path (plausibly
+        precision, the chunked op computes the same recurrence differently), while
+        the final hidden state is off by 45 -- so something amplifies through the
+        stack rather than starting large. `prepare()` does apply the q/k l2-norm
+        and the q scale, so that is not the missing piece.
+
+        What *was* fixed here, and is worth keeping: it no longer dies on shapes.
+        `_causal_conv_chunk` and `_ple_chunk` now speak the ring representation the
+        decode path uses, `_linear_attention_chunk` uses the local (head-sharded)
+        head counts and prepares each device's own heads instead of broadcasting
+        device 0's, and the MoE selects the same expert weights as decode -- naming
+        the split halves while the model is fused loaded another ~11 GB per device
+        and ran out of DRAM at the first MoE layer.
+        
+
         `moe_chunk` matters: the MoE's broadcast formulation computes
         |union of selected experts| x M rows, and the union approaches all 512 as
         M grows. Splitting the chunk's MoE into `moe_chunk`-sized pieces trades
@@ -1060,27 +1126,6 @@ class TTModel:
             raise ValueError(f"gated_delta_attn_seq fixes the chunk at {CHUNK}, got {chunk}")
         if state.batch != 1:
             raise NotImplementedError("chunked prefill is single-sequence for now")
-        # This path has not kept up with two later optimisations and currently
-        # fails with a bare `concat shapes_match` deep inside the conv:
-        #
-        #   * the decode path's conv windows became *rings* (lists of single
-        #     columns); `_causal_conv_chunk` still expects one [1,1,C,k-1] tensor,
-        #   * `_linear_attention_chunk` still uses the global head counts
-        #     (cfg.linear_num_v_heads) from before the DeltaNet was head-sharded,
-        #     where decode uses self.n_v_local.
-        #
-        # Measured worth: feeding a 128-token prompt through the decode path costs
-        # 69.1 s (539.7 ms/token), so repairing this is real work -- but it is
-        # single-sequence, and the server feeds every slot's prompt in the same
-        # batched step, which already amortises the cost across concurrent
-        # requests. Fail with the reason rather than a kernel-level shape error.
-        raise NotImplementedError(
-            "chunked prefill is stale: it predates the conv ring buffers and "
-            "DeltaNet head sharding. Feed the prompt through step() instead, or "
-            "update _causal_conv_chunk (ring state) and _linear_attention_chunk "
-            "(local head counts) first."
-        )
-
         final = None
         for begin in range(0, len(token_ids), chunk):
             ids = token_ids[begin : begin + chunk]
@@ -1116,11 +1161,19 @@ class TTModel:
                 for sub in range(0, seq, moe_chunk):
                     width = min(moe_chunk, seq - sub)
                     part = ttnn.slice(mixed, (0, 0, sub, 0), (1, 1, sub + width, cfg.hidden_size))
+                    # Same weight selection as decode. Naming the split halves
+                    # here while the model is fused loads them lazily *on top of*
+                    # the fused tensor -- another ~11 GB per device, which is an
+                    # out-of-memory at the first MoE layer, not a slow path.
+                    if self.fuse_expert_gate_up:
+                        gate_w, up_w = self.w.fused_gate_up(layer), None
+                    else:
+                        gate_w = self.w.blk(layer, "ffn_gate_exps.weight")
+                        up_w = self.w.blk(layer, "ffn_up_exps.weight")
                     routed = self.all_reduce(
                         moe.moe_block(
                             part, self.w.blk(layer, "ffn_gate_inp.weight"),
-                            self.w.blk(layer, "ffn_gate_exps.weight"),
-                            self.w.blk(layer, "ffn_up_exps.weight"),
+                            gate_w, up_w,
                             self.w.blk(layer, "ffn_down_exps.weight"),
                             cfg.num_experts_per_tok, cfg.num_experts,
                             cfg.hidden_size, cfg.expert_intermediate,
@@ -1180,23 +1233,33 @@ class TTModel:
         )
         state_len = (cfg.ple_conv_kernel - 1) * cfg.ngram_size
         col = ttnn.transpose(gated_normed, -2, -1)                   # [1,1,C,seq]
+        c_dim = cfg.hc_hidden_size
+        # Same ring contract as the DeltaNet conv: decode keeps this window as a
+        # list of single columns, so prefill consumes and returns one.
         if st.ple_conv is None:
-            st.ple_conv = ttnn.zeros(
-                (1, 1, cfg.hc_hidden_size, state_len), dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT, device=self.mesh,
-            )
-        window = ttnn.concat([st.ple_conv, col], dim=-1)              # [1,1,C,state_len+seq]
-        st.ple_conv = ttnn.slice(
-            window, (0, 0, 0, seq), (1, 1, cfg.hc_hidden_size, seq + state_len)
-        )
+            st.ple_conv = [
+                ttnn.zeros((1, 1, c_dim, 1), dtype=ttnn.bfloat16,
+                           layout=ttnn.TILE_LAYOUT, device=self.mesh)
+                for _ in range(state_len)
+            ]
+        ring = st.ple_conv
+        oldest_first = list(reversed(ring)) if self.trace_safe_rings else list(ring)
+        window = ttnn.concat([*oldest_first, col], dim=-1)      # [1,1,C,state_len+seq]
         conv_w = self.w.blk(layer, "ple_conv1d.weight")
         acc = None
-        for tap in range(cfg.ple_conv_kernel):
+        for tap, w_tap in enumerate(
+            self.conv_taps(("ple_chunk", layer), conv_w, c_dim, cfg.ple_conv_kernel)
+        ):
             off = tap * cfg.ngram_size
-            piece = ttnn.slice(window, (0, 0, 0, off), (1, 1, cfg.hc_hidden_size, off + seq))
-            w_tap = ttnn.slice(conv_w, (0, 0, 0, tap), (1, 1, cfg.hc_hidden_size, tap + 1))
+            piece = ttnn.slice(window, (0, 0, 0, off), (1, 1, c_dim, off + seq))
             term = ttnn.multiply(piece, w_tap)
             acc = term if acc is None else ttnn.add(acc, term)
+        total = state_len + seq
+        cols = [
+            ttnn.slice(window, (0, 0, 0, total - state_len + i), (1, 1, c_dim, total - state_len + i + 1))
+            for i in range(state_len)
+        ]                                                       # oldest .. newest
+        st.ple_conv = list(reversed(cols)) if self.trace_safe_rings else cols
         # prefill is single-sequence: [1,1,C,seq] -> [1,1,seq,C]
         conv = ttnn.silu(ttnn.transpose(acc, -2, -1))
         return ttnn.add(gated, conv)
