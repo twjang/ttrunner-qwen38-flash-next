@@ -226,3 +226,64 @@ That gap is real headroom, but closing it means fewer, larger kernels: a
 gather-based grouped GEMM for the MoE, and a fused hyper-connection gate. Both
 are custom-kernel projects rather than a rearrangement of the ops ttnn offers,
 and the measurements above are what a successor would start from.
+
+---
+
+## Observation 5 — the floor is op count, and a fifth of the ops are layout
+
+The claim that "what remains needs fewer, larger kernels" is checkable. Counting
+every device op in one batch-1 step:
+
+```
+6355 device ops per step
+eager  494.1 ms  ->  77.7 us/op
+traced 229.0 ms  ->  36.0 us/op
+```
+
+Trace removes ~42 us/op of host dispatch and leaves ~36 us of device time per op,
+on tensors that at batch 1 are a single row. Step time is op count times a
+per-kernel floor, not arithmetic — which is why the earlier bandwidth estimate
+(single-digit milliseconds of weight traffic) is 20-40x below what the step
+costs.
+
+What the ops are:
+
+| op | count | | op | count |
+|---|---|---|---|---|
+| multiply | 1334 | | permute | 317 |
+| **reshape** | **914** | | sum | 302 |
+| linear | 760 | | silu | 230 |
+| add | 461 | | rms_norm | 160 |
+| slice | 444 | | | |
+| sigmoid | 326 | | | |
+
+**914 reshapes and 317 permutes — 1231 ops, 19 % of the step — are layout, not
+arithmetic.** And they are not free:
+
+```
+reshape [1,1,1,2560] -> [1,1,2560]    (rank only, no tile change)    99.6 us
+reshape [1,1,1,2560] -> [1,1,20,128]  (tile change)                 132.1 us
+reshape [1,1,1,10240] -> [1,1,4,2560] (the hyper-connection mean)   132.9 us
+permute [1,1,4,128]  -> [1,4,1,128]                                 164.4 us
+multiply [1,1,1,2560]                 (reference: real arithmetic)  277.3 us
+```
+
+(Sync-inclusive, so the absolute numbers are inflated; the ratio is the signal.)
+A layout op costs roughly half an arithmetic op of the same size, and a reshape
+that only changes rank costs nearly as much as one that re-tiles — ttnn's reshape
+has a fixed cost regardless of whether data has to move. So they cannot be made
+cheaper, only removed.
+
+The largest sources are the DeltaNet head tiling (~10 reshapes per layer x 36)
+and the hyper-connection gate's stream mean (2 per call x 97). Removing them
+means choosing tensor layouts so intermediate shapes already line up — a refactor
+across the model rather than a local change, and one where a mistake is the
+quiet kind: this session has already had four bugs that were invisible at batch 1
+or in a timing-only harness.
+
+That is the honest end state for the single-user path with the ops ttnn offers:
+
+* **2.16x delivered** (496 -> 229 ms/step), verified token-for-token.
+* the remaining 20-40x to a memory-bound floor is 6355 ops x ~36 us, and closing
+  it means fewer ops: a gather-based grouped GEMM for the MoE, a fused
+  hyper-connection gate, and a layout pass to delete the 1231 shape ops.
