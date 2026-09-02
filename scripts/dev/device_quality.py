@@ -30,6 +30,11 @@ from _device_model import open_model, tokenizer
 argv = sys.argv[1:]
 PREFILL = 0
 SCORE_FROM = 0
+MOE_CHUNK = None
+if "--moe-chunk" in argv:
+    i = argv.index("--moe-chunk")
+    MOE_CHUNK = int(argv[i + 1])
+    argv = argv[:i] + argv[i + 2:]
 for flag in ("--prefill", "--score-from"):
     if flag in argv:
         i = argv.index(flag)
@@ -69,7 +74,8 @@ hits = top5 = 0
 nll = []
 start = 0
 if PREFILL:
-    h = m.prefill(ids[:PREFILL], st)
+    kw = {} if MOE_CHUNK is None else {"moe_chunk": MOE_CHUNK}
+    h = m.prefill(ids[:PREFILL], st, **kw)
     lg = m.logits(h)[0].float()
     target = ids[PREFILL]
     hits += int(lg.argmax()) == target

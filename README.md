@@ -84,8 +84,8 @@ in `(2048, 65536]` -- a step is 297.5 ms at 8192 tokens against 236.1 dense; the
 extra is almost all `ttnn.topk` at k=512, see `docs/iterations/015`.)
 
 For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
-~45 ms/token instead of ~500, at the cost of the trace (each generated token
-then costs ~513 ms). A 2000-token prompt with 200 output tokens is ~194 s that
+**8.6 ms/token** instead of ~500, at the cost of the trace (each generated token
+then costs ~513 ms). A 2000-token prompt with 200 output tokens is ~120 s that
 way against ~1047 s traced-and-stepped; short prompts invert it. Prefix reuse
 across chat turns is on unconditionally — a follow-up turn re-feeds only what it
 added, measured 7.49 s to first token cold against 2.07 s warm.
@@ -97,9 +97,10 @@ Throughput-oriented configurations (more slots, shorter context):
 | 8 | 10.18 | 7.2× |
 | 32 | **37.84** | 30.5× |
 
-Prompts are fed one token per step. `TTModel.prefill` is 11.3× faster
-(45.0 vs 509.0 ms/token) but disagrees with the decode path from the first
-chunk, so it is not enabled — see `docs/iterations/012`.
+The server feeds prompts one token per step. `TTModel.prefill` is ~59× faster
+(8.6 vs 509.0 ms/token) and is on for one-slot engines; it is refused above that
+because it consumes a whole prompt before returning, which a shared lockstep
+batch cannot express.
 
 ## Layout
 
@@ -168,9 +169,20 @@ itself rather than against another implementation
 | | top-1 | top-5 | mean NLL | perplexity |
 |---|---|---|---|---|
 | device, decode | **83.0 %** | 97.9 % | 0.682 | 1.98 |
-| device, chunked prefill | 87.5 % | 100 % | 0.335 | 1.40 |
 | device, QSA selection on | 83.0 % | 97.9 % | 0.682 | 1.98 |
 | float32 CPU reference | 80.9 % | 97.9 % | 0.703 | 2.00 |
+
+Chunked prefill is judged separately, against a decode control over the *same*
+positions — the question is whether the state a prompt leaves still predicts the
+text, not whether it matches decode token for token:
+
+| prefilled | scored | prefill | decode control |
+|---|---|---|---|
+| 128 | 32 | **53.1 %** top-1, NLL 3.11 | 51.6 %, NLL 3.25 |
+| 32 | 128 | **71.9 %** top-1, NLL 1.43 | 71.7 %, NLL 1.48 |
+
+(Lower than the decode row above because the passage runs on into dates and
+proper nouns; both paths fall together, which is the point of a control.)
 
 QSA attends to 2048 *selected* tokens, not to the whole context. The selection
 runs on device and was verified against the reference past the budget --

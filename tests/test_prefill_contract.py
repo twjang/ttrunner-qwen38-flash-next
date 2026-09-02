@@ -163,3 +163,22 @@ def test_chunked_prefill_turns_the_trace_off() -> None:
     token 0 repeatedly -- eager prefill is correct, the combination is not."""
     src = inspect.getsource(TTEngine.__init__)
     assert "and not self._chunked_prefill" in src
+
+
+def test_prefill_refuses_a_moe_chunk_past_the_cliff() -> None:
+    """`moe_chunk` above 32 changes the answer, so it is refused, not documented.
+
+    The fastest setting measured (64, 136.7 tok/s against 116.3 at 32) is on the
+    wrong side of it: next-token top-1 on a 128-token chunk falls from 53.1 % to
+    43.8 % at 64 and 21.9 % at 128, while 8, 16 and 32 agree on every token. A
+    silent 10-point loss for a 1.2x speedup is not a trade a caller can make by
+    accident.
+    """
+    import twtest.tt.model as model_mod
+
+    assert model_mod._MAX_MOE_CHUNK == 32
+    src = inspect.getsource(TTModel.prefill)
+    assert "_MAX_MOE_CHUNK" in src, "the cap must be enforced, not just recorded"
+    assert "moe_chunk: int = 32" in src.split("\n")[0] or "moe_chunk: int = 32" in src, (
+        "the default must sit inside the verified range"
+    )

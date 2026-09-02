@@ -34,6 +34,12 @@ from .ops import HIFI4, gated_residual_mix, grouped_rms_norm, reinject, rms_norm
 from .weights import TTWeights
 
 
+# Largest MoE row-group that leaves chunked prefill's output unchanged. 8, 16
+# and 32 agree on every token; 64 and 128 degrade monotonically, and why is not
+# yet known. See `TTModel.prefill`.
+_MAX_MOE_CHUNK = 32
+
+
 @dataclass
 class LayerState:
     conv: list | None = None                   # ring of kernel-1 single columns
@@ -1785,7 +1791,7 @@ class TTModel:
         out = ttnn.multiply(out, ttnn.sigmoid(gate))
         return ttnn.linear(out, self.w.blk(layer, "attn_output.weight"), compute_kernel_config=HIFI4)
 
-    def prefill(self, token_ids: list[int], state: TTState, chunk: int = 128, moe_chunk: int = 16):
+    def prefill(self, token_ids: list[int], state: TTState, chunk: int = 128, moe_chunk: int = 32):
         """Consume a prompt in chunks; returns the final hidden state for the last token.
 
         **Not verified yet -- do not wire this into the engine.** It runs, and it
@@ -1820,6 +1826,28 @@ class TTModel:
         |union of selected experts| x M rows, and the union approaches all 512 as
         M grows. Splitting the chunk's MoE into `moe_chunk`-sized pieces trades
         dispatches against that waste (M=128 wastes ~51x, M=16 about 8x).
+
+        Which way that trade falls is a measurement, and the FLOP count is the
+        wrong end of it: a 128-token chunk issues 19733 device calls
+        (`op_count.py --prefill 128`) and is dispatch-bound, so wasting compute
+        to issue fewer calls wins -- up to a point. `moe_chunk_sweep.py` for
+        speed, `device_quality.py --prefill 128 --moe-chunk` for quality:
+
+            moe_chunk    8   3332.8 ms    38.4 tok/s   53.1 % top-1  NLL 3.108
+            moe_chunk   16   2032.6 ms    63.0 tok/s   53.1 % top-1  NLL 3.038
+            moe_chunk   32   1101.0 ms   116.3 tok/s   53.1 % top-1  NLL 3.108
+            moe_chunk   64    936.1 ms   136.7 tok/s   43.8 % top-1  NLL 4.021
+            moe_chunk  128    998.7 ms   128.2 tok/s   21.9 % top-1  NLL 5.477
+
+        The default had been 16, chosen from the waste figures alone; 32 is
+        1.85x faster and agrees with 8 on every token and every NLL digit.
+
+        Above 32 the output degrades, and it is a cliff rather than a slope --
+        8, 16 and 32 agree while 64 and 128 fall away monotonically -- so it
+        reads as a limit crossed in the MoE broadcast path rather than
+        accumulated precision. The cause is not identified. That is why
+        `moe_chunk` is capped rather than merely documented: the fastest setting
+        is on the wrong side of the cliff, and it changes the answer silently.
         """
         from .deltanet import CHUNK
 
@@ -1827,11 +1855,17 @@ class TTModel:
         # `prepare_device` pads a short sequence up to the op's 128-wide chunk
         # with zero decay and zero beta, which leave the carried state untouched,
         # so a chunk *smaller* than CHUNK is well defined -- just wasteful. It is
-        # more accurate: the op's error grows with position inside a chunk
-        # (measured against the reference's own chunked delta rule at layer 0,
-        # 0.36 % at position 0 and 60 % by position 127, and 25-60 % overall at
-        # every DeltaNet layer), so keeping the real tokens near the top of the
-        # chunk is what buys the accuracy back. A chunk *larger* than CHUNK would
+        # more accurate: the error grows with position inside a chunk (against
+        # the reference's own chunked delta rule, `branch_chunk_check.py --seq
+        # 128`: 0.35 % at position 0 rising to ~32 % by position 127, ~32-33 %
+        # overall at layers 0, 4 and 8), so keeping the real tokens near the top
+        # of the chunk is what buys the accuracy back. Half of that growth was
+        # the unstable chunk inverse and is gone -- it read 60 % at position 127
+        # before `block_diag_inverse` -- and what remains is the op's own
+        # accumulation. Note the *token* is unaffected: prefilling 128 tokens
+        # scores 53.1 % next-token top-1 against 51.6 % for stepping the same
+        # ones, which is iteration 013's lesson that a per-layer distance cannot
+        # tell noise from a bug. A chunk *larger* than CHUNK would
         # need the op's inter-chunk scan, which this path does not build here.
         # It must also be a whole number of tiles: `fill_cache` asserts
         # `update_idx % TILE_HEIGHT == 0`, and the attention chunk writes the K/V
@@ -1840,6 +1874,14 @@ class TTModel:
             raise ValueError(
                 f"chunk must be a multiple of {ttnn.TILE_SIZE} in "
                 f"{ttnn.TILE_SIZE}..{CHUNK} (the op's chunk width), got {chunk}"
+            )
+        if not 0 < moe_chunk <= _MAX_MOE_CHUNK:
+            raise ValueError(
+                f"moe_chunk must be in 1..{_MAX_MOE_CHUNK}, got {moe_chunk}. Above "
+                f"{_MAX_MOE_CHUNK} the MoE block silently returns something worse: "
+                "on a 128-token chunk next-token top-1 falls from 53.1 % to 43.8 % "
+                "at 64 and 21.9 % at 128, while 8, 16 and 32 agree on every token. "
+                "Raise the cap with a measurement, not a reason."
             )
         if state.batch != 1:
             raise NotImplementedError("chunked prefill is single-sequence for now")

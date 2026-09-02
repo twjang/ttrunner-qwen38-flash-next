@@ -57,14 +57,15 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 |---|---|
 | single user, 1 slot, 262144 ctx, traced | **236 ms/step**; eager 469 ms |
 | same, QSA selection on (context in (2048, 65536]) | 297 ms/step at 8192 |
-| same, eager, chunked prefill on | prompt at ~45 ms/token |
+| same, eager, chunked prefill on | prompt at **8.6 ms/token** (was ~45) |
 | `step_n` verifying k tokens, traced | 255 ms at k=2, 276.6 at k=4, 323.9 at k=8 |
 | same, eager | 496 ms/step |
 | batch 64, eager, fused experts | 97.4 tok/s aggregate |
 | server, 32 concurrent | 37.84 tok/s |
-| prefill, 128 tokens | 5.77 s (11.3× the step path) — **not correct yet**, see §5 |
-| unit tests | `uv run pytest -q tests` → 130 passed, ~3 s, no hardware needed |
-| **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; chunked prefill 87.5 %; float32 reference 80.9 % / 2.00** |
+| prefill, 128 tokens, `moe_chunk=32` | **1101 ms** (116.3 tok/s); was 2033 ms at the old `moe_chunk=16` default |
+| unit tests | `uv run pytest -q` → 197 passed, ~3 s, no hardware needed |
+| **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; float32 reference 80.9 %** |
+| chunked prefill, judged against a same-positions decode control | 128 tokens prefilled: **53.1 %** vs 51.6 % stepped; 32 prefilled, 128 scored: **71.9 %** vs 71.7 % |
 
 Step time is flat in position (496 ms at pos 4, 501 ms at pos 65536) and flat
 in batch up to 64 rows. The *eager* path is dispatch-bound -- measured at 0.30 ms
@@ -166,7 +167,25 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     Off *and* over the budget means the device is running a different model, and
     `TTEngine` prints a notice; do not quote a long-context result without
     checking which regime it came from.
-12. **Verification standard.** A change to the model is done when (a) unit
+12. **A device matmul is not a float32 matmul.** `ttnn.matmul` on float32
+    inputs, at HiFi4 with `fp32_dest_acc_en`, is **0.16 %** off torch for a
+    128x128 -- the Tensix multiplier decomposes fp32 into bf16 pieces. Every
+    elementwise op measured is at ~1e-5. So an algorithm that is merely
+    *correct* in float32 can be unusable on device: porting one, check whether
+    it cancels large intermediates against each other. `block_inverse` summed
+    `sum_k (-N)^k`, whose terms reach ~1e8 for an answer bounded by 1; float32
+    hid that at 0.27 absolute error and the device turned it into 620875 %.
+    `block_diag_inverse` replaced it with a blocked form that never grows.
+    Corollary for test design: the old test scaled its off-diagonals to 0.4 and
+    passed, and *magnitude alone does not reproduce the failure* -- random signs
+    cancel inside the powers. Build the fixture the way the model builds the
+    tensor (`test_block_inverse_survives_correlated_keys`).
+13. **A per-layer distance still cannot tell noise from a bug** (013's lesson,
+    re-earned). Chunked prefill's hidden state is ~32 % from the reference by
+    position 127 of a chunk and the *token* is fine: 128 tokens prefilled score
+    53.1 % against 51.6 % for stepping the same ones. Judge prefill by a
+    same-positions decode control, which is what `--score-from` is for.
+14. **Verification standard.** A change to the model is done when (a) unit
     tests pass, (b) `device_quality.py` is run and next-token accuracy does not
     regress from 83 %, (c) the number it claims to move is measured with the
     hygiene in (7), and (d) if it touches prefill, `device_quality.py --prefill`
@@ -196,7 +215,7 @@ is back to 236.1 ms from 239.1; attn_qkv costs ~200 MB more per device.
 what any change to the plan or the shard layout needs.
 
 
-### 5.2 Chunked prefill inside the trace — blocked on an on-device `prepare()`
+### 5.2 Chunked prefill inside the trace — the `prepare()` blocker is gone
 
 Chunked prefill works and is on for one-slot engines, but it turns the trace off:
 it runs eagerly and allocates gigabytes of temporaries per call, and after a few
@@ -204,16 +223,51 @@ of them the trace replay came back as token 0 repeated. Eager prefill is correct
 -- warm and cold turns agree token for token -- so this is about getting both at
 once.
 
-Capturing a second trace for the prefill graph does not work as things stand:
-`_linear_attention_chunk` builds `gated_delta_attn_seq`'s eight inputs on the
-**host** (`deltanet.prepare()`, ~30 MB round trip per layer per chunk), and host
-work is invisible to a capture. So the real prerequisite is the roadmap's A1.1,
-moving `prepare()` onto the device; only then is there a graph to capture.
+**The stated prerequisite is done.** `deltanet.prepare_device` builds
+`gated_delta_attn_seq`'s eight inputs on device, in the op's own
+`[H, NC, C, D]` layout, so each device prepares the heads it already holds and
+nothing is gathered. The chunk path contains no host round trip at all --
+`tests/test_prefill_contract.py::test_chunked_deltanet_never_leaves_the_device`
+keeps it that way -- and the chunk's fixed cost fell from ~1.3 s to 850 ms.
+Doing it turned up a real bug in *both* engines; see `docs/iterations/017`.
 
-Until then the flag is the right choice for prompt-heavy work and the wrong one
-for generation-heavy work: a 2000-token prompt with 200 output tokens is ~194 s
-eager-and-prefilled against ~1047 s traced-and-stepped, and short prompts invert
-it. Prefix reuse makes later turns of a chat cheap either way.
+**What blocks it now, precisely.** Four host dependencies remain, all in
+`_attention_chunk`:
+
+1. `self.rope(range(start, start + seq))` builds cos/sin on the host and copies
+   them in. Needs a pre-allocated device buffer written before replay, exactly
+   as `TracedDecoder._fill_inputs` already does for the decode inputs.
+2. `ttnn.fill_cache(..., update_idx=start)` takes a Python int, so a capture
+   bakes in one slot and every replay writes it again.
+3. The causal mask is built with `torch.arange` and copied in.
+4. `kv_len` grows with the chunk index, so the shapes are not static and one
+   trace cannot cover every chunk.
+
+**The route, and it is better than the docstring in `_attention_chunk`
+suggests.** Two ops already do what is needed, both verified present in this
+build (`scripts/dev/` probes):
+
+* `ttnn.experimental.paged_fill_cache(cache, input, page_table, ...)` takes the
+  page table as a *device tensor*, so where a chunk lands is data, killing (2).
+* `ttnn.transformer.chunked_scaled_dot_product_attention` accepts
+  `chunk_start_idx_tensor` (int32, shape `[1]`, on device) and its own docs name
+  the use case: "Trace capture/replay: capture one SDPA call, then replay with
+  different chunk_start_idx by updating the tensor on device (no recompile). One
+  program handles variable prefix lengths by updating the tensor each step."
+  It is causal internally, so it kills (3) and (4) together.
+
+The cost is that both want a paged K/V cache -- `[max_num_blocks, 1, block_size,
+head_dim]` plus a page table -- while `st.keys`/`st.values` are flat
+`[1, n_kv, T, head_dim]`. Decode calls
+`ttnn.experimental.paged_update_cache(update_idxs_tensor=)` on that flat cache
+and works; repaging touches decode too, so do it behind a measurement of decode
+quality (`device_quality.py`, 83.0 % top-1 / NLL 0.682) and not in the same
+change as anything else.
+
+**Worth it?** Yes, and the number is large: a 128-token chunk issues 19733
+device calls (`op_count.py --prefill 128`) against 6355 for a single-token step,
+and at 936-1101 ms per chunk that is ~0.06 ms a call -- the chunk is
+dispatch-bound, which is precisely what a trace removes.
 
 Done when: `use_trace=True` and `chunked_prefill=True` together reproduce the
 eager result token for token over
@@ -379,6 +433,35 @@ shapes. And every PR here needs the same A/B: `device_quality.py` unchanged,
 `op_count.py` before and after, and `bench_step.py` at one configuration for
 both paths.
 
+
+### 5.8 The MoE row-group cliff — a real bug, currently walled off
+
+`prefill(moe_chunk=)` groups rows for the MoE. Speed says take the biggest group
+you can; the output says otherwise, and the shape of the disagreement is the
+interesting part:
+
+| moe_chunk | wall clock | tok/s | next-token top-1 | NLL |
+|---|---|---|---|---|
+| 8 | 3332.8 ms | 38.4 | 53.1 % | 3.108 |
+| 16 | 2032.6 ms | 63.0 | 53.1 % | 3.038 |
+| 32 | **1101.0 ms** | 116.3 | 53.1 % | 3.108 |
+| 64 | 936.1 ms | 136.7 | 43.8 % | 4.021 |
+| 128 | 998.7 ms | 128.2 | 21.9 % | 5.477 |
+
+8, 16 and 32 agree on every token (8 and 32 agree to every NLL digit); 64 and
+128 fall away monotonically. A slope would be accumulated precision. A cliff
+between 32 and 64 is a **limit being crossed** somewhere in the MoE broadcast
+path, and there is a known candidate: `ttnn.scatter` takes uint16 indices only,
+which caps reach at 65536, and the broadcast formulation materialises
+|union of selected experts| x M rows.
+
+`_MAX_MOE_CHUNK = 32` refuses anything larger, because the fastest setting is on
+the wrong side and it changes the answer silently. Do not raise the cap to buy
+the remaining 1.2x without finding the cause first.
+
+Done when: the mechanism is identified and either fixed -- 64 and 128 agreeing
+with 32 on every token -- or the cap is justified by the op limit that forces it,
+in `_moe_block` where the next reader will look.
 
 ## 6. Recipes
 
