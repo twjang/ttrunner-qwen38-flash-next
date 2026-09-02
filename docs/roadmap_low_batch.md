@@ -1,5 +1,15 @@
 # Roadmap: chunked prefill and the batch < 4 regime
 
+> **Superseded in part by `docs/iterations/013` (2026-09-02).** Part A's premise
+> — that prefill is the thing that is wrong — did not survive measurement: the
+> decode path had a bug of its own, and so did the CPU reference that both were
+> being judged against. Four correctness fixes later, accuracy against the
+> float32 oracle (decode 40.4 %, prefill 27.3 % of greedy tokens on real text)
+> is the project's open problem, and `docs/HANDOFF.md` §5 carries the current
+> ordering. A5 (the missing QSA indexer) and all of Part B still stand as
+> written; the speculation items in B1/B2 are only *exact* once 5.1 is closed,
+> because speculation reproduces whatever the verifier does.
+
 Date: 2026-09-02. Status of the code this is written against: branch
 `feat/ttnn-inference-stack`, single user, 1 slot, 262144-token context, traced
 decode at **229 ms/step** (496 ms eager). Everything below is a proposal with the
