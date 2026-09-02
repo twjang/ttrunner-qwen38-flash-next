@@ -150,6 +150,10 @@ class TTModel:
         # only -- the host->device copies that fill the bound buffers happen
         # outside it, so they are suppressed here.
         self._skip_copy = False
+        # Per-device selection of the K/Q heads this device's V heads need; see
+        # `head_select`. One matrix serves all 36 DeltaNet layers.
+        self._head_select = None
+
         # Debug hook: called as probe(layer, hidden) after every layer in both
         # `step` and `prefill`, so the two paths can be bisected layer by layer.
         # Never set while tracing (host callbacks are invisible to capture).
@@ -186,6 +190,48 @@ class TTModel:
 
     def all_reduce(self, t: ttnn.Tensor) -> ttnn.Tensor:
         return ttnn.all_reduce(t, cluster_axis=1, topology=ttnn.Topology.Linear)
+
+    def all_gather(self, t: ttnn.Tensor) -> ttnn.Tensor:
+        return ttnn.all_gather(t, dim=-1, cluster_axis=1, topology=ttnn.Topology.Linear)
+
+    @property
+    def head_select(self) -> ttnn.Tensor:
+        """Picks each device's twelve K/Q heads out of the gathered sixteen.
+
+        V heads are stored tiled over K heads, so global v-head j reads global
+        k-head `j % n_k`. Device d owns v-heads [12d, 12d+12) but only k-heads
+        [4d, 4d+4), and `12d+i mod 16` walks outside that block for most i --
+        device 0 alone needs k-heads 0-11, which live on three devices. There is
+        no expansion of the local heads that produces the right pairing, which is
+        why the step path was wrong however it expanded (25.5 % next-token top-1
+        against the reference's 80.9 %).
+
+        So gather all sixteen heads and let each device select its own twelve.
+        The selection is a fixed 0/1 matrix -- exact in any dtype -- and the same
+        one serves every DeltaNet layer, so it is built once: [n_k*hd, n_v*hd]
+        per device, sharded on the last dim so each device gets its own.
+
+        The alternative is to fix the shard layout at conversion time and give
+        device d those twelve heads directly, which costs nothing at all at
+        runtime (~200 MB more per device for attn_qkv and ssm_conv1d, and the
+        expansion disappears). This is the version that needs no re-conversion.
+        """
+        if self._head_select is None:
+            hd = self.cfg.linear_head_dim
+            n_k_global = self.n_k_local * self.n_dev
+            eye = torch.eye(hd)
+            blocks = []
+            for d in range(self.n_dev):
+                sel = torch.zeros(n_k_global * hd, self.n_v_local * hd)
+                for i in range(self.n_v_local):
+                    src = (self.n_v_local * d + i) % n_k_global
+                    sel[src * hd : (src + 1) * hd, i * hd : (i + 1) * hd] = eye
+                blocks.append(sel)
+            self._head_select = ttnn.from_torch(
+                torch.cat(blocks, dim=-1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=-1),
+            )
+        return self._head_select
 
     # -- rope -------------------------------------------------------------
 
@@ -418,23 +464,11 @@ class TTModel:
         k = self._slice_last(qkv, kd, 2 * kd)
         v = self._slice_last(qkv, 2 * kd, 2 * kd + self.value_dim_local)
 
-        # V heads are grouped over K heads -- v-head j reads k-head j // reps --
-        # so Q/K expand by repeat_interleave, matching upstream. This is also the
-        # only expansion compatible with head-sharding: device d holds k-heads
-        # [4d, 4d+4) and v-heads [12d, 12d+12), and the global pairing sends
-        # v-head 12d+i to k-head 4d + i//reps, which is exactly what interleaving
-        # the local heads produces. Tiling (repeat) pairs v-head j with k-head
-        # j % n_k instead, which no device holds the k heads for.
-        #
-        # The expansion has to happen *inside* each sequence: flattening batch
-        # and head together first would wrap across sequences and pair sequence
-        # b's query with sequence b-1's value.
-        # `repeat` along a new axis -- reshape to (batch*n_k, 1, 1, hd), copy
-        # `reps` times, flatten -- expresses the same grouping and was measured
-        # to cost the same (237.2 vs 236.4 ms traced, inside the noise), so the
-        # clearer form stays.
-        q = ttnn.repeat_interleave(ttnn.reshape(q, (batch, 1, n_k, hd)), reps, dim=2)
-        k = ttnn.repeat_interleave(ttnn.reshape(k, (batch, 1, n_k, hd)), reps, dim=2)
+        # V heads are stored tiled over K heads, and this device's twelve V heads
+        # need K heads that live on three other devices -- see `head_select`.
+        # Gather all sixteen and select, rather than expanding the local four.
+        q = ttnn.linear(self.all_gather(q), self.head_select, compute_kernel_config=HIFI4)
+        k = ttnn.linear(self.all_gather(k), self.head_select, compute_kernel_config=HIFI4)
         q = ttnn.reshape(q, (batch * n_v, 1, 1, hd))
         k = ttnn.reshape(k, (batch * n_v, 1, 1, hd))
         v = ttnn.reshape(v, (batch * n_v, 1, 1, hd))
@@ -1019,12 +1053,29 @@ class TTModel:
         b_all = torch.sigmoid(gather(b, n_v))
         reps = n_v // n_k
 
+        # V heads are stored tiled over K heads: global v-head j reads global
+        # k-head `j % n_k_global`. Device d holds v-heads [12d, 12d+12) but only
+        # k-heads [4d, 4d+4), so the pairing it needs is *not* satisfiable from
+        # its own shard -- tiling the four local k heads, which is what this did,
+        # is a third pairing that matches no convention.
+        #
+        # Here it costs nothing to be right: `gather` already brought every
+        # device's channels to the host, so the global q/k heads are all in hand
+        # and each device's twelve can simply be indexed out of them.
+        n_k_global = n_k * self.n_dev
+        q_global = torch.cat([qkv_all[e][..., :kd] for e in range(self.n_dev)], dim=-1)
+        k_global = torch.cat(
+            [qkv_all[e][..., kd : 2 * kd] for e in range(self.n_dev)], dim=-1
+        )
+        q_global = q_global.reshape(1, seq, n_k_global, hd)
+        k_global = k_global.reshape(1, seq, n_k_global, hd)
+
         per_dev = []
         for d in range(self.n_dev):
             qkv_h = qkv_all[d]
-            # grouped, not tiled -- see _linear_attention_step
-            q_h = qkv_h[..., :kd].reshape(1, seq, n_k, hd).repeat_interleave(reps, dim=2)
-            k_h = qkv_h[..., kd : 2 * kd].reshape(1, seq, n_k, hd).repeat_interleave(reps, dim=2)
+            heads = [(n_v * d + i) % n_k_global for i in range(n_v)]
+            q_h = q_global[:, :, heads, :]
+            k_h = k_global[:, :, heads, :]
             v_h = qkv_h[..., 2 * kd :].reshape(1, seq, n_v, hd)
             prep = prepare(q_h, k_h, v_h, g_all[d], b_all[d])
             prep.pop("_meta")

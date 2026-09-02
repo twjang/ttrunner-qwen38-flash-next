@@ -216,17 +216,21 @@ class Qwen4ExpModel:
         dt_bias = self.bw(layer, "ssm_dt.bias")
         g = a_decay.float() * F.softplus(a.float() + dt_bias.float())
 
-        # V heads are grouped over K heads: v-head j reads k-head j // reps. That
-        # is repeat_interleave, as upstream does it
-        # (modeling_qwen4_exp.py: `query.repeat_interleave(num_v_heads //
-        # num_k_heads, dim=2)`). Tiling instead pairs v-head j with k-head
-        # j % n_k, which is a different model -- and one that cannot be
-        # head-sharded at all, since a device holding a contiguous block of v
-        # heads would need k heads from every other device.
+        # V heads are stored TILED over K heads in this checkpoint: v-head j
+        # reads k-head `j % n_k`, so Q/K expand with `repeat`, not
+        # `repeat_interleave`.
+        #
+        # Upstream's HF code interleaves (`modeling_qwen4_exp.py:594`), and
+        # taking that at face value cost a day: the GGUF converter permutes the
+        # head order, so the two are not the same model here. The arbiter is what
+        # the float32 reference does on real text -- tiling predicts the next
+        # token 80.9 % of the time (mean NLL 0.703), grouping 12.8 % (NLL 8.4).
+        # Greedy samples cannot tell them apart; both read as fluent English.
+        # `scripts/dev/reference_quality.py` is that measurement.
         if n_v > n_k:
             reps = n_v // n_k
-            query = query.repeat_interleave(reps, dim=2)
-            key = key.repeat_interleave(reps, dim=2)
+            query = query.repeat(1, 1, reps, 1)
+            key = key.repeat(1, 1, reps, 1)
 
         prev_state = cache[layer].recurrent_state if cache is not None else None
         rule = recurrent_gated_delta_rule if seq == 1 else chunk_gated_delta_rule

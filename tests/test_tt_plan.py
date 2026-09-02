@@ -227,54 +227,70 @@ def test_shared_expert_gate_is_a_column() -> None:
         assert tuple(device_layout(name, torch.zeros(n)).shape) == (1, 1, 1, n), name
 
 
-def test_head_expansion_is_grouped_and_per_sequence() -> None:
-    """V heads are *grouped* over K heads: v-head j reads k-head j // reps.
+def test_head_expansion_is_tiled_and_per_sequence() -> None:
+    """V heads are stored *tiled* over K heads: v-head j reads k-head j % n_k.
 
-    That is repeat_interleave, which is what upstream does
-    (`query.repeat_interleave(num_v_heads // num_k_heads, dim=2)`). Tiling
-    instead -- pairing v-head j with k-head j % n_k -- is a different model, and
-    it cost the device path 41 % against the float32 reference in the very first
-    DeltaNet layer.
+    Upstream's HF code interleaves instead
+    (`query.repeat_interleave(num_v_heads // num_k_heads, dim=2)`), and taking
+    that at face value cost a day: the GGUF converter permutes the head order,
+    so the two are not the same model on this checkpoint. The arbiter is the
+    float32 reference's next-token accuracy on real text -- 80.9 % tiled against
+    12.8 % grouped. Greedy samples cannot tell them apart; both read as fluent
+    English.
 
-    Grouping is also what removes the batch hazard tiling had: interleaving
-    never wraps past a head, so flattening (batch, head) first gives the same
-    answer, where tiling the flattened block paired sequence 0's heads with
-    sequence 1's data for any batch > 1.
+    The expansion also has to happen inside each sequence: flattening (batch,
+    head) first and then tiling pairs sequence 0's heads with sequence 1's data
+    for any batch > 1.
     """
     batch, n_k, reps, hd = 3, 16, 3, 4
     n_v = n_k * reps
     q = torch.arange(batch * n_k * hd, dtype=torch.float32).reshape(batch, 1, n_k, hd)
 
-    good = q.repeat_interleave(reps, dim=2).reshape(batch * n_v, hd)
+    good = q.repeat(1, 1, reps, 1).reshape(batch * n_v, hd)
     for b in range(batch):
         for j in range(n_v):
-            assert torch.equal(good[b * n_v + j], q[b, 0, j // reps]), "grouping broke"
+            assert torch.equal(good[b * n_v + j], q[b, 0, j % n_k]), "tiling broke"
 
-    tiled = q.repeat(1, 1, reps, 1).reshape(batch * n_v, hd)
-    assert not torch.equal(good, tiled), "tiling and grouping must differ"
-    # grouping is order-insensitive here; tiling was not
-    assert torch.equal(good, q.reshape(batch * n_k, hd).repeat_interleave(reps, dim=0))
-    assert not torch.equal(tiled, q.reshape(batch * n_k, hd).repeat(reps, 1))
+    grouped = q.repeat_interleave(reps, dim=2).reshape(batch * n_v, hd)
+    assert not torch.equal(good, grouped), "tiling and grouping must differ"
+    flattened_first = q.reshape(batch * n_k, hd).repeat(reps, 1)
+    assert not torch.equal(good, flattened_first[: good.shape[0]]), "must tile per sequence"
 
 
-def test_grouped_expansion_survives_head_sharding() -> None:
-    """Grouping is the only expansion a head-sharded DeltaNet can implement.
+def test_tiling_cannot_be_served_from_a_contiguous_head_shard() -> None:
+    """Which is why the decode step gathers all K heads before selecting.
 
-    Device d holds k-heads [d*n_k/D, ...) and v-heads [d*n_v/D, ...). Under
-    grouping, global v-head j needs k-head j // reps, which always lands in the
-    same device's own shard -- so expanding the local heads gives the global
-    answer. Under tiling, v-head j needs k-head j % n_k, which is spread over
-    every device.
+    Device d holds k-heads [d*n_k/D, ...) and v-heads [d*n_v/D, ...). Tiling
+    sends global v-head j to global k-head j % n_k, and that walks straight out
+    of the device's own block -- device 0's twelve v heads need k-heads 0-11,
+    which live on three devices. No expansion of the four local heads produces
+    it, so `TTModel.head_select` picks each device's twelve out of an
+    all-gathered sixteen.
     """
     n_k, reps, n_dev = 16, 3, 4
     n_v = n_k * reps
     k_per, v_per = n_k // n_dev, n_v // n_dev
     for d in range(n_dev):
-        for i in range(v_per):
-            j = d * v_per + i                       # global v head
-            assert j // reps == d * k_per + i // reps, "grouping must stay on-device"
-    # tiling does not: device 0's v heads need k heads it does not hold
-    assert any((d * v_per + i) % n_k >= k_per for d in (0,) for i in range(v_per))
+        needed = {(d * v_per + i) % n_k for i in range(v_per)}
+        held = set(range(d * k_per, (d + 1) * k_per))
+        assert not needed <= held, f"device {d} would not have needed the gather"
+        assert len(needed) == v_per, "each device needs twelve distinct k heads"
+
+
+def test_head_select_matrix_picks_the_right_heads() -> None:
+    """The selection built in `TTModel.head_select`, as plain torch."""
+    hd, n_k, n_dev = 4, 16, 4
+    n_v_local = (n_k * 3) // n_dev
+    gathered = torch.arange(n_k * hd, dtype=torch.float32)      # head h -> values h*hd..
+    for d in range(n_dev):
+        sel = torch.zeros(n_k * hd, n_v_local * hd)
+        for i in range(n_v_local):
+            src = (n_v_local * d + i) % n_k
+            sel[src * hd : (src + 1) * hd, i * hd : (i + 1) * hd] = torch.eye(hd)
+        out = (gathered @ sel).reshape(n_v_local, hd)
+        for i in range(n_v_local):
+            src = (n_v_local * d + i) % n_k
+            assert torch.equal(out[i], gathered[src * hd : (src + 1) * hd]), (d, i)
 
 
 def test_reinject_broadcast_equals_the_slice_form() -> None:
