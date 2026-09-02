@@ -190,64 +190,101 @@ is back to 236.1 ms from 239.1; attn_qkv costs ~200 MB more per device.
 what any change to the plan or the shard layout needs.
 
 
-### 5.2 Chunked prefill inside the trace (2-3 days)
+### 5.2 Chunked prefill inside the trace — blocked on an on-device `prepare()`
 
-Chunked prefill works and is on for one-slot engines, but it turns the trace
-off: it runs eagerly and allocates gigabytes of temporaries per call, and after
-a few of them the trace replay came back as token 0 repeated. Eager prefill is
-correct — warm and cold turns agree token for token — so this is about getting
-both at once, not about correctness.
+Chunked prefill works and is on for one-slot engines, but it turns the trace off:
+it runs eagerly and allocates gigabytes of temporaries per call, and after a few
+of them the trace replay came back as token 0 repeated. Eager prefill is correct
+-- warm and cold turns agree token for token -- so this is about getting both at
+once.
 
-A 2000-token prompt with 200 output tokens is ~194 s eager-and-prefilled against
-~1047 s traced-and-stepped, so today the flag is the right choice for
-prompt-heavy work and wrong for generation-heavy work. Fixing it means either
-confining prefill's allocations away from the captured buffers, or capturing a
-second trace for the prefill graph (its shapes are static once `chunk` is
-fixed).
+Capturing a second trace for the prefill graph does not work as things stand:
+`_linear_attention_chunk` builds `gated_delta_attn_seq`'s eight inputs on the
+**host** (`deltanet.prepare()`, ~30 MB round trip per layer per chunk), and host
+work is invisible to a capture. So the real prerequisite is the roadmap's A1.1,
+moving `prepare()` onto the device; only then is there a graph to capture.
+
+Until then the flag is the right choice for prompt-heavy work and the wrong one
+for generation-heavy work: a 2000-token prompt with 200 output tokens is ~194 s
+eager-and-prefilled against ~1047 s traced-and-stepped, and short prompts invert
+it. Prefix reuse makes later turns of a chat cheap either way.
 
 Done when: `use_trace=True` and `chunked_prefill=True` together reproduce the
-eager result token for token over the three-turn check in
+eager result token for token over
 `scripts/dev/prefix_reuse_check.py --chunked --trace`.
 
 
-### 5.3 QSA indexer on device (2-3 days; correctness for > 2048 tokens)
+### 5.3 QSA indexer on device (2-3 days; correctness beyond 2048 tokens)
 
-Unchanged and still real: attention is dense causal in both paths, so the device
-is exact only below 2048 tokens. Entry points: `_attention_step` in
-`tt/model.py`; the reference implementation is `_indexer_mask` in
-`reference/model.py` (whose per-query tail semantics 013 fixed -- read that
-first, the old ones were wrong); `ttnn.experimental.indexer_score_dsa` was
-validated at 1.0 % in iteration 007; the weights are already on device and
-`LayerState.indexer_keys` is the reserved slot.
+Attention is dense causal in both paths, so the device is exact only below 2048
+tokens -- below the budget QSA retains every complete block, and dense is then
+the same thing. Beyond it the device attends to everything where the model would
+attend to 2048 selected tokens: a different model, and one nobody has measured.
 
-Keep shapes static so the step stays traceable: always select exactly 512
-blocks, masking the surplus below 2048.
+**The design is settled and every op it needs was probed on hardware
+(2026-09-02).** Build it as a compact gather, not as a mask:
 
-What was checked before writing any of it (2026-09-02), so it need not be
-rediscovered:
+1. Keep the pooled block cache, not the raw keys. Block j's value is
+   `rms_norm(mean(raw_k[4j..4j+4]), k_norm)` roped at position `4j`, and it never
+   changes once complete -- so compute it incrementally and store it already
+   normed and roped: `(batch, 1, max_seq/4, 128)`, 16 MB a layer at full context.
+2. Write it unconditionally, which is what tracing needs: keep the last four raw
+   keys in a shift ring (the mean is order-independent), and every step write
+   `pooled[p // 4] = mean(ring)` roped at `4 * (p // 4)`. At `p % 4 == 3` all
+   four slots belong to block `p // 4`; at other p the value is wrong and the
+   block is ineligible, and it is overwritten before it becomes eligible.
+3. Score with a plain matmul: q is `[1, 4, 1, 128]` after `q_norm` and rope at p,
+   pooled is `[1, 1, 128, n_blocks]`; relu, sum over the four heads, scale by
+   `1/sqrt(128)`. `indexer_score_dsa` also exists but takes its causality offset
+   as a Python int, which a trace bakes in -- see below.
+4. Mask ineligible blocks (`4j + 3 > p`) with an additive tensor built on the
+   host, one per step shared by all twelve layers, then `ttnn.topk(scores, 512)`.
+5. Expand the 512 block indices to 2048 token indices and **gather the K/V**:
+   `ttnn.gather(cache, dim=-2, index=idx)` with `idx` uint32 in TILE_LAYOUT and
+   the output's shape `[b, n_kv, 2048, hd]`. Then `sdpa_decode` over that compact
+   cache with `is_causal=False`. Attention becomes constant-cost in position,
+   which is a bonus.
+6. The tail -- positions `4 * ((p + 1) // 4)` to p -- is always visible; fold it
+   into the selected set before the gather.
 
-* `ttnn.transformer.scaled_dot_product_attention_decode` **does** take
-  `attn_mask` (`[b, 1, s, s]`), so the selection can be applied to the existing
-  decode attention rather than replacing it.
-* `ttnn.experimental.indexer_score_dsa` computes
-  `sum_h relu(q[b,h,s,:] . k[b,t,:]) * weights[b,h,s]`. Our scoring has no
-  learned per-head gate, so pass `weights = 1/sqrt(indexer_head_dim)`. Two
-  catches: it scores against *per-token* keys, and this model scores pooled
-  4-token blocks, so `k` has to be the pooled cache with `T = n_blocks`; and its
-  causality is `t <= chunk_start_idx + s`, which for block scoring needs
-  `chunk_start_idx = (p + 1) // 4 - 1` — a Python int, therefore **baked into a
-  captured trace**. Either keep the indexer out of the traced region or score
-  with matmul + relu + sum and mask from a tensor, which is traceable.
-* The pooled-block cache can be written unconditionally, which is what tracing
-  needs: at position p write `pooled[p // 4] = mean(raw[4*(p//4) .. +4])` every
-  step. A partially filled block holds a wrong value, but a block is only
-  eligible once `4j + 3 <= p`, by which point all four slots are real.
-* Read `_indexer_mask` in `reference/model.py` as it is *now*: its tail is
-  per-query (`docs/iterations/013`, observation 4). The old global-`kv_len`
-  form is what made the reference disagree with itself.
+Probed on hardware, so do not re-derive:
 
-Done when: device and reference agree on the next token after a 3000-token
-prompt, the < 2048 result is unchanged, and step time is within 5 % of 236 ms.
+* `ttnn.topk(x, 512, dim=-1)` works at n = 2048, 8192 **and 65536** (full
+  context). ✓
+* `ttnn.gather(cache, dim=-2, index=...)` needs the index **uint32 in
+  TILE_LAYOUT** and shaped like the output; int32 and ROW_MAJOR both assert. ✓
+* `sdpa_decode`'s `attn_mask` is a dead end. It must carry Q's head count
+  (`Expect same number of heads in mask as in Q`), so at full context that is a
+  12.6 MB mask per layer per step, and `[b, 1, 24, S]` throws at program build
+  anyway.
+* `ttnn.scatter` rejects int32 and uint32 indices and accepts **uint16** -- worth
+  knowing, though the gather design does not need it.
+* `_apply_rope_dev` rotates the leading `rope_dim`=64 dims and passes the rest,
+  so it handles the indexer's 128-wide vectors unchanged.
+* `indexer_score_dsa` computes
+  `sum_h relu(q[b,h,s,:] . k[b,t,:]) * weights[b,h,s]` -- pass
+  `weights = 1/sqrt(128)`, since this model has no learned per-head gate. It
+  scores per-token keys, so feed it the pooled cache with `T = n_blocks`, and its
+  causality is `t <= chunk_start_idx + s`, needing
+  `chunk_start_idx = (p + 1) // 4 - 1`: a Python int, therefore baked into a
+  capture. Either keep the indexer out of the traced region or use the matmul
+  form in (3).
+* Config: `indexer_heads` 4, `indexer_head_dim` 128, `indexer_budget` 2048,
+  `indexer_compress_ratio` 4 -- so 512 blocks of 4, and 65536 blocks at full
+  context.
+
+Read `_indexer_mask` in `reference/model.py` as it is *now*: its tail is
+per-query (`docs/iterations/013`, observation 4).
+
+**Verify it without a full reference forward.** A 3000-token reference forward is
+hours; do not attempt it. Instead: (a) compare the device's selected block set
+against `ref._indexer_mask` on the same inputs at a handful of positions past
+2048 -- the selection is the whole feature; (b) check `device_quality.py` is
+unchanged below 2048, where selection must be a no-op; (c) run
+`device_quality.py` on a >2048-token text and confirm it does not regress.
+
+Done when: (a), (b) and (c) hold and the traced step is within 5 % of 236 ms.
+
 
 ### 5.4 Prefix reuse across turns — **done**
 
