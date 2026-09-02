@@ -523,6 +523,26 @@ re-shapes every layer rather than adding anything.
 * alternating two captures of the *same* model-scale graph does not;
 * tiny traces do not reproduce any of it, so the defect needs scale.
 
+**Four workarounds excluded by experiment, so they are not re-tried:**
+
+1. `ttnn.synchronize_device` between the replays — no effect. Both
+   `execute_trace` calls already pass `blocking=True`, and with no `cq_id` the
+   sync waits on every queue.
+2. A second command queue — stops the hang and is *worse*: the replay does not
+   execute, it merely stops blocking, returning `[201058, 0]` where the eager
+   `step_n` returns `[75, 220]`, in 12 ms against 265.
+3. An ordinary (non-trace) program between the replays, on the theory that
+   normal dispatch maintains what the trace path leaves stale
+   (`TWTEST_EAGER_BETWEEN=1`) — still hangs.
+4. `MeshDevice.reset_sub_device_stall_group()` between the replays, since
+   `enqueue_trace` updates worker state per sub-device (`TWTEST_RESET_STALL=1`)
+   — still hangs.
+
+There is no host-side lever left that I can see. The one candidate that still
+fits — per-program config-buffer state — cannot be varied from Python; it needs
+an instrumented tt-metal build, which is what
+`docs/upstream/trace_alternation_hang.md` is for.
+
 **Next step is upstream.** The report must carry the model-scale harness
 (`spec_capture_ladder.py`, stages `both_replay` and `two_stepn`, with `two_same`
 and `stepn_only` as controls) rather than a tidy standalone script, because the

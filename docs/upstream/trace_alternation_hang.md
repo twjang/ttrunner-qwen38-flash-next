@@ -98,6 +98,9 @@ model graphs are thousands of ops with hundreds of distinct kernels.
   returns `[75, 220]`, in 12 ms against 265).
 * **An ordinary program between the replays**, on the theory that non-trace
   dispatch would resync whatever the trace path leaves stale. Still hangs.
+* **`MeshDevice.reset_sub_device_stall_group()` between the replays**, since
+  `enqueue_trace` takes per-sub-device ownership and updates worker state indexed
+  by sub-device. Still hangs.
 * **Capture order and allocation.** Capturing both before replaying either,
   allocating all buffers before any capture, capturing on a worker thread,
   `max_seq_len` 512 vs 2048, and an explicit `trace_region_size` (default vs

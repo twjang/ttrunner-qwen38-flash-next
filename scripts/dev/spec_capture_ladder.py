@@ -207,6 +207,13 @@ def two_stepn():
     b = TracedStepN(m, st, k2)
     print("RESULT both captured; replaying k=2", flush=True)
     a.step_n(toks[8:10])
+    if os.environ.get("TWTEST_RESET_STALL"):
+        # `enqueue_trace` takes per-sub-device ownership and updates worker state
+        # indexed by sub-device, so anything that resets that grouping between
+        # replays is worth one try before concluding there is no host-side fix.
+        print("RESULT reset_sub_device_stall_group between the replays", flush=True)
+        mesh.reset_sub_device_stall_group()
+        ttnn.synchronize_device(mesh)
     if os.environ.get("TWTEST_EAGER_BETWEEN"):
         # The mechanism says the *host* launch-message pointer is left at the
         # executed trace's program count while the next trace was recorded
