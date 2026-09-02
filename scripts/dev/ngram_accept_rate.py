@@ -12,11 +12,19 @@ Prompt-lookup drafting: find the most recent earlier occurrence of the last
 `ngram` tokens and propose the `k` tokens that followed it. No draft model, no
 extra weights.
 
-Then price it. With `step_n` at k costing `T(k)` and a single step costing `S`:
-a round where the drafter fires costs `T(k)` and emits j+1 tokens; a round where
-it does not fire costs `S` and emits one. Charging `T(k)` for *every* round --
-which the first version of this did -- understates the scheme badly, because the
-drafter fires on a small minority of positions.
+Then price it honestly, which for a recurrent model means paying for the
+rollback. `step_n` advances the state by all k tokens; if only j are accepted the
+DeltaNet recurrent state and the convolution rings are ahead by k-j and there is
+no truncating them the way a transformer truncates its K/V cache. So a partial
+round costs a snapshot, the verify, a restore, and a replay of the accepted
+prefix:
+
+    drafter fires, all k accepted    T(k)                       -> k+1 tokens
+    drafter fires, j < k accepted    T(k) + T(j+1) + 2*SNAP     -> j+1 tokens
+    drafter does not fire            S                          -> 1 token
+
+Ignoring the replay is what makes speculation look better than it is: it is the
+dominant correction here.
 """
 import sys
 
@@ -61,9 +69,16 @@ def generate(prompt):
     return out
 
 
-# measured on this machine, scripts/dev/step_n_bench.py (eager)
-STEP_EAGER, STEP_TRACED = 517.8, 236.1
-T = {1: 531.5, 2: 672.3, 4: 864.4, 8: 1233.1, 16: 2000.4}
+# measured on this machine: step_n_bench.py (eager) and
+# traced_step_n_check.py (captured). The traced figures are the ones that
+# matter -- an untraced verifier is beaten by the traced step it replaces.
+STEP_EAGER, STEP_TRACED = 517.8, 235.9
+T_EAGER = {1: 531.5, 2: 672.3, 4: 864.4, 8: 1233.1, 16: 2000.4}
+T_TRACED = {1: 235.9, 2: 255.0, 3: 265.0, 4: 276.6, 5: 288.0, 6: 300.0,
+            7: 312.0, 8: 323.9, 9: 335.0}
+# snapshot/restore of the recurrent state: 36 layers x [12,1,128,128] float32
+# is ~85 MB, at the ~35 GB/s the state matmuls see
+SNAP = 2.5
 
 
 def draft(context, ngram, k):
@@ -75,7 +90,9 @@ def draft(context, ngram, k):
     for start in range(len(context) - ngram - 1, -1, -1):
         if context[start : start + ngram] == key:
             got = context[start + ngram : start + ngram + k]
-            return got if len(got) == k else None
+            if len(got) == k:
+                return got
+            # too close to the end to propose k -- keep looking further back
     return None
 
 
@@ -89,12 +106,15 @@ for label, text in TEXTS.items():
     for ngram in (2, 3):
         for k in (2, 4, 8):
             pos, drafted, plain, emitted, accepted = len(prompt), 0, 0, 0, 0
+            cost_t = cost_e = 0.0
             while pos < len(full) - 1:
                 d = draft(full[:pos], ngram, k)
                 if d is None:
                     plain += 1
                     emitted += 1
                     pos += 1
+                    cost_t += STEP_TRACED
+                    cost_e += STEP_EAGER
                     continue
                 drafted += 1
                 j = 0
@@ -103,9 +123,11 @@ for label, text in TEXTS.items():
                 accepted += j
                 emitted += j + 1
                 pos += j + 1
-            # a drafted round costs T(k); a round with no draft is a plain step
-            cost_e = drafted * T[k] + plain * STEP_EAGER
-            cost_t = drafted * T[k] + plain * STEP_TRACED
+                cost_t += T_TRACED[k]
+                cost_e += T_EAGER[k]
+                if j < k:                      # roll back and replay the prefix
+                    cost_t += T_TRACED[min(j + 1, max(T_TRACED))] + 2 * SNAP
+                    cost_e += T_EAGER.get(min(j + 1, 16), T_EAGER[16]) + 2 * SNAP
             fires = 100 * drafted / max(drafted + plain, 1)
             print(
                 f"RESULT [{label}] ngram={ngram} k={k}: drafter fired on "

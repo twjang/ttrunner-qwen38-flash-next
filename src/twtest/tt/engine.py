@@ -45,6 +45,44 @@ class _Sequence:
     created: float = field(default_factory=time.time)
 
 
+def prompt_lookup_draft(
+    context: list[int], k: int, ngram: int = 3
+) -> list[int] | None:
+    """The `k` tokens that followed the last earlier occurrence of the last
+    `ngram` tokens, or None if there is no earlier occurrence with k to spare.
+
+    No draft model and no extra weights -- it is a bet that the sequence is about
+    to repeat itself, which is why it earns 1.7-2.1x on prompts that quote their
+    context and nothing at all on open prose.
+    """
+    if k <= 0 or len(context) <= ngram:
+        return None
+    key = context[-ngram:]
+    for start in range(len(context) - ngram - 1, -1, -1):
+        if context[start : start + ngram] == key:
+            got = context[start + ngram : start + ngram + k]
+            if len(got) == k:
+                return got
+            # too close to the end to propose k tokens -- keep looking further
+            # back rather than giving up, which is what the first version did
+            # and it silently cost drafts.
+    return None
+
+
+def accepted_prefix(drafted: list[int], verified: list[int]) -> int:
+    """How many drafted tokens the model agrees with, from the front.
+
+    `verified[i]` is what the model predicts *after* consuming draft token i-1,
+    so `verified[i]` is compared against `drafted[i]`. Greedy acceptance: stop at
+    the first disagreement, which makes the emitted sequence identical to what
+    unspeculated decoding would have produced.
+    """
+    j = 0
+    while j < len(drafted) and j < len(verified) and drafted[j] == verified[j]:
+        j += 1
+    return j
+
+
 def reusable_prefix(held: list[int] | None, prompt: list[int]) -> bool:
     """Can a slot holding `held` be handed to a request for `prompt` as is?
 
@@ -68,6 +106,7 @@ class TTEngine(Engine):
         chunked_prefill: bool = False,
         trace_region_bytes: int = 128 << 20,
         use_trace: bool = True,
+        speculate: int = 0,
     ):
         import ttnn
 
@@ -81,6 +120,25 @@ class TTEngine(Engine):
         # CCL is dead without this: every collective fails on
         # `fabric_context_ != nullptr` inside the control plane.
         ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+        # Speculation captures a `step_n` graph, and there is exactly **one**
+        # capture, not a ladder of widths. Capturing a second one allocates its
+        # intermediates while the first trace is live, and tt-metal says so:
+        # "Allocating device buffers is unsafe due to the existence of an active
+        # trace. These buffers may be corrupted." A ladder would let a partial
+        # acceptance replay its prefix cheaply, but not at that price.
+        #
+        # At k=2 that costs nothing: the draft is a single token, so acceptance
+        # is all-or-nothing and the only replay width is 1 -- an ordinary traced
+        # step, which already exists. Larger k replays a partial prefix with
+        # single steps, which is slower, so k=2 is the useful setting until
+        # allocating during a second capture is safe.
+        #
+        # The capture is also large -- four of them wanted over 253 MB where the
+        # default region is 128 -- and the region is fixed when the mesh opens,
+        # so it is sized here.
+        self._widths = [speculate] if speculate else []
+        if self._widths:
+            trace_region_bytes = max(trace_region_bytes, (len(self._widths) + 1) * (192 << 20))
         # The trace region has to be reserved at open time; a decode step records
         # on the order of 5 000 ops, so it needs real space.
         self.mesh = ttnn.open_mesh_device(
@@ -211,6 +269,38 @@ class TTEngine(Engine):
         # capture region, landing on memory the recorded graph depends on.
         # TracedDecoder now runs them before capturing. Above batch 48 the gain is
         # ~1 %, so capture is not worth its memory there.
+        # Prompt-lookup speculation: draft the `speculate` tokens that followed
+        # the last earlier occurrence of the last few, verify them all in one
+        # `step_n`, and keep the prefix that agrees. Greedy acceptance, so the
+        # output is *identical* to not speculating, not merely close.
+        #
+        # Measured (scripts/dev/ngram_accept_rate.py, with the rollback and the
+        # replay of the accepted prefix both paid for):
+        #
+        #   copy-heavy prompts (RAG, quoting, editing)   1.70-2.14x
+        #   open prose                                   0.95-1.00x
+        #
+        # The drafter fires on 36-67 % of positions in the first case and 3-9 %
+        # in the second, which is the whole story: it is a bet on repetition, and
+        # when it does not fire the round is an ordinary step.
+        self._speculate = int(speculate)
+        if self._speculate:
+            if max_concurrency != 1:
+                raise NotImplementedError(
+                    "speculation verifies one sequence at a time, so it needs "
+                    f"max_concurrency=1 (got {max_concurrency})"
+                )
+            if not use_trace or self._chunked_prefill:
+                raise ValueError(
+                    "speculation needs the trace: an untraced step_n costs 864 ms "
+                    "at k=4 where four traced steps cost 944, so it would be "
+                    "beaten by the path it replaces"
+                )
+            if self.model.use_indexer:
+                raise NotImplementedError(
+                    "step_n does not carry the QSA selection yet, so speculation "
+                    "and a context in (2048, 65536] cannot both be on"
+                )
         self._use_trace = use_trace and max_concurrency < 48 and not self._chunked_prefill
         self._decoder = None
         self._admit: queue.SimpleQueue = queue.SimpleQueue()
@@ -269,6 +359,31 @@ class TTEngine(Engine):
                 self._decoder = None
                 print(f"[tt] trace capture failed, falling back to eager: {exc}")
 
+        # k is a *shape* in the step_n graph -- it carries k unrolled convolution
+        # and recurrence steps -- so the verify needs its own capture, and so
+        # does the replay of an accepted prefix, whose length is 1..k.
+        #
+        # Capturing every width is too much of both: seven captures for k=8
+        # wanted 145 MB of trace region against the 128 MB allocated, and cost
+        # ~40 s each to compile. A ladder of powers of two plus k covers any
+        # prefix by composition -- a replay of 5 is 4 then 1 -- for four captures
+        # instead of seven. Composing costs a little (4+1 is 513 ms where a
+        # captured 5 would be 288) and only on partial acceptance.
+        verifiers: dict[int, object] = {}
+        widths = self._widths
+        if self._speculate and self._decoder is not None:
+            try:
+                from .traced import TracedStepN
+
+                for width in widths:
+                    verifiers[width] = TracedStepN(self.model, state, width)
+                self._decoder.reset()
+            except Exception as exc:
+                for v in verifiers.values():
+                    v.release()
+                verifiers = {}
+                print(f"[tt] speculation capture failed, decoding normally: {exc}")
+
         def advance(tokens: list[int]):
             if self._decoder is not None:
                 return self._decoder.step(tokens)
@@ -278,6 +393,78 @@ class TTEngine(Engine):
         # the live count instead would mean a differently-shaped state (and a new
         # trace) every time a request arrives or finishes.
         FILLER = 0
+
+        def speculate_round(seq: "_Sequence | None") -> bool:
+            """Try one draft-and-verify round. False if it does not apply.
+
+            Applies only to a single slot past its prompt and decoding greedily
+            -- a draft is a bet on the *argmax*, and with a temperature there is
+            no argmax to bet on.
+            """
+            if seq is None or seq.done or seq.next_token is None:
+                return False
+            if seq.prompt_pos < len(seq.request.prompt_token_ids):
+                return False
+            if seq.request.temperature > 0:
+                return False
+            context = list(state.histories[0]) + [seq.next_token]
+            draft = prompt_lookup_draft(context, self._speculate - 1)
+            if draft is None:
+                return False
+
+            feed = [seq.next_token] + draft
+            k = len(feed)
+            if k not in verifiers:
+                return False
+
+            # Row i predicts the token that follows feed[i], so rows 0..k-2 are
+            # predictions of the draft and row k-1 is a genuinely new token.
+            snap = self.model.snapshot(state)
+            try:
+                verified = self.model.greedy_tokens(verifiers[k].step_n(feed))[:k]
+            except Exception as exc:
+                seq.out_queue.put(exc)
+                retire(0, seq)
+                return True
+            if verified is None:
+                self.model.restore(state, snap)
+                return False
+            j = accepted_prefix(draft, verified[: k - 1])
+            emitted = verified[: j + 1]
+
+            if j < len(draft):
+                # the state ran ahead of what was accepted; a recurrence cannot
+                # be truncated the way a K/V cache can, so rewind and replay
+                self.model.restore(state, snap)
+                # compose the replay from the captured widths, largest first
+                pos, remaining = 0, j + 1
+                while remaining:
+                    width = max((w for w in verifiers if w <= remaining), default=1)
+                    if width == 1:
+                        advance(feed[pos : pos + 1])
+                    else:
+                        verifiers[width].step_n(feed[pos : pos + width])
+                    pos += width
+                    remaining -= width
+            if prefix[0] is not None:
+                prefix[0].extend(feed[: j + 1])
+
+            params = params_of(seq)
+            for tok in emitted:
+                seq.next_token = tok
+                seq.emitted += 1
+                self._stats.completion_tokens += 1
+                if tok in params.stop_token_ids:
+                    seq.out_queue.put(TokenEvent(tok, "", seq.emitted, finish_reason="stop"))
+                    retire(0, seq)
+                    return True
+                if seq.emitted >= params.max_tokens:
+                    seq.out_queue.put(TokenEvent(tok, self.decode([tok]), seq.emitted - 1))
+                    seq.out_queue.put(TokenEvent(-1, "", seq.emitted, finish_reason="length"))
+                    retire(0, seq)
+                    return True
+                seq.out_queue.put(TokenEvent(tok, self.decode([tok]), seq.emitted - 1))
+            return True
 
         def params_of(seq: _Sequence) -> SamplingParams:
             r = seq.request
@@ -347,6 +534,13 @@ class TTEngine(Engine):
                 except queue.Empty:
                     continue
                 admit(seq, free.pop())
+
+            # A speculative round, when there is a draft to verify. Emits one to
+            # k tokens for one `step_n` instead of one per step; the accept rule
+            # is greedy, so what comes out is exactly what one-at-a-time decoding
+            # would have produced.
+            if verifiers and speculate_round(slots[0]):
+                continue
 
             # One token per slot: the next prompt token while the prompt is still
             # being consumed, otherwise the token this slot sampled last round.

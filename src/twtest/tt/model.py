@@ -1372,6 +1372,66 @@ class TTModel:
     def new_state(self, batch: int = 1) -> TTState:
         return TTState(self.cfg.num_layers, batch)
 
+    def snapshot(self, state: TTState) -> dict:
+        """Copy everything a single-sequence state carries, for a later rewind.
+
+        Speculation needs this and a transformer does not: verifying k drafts
+        advances the DeltaNet recurrent state and the convolution rings by all k
+        tokens, and unlike a K/V cache -- which attention simply reads less of --
+        a recurrence cannot be truncated back to the accepted prefix.
+
+        The K/V and the indexer's block cache are deliberately *not* copied.
+        Attention reads only up to `cur_pos`, so whatever a rejected draft left
+        beyond the accepted position is never looked at, and copying 6.4 GB a
+        slot to protect data nobody reads would cost more than the speculation
+        saves. What must be copied is everything that accumulates
+        unconditionally.
+        """
+        if state.batch != 1:
+            raise NotImplementedError("snapshot is single-sequence")
+
+        def copy(t):
+            out = ttnn.zeros(list(t.shape), dtype=t.dtype, layout=t.layout, device=self.mesh)
+            ttnn.copy(t, out)
+            return out
+
+        layers = []
+        for st in state.layers:
+            layers.append(
+                {
+                    "recurrent": None if st.recurrent is None else copy(st.recurrent),
+                    "conv": None if st.conv is None else [copy(c) for c in st.conv],
+                    "ple_conv": None if st.ple_conv is None else [copy(c) for c in st.ple_conv],
+                    "conv_step": st.conv_step,
+                    "ple_step": st.ple_step,
+                }
+            )
+        return {
+            "layers": layers,
+            "positions": list(state.positions),
+            "histories": [list(h) for h in state.histories],
+        }
+
+    def restore(self, state: TTState, snap: dict) -> None:
+        """Rewind to a `snapshot`, writing in place.
+
+        In place because a captured trace replays against the addresses it
+        recorded: rebinding the rings to the snapshot's tensors would leave the
+        trace reading whatever used to be there.
+        """
+        for st, saved in zip(state.layers, snap["layers"]):
+            if saved["recurrent"] is not None:
+                ttnn.copy(saved["recurrent"], st.recurrent)
+            for name in ("conv", "ple_conv"):
+                if saved[name] is None:
+                    continue
+                for src, dst in zip(saved[name], getattr(st, name)):
+                    ttnn.copy(src, dst)
+            st.conv_step = saved["conv_step"]
+            st.ple_step = saved["ple_step"]
+        state.positions = list(snap["positions"])
+        state.histories = [list(h) for h in snap["histories"]]
+
     def reset_slot(self, state: TTState, slot: int) -> None:
         """Clear one sequence's state so a fresh sequence can take the slot.
 
