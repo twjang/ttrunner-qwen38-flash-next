@@ -55,8 +55,10 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 
 | configuration | result |
 |---|---|
-| single user, 1 slot, 262144 ctx, traced, fused experts | **239 ms/step** (236 before the head-select gather) |
-| same, eager, chunked prefill on | ~551 ms/step, prompt at ~45 ms/token |
+| single user, 1 slot, 262144 ctx, traced | **236 ms/step**; eager 469 ms |
+| same, QSA selection on (context in (2048, 65536]) | 297 ms/step at 8192 |
+| same, eager, chunked prefill on | prompt at ~45 ms/token |
+| `step_n` verifying k tokens, traced | 255 ms at k=2, 276.6 at k=4, 323.9 at k=8 |
 | same, eager | 496 ms/step |
 | batch 64, eager, fused experts | 97.4 tok/s aggregate |
 | server, 32 concurrent | 37.84 tok/s |
@@ -65,8 +67,10 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 | **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; chunked prefill 87.5 %; float32 reference 80.9 % / 2.00** |
 
 Step time is flat in position (496 ms at pos 4, 501 ms at pos 65536) and flat
-in batch up to 64 rows. It is **op-count bound**: 6355 device ops × ~36 µs
-traced. Any change is judged by ops removed or useful rows added per step.
+in batch up to 64 rows. The *eager* path is dispatch-bound -- measured at 0.30 ms
+per device call, so 6143 calls is most of its 469 ms -- and the traced path is
+not: removing 97 calls moved eager by 29.6 ms and traced by nothing. Judge a
+change on the path it is meant to help (§5.7).
 
 **Read `docs/iterations/014` before anything else.** It is the story of how a
 wrong head pairing survived five iterations of review, and its lesson is a rule:
@@ -328,12 +332,43 @@ Done when: `speculation_check.py` reports identical output *and* a speedup on th
 copy-heavy prompt.
 
 
-### 5.7 Fewer launches (ongoing; each item is a self-contained PR)
+### 5.7 Fewer launches — and what it is actually worth
 
-Roadmap B3. Start with the hyper-connection gate (`ops.gated_residual_mix`
-and `reinject`; 97 calls × ~11 ops). Every PR: op count before/after (count
-with the profiler recipe in `docs/iterations/012` Observation 5), traced step
-time with hygiene, single-user text unchanged.
+**Read this before spending a day on it.** `docs/iterations/012` framed the
+single-user step as op-count bound, "6355 ops x ~36 us traced". That arithmetic
+describes the *eager* path. Measured directly, by removing 97 ops and timing
+both paths at the same configuration:
+
+    eager    498.7 -> 469.1 ms   (-5.9 %)
+    traced   236.1 -> 236.0 ms   (unchanged)
+
+29.6 ms for 97 ops is **0.30 ms apiece, and that is a host dispatch**. A trace
+replays with one dispatch, which was its whole point, so removing launches buys
+nothing there. Fewer launches pays for chunked prefill and for eager decode --
+which is what speculation currently needs -- and not for traced decoding.
+
+`scripts/dev/op_count.py` wraps the ttnn namespace and counts one step. The
+current distribution, 6143 calls, 128 a layer:
+
+| op | share | op | share |
+|---|---|---|---|
+| multiply | 20.1 % | permute | 5.2 % |
+| linear | 12.4 % | sum | 3.3 % |
+| reshape | 12.1 % | silu | 3.7 % |
+| add | 7.5 % | rms_norm | 2.6 % |
+| slice | 7.2 % | sparse_matmul | 1.6 % |
+| sigmoid | 5.3 % | all_reduce | 1.4 % |
+
+Done: the hyper-connection mix averages in one op instead of summing and
+scaling.
+
+Two warnings for whatever is next. Op count is a poor proxy for cost -- the
+`reinject` docstring records a three-op form running **9.5x slower** than the
+nine-op one it replaced, because `repeat_interleave` is pathological on those
+shapes. And every PR here needs the same A/B: `device_quality.py` unchanged,
+`op_count.py` before and after, and `bench_step.py` at one configuration for
+both paths.
+
 
 ## 6. Recipes
 
