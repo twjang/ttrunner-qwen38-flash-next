@@ -56,3 +56,16 @@ def host_row(mesh, t: ttnn.Tensor) -> torch.Tensor:
 def synthetic_prompt(n: int) -> list[int]:
     """Deterministic token ids that avoid special tokens. Not real text."""
     return [1000 + ((i * 37) % 5000) for i in range(n)]
+
+
+def tokenizer(cfg):
+    """The real tokenizer, from TWTEST_TOKENIZER (default ~/models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json)."""
+    from twtest.reference.tokenizer import Qwen4ExpTokenizer
+
+    path = os.environ.get(
+        "TWTEST_TOKENIZER",
+        str(Path.home() / "models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json"),
+    )
+    return Qwen4ExpTokenizer(
+        path, cfg.chat_template, [t for t in (cfg.eos_token_id, 248044) if t is not None]
+    )

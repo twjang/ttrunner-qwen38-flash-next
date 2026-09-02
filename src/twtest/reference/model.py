@@ -35,6 +35,10 @@ class Qwen4ExpModel:
         self.store = store
         self.rotary = RotaryEmbedding(config.rope_dim, config.rope_theta, config.mrope_section)
         self._ple_layers = {idx: n for n, idx in enumerate(config.ple_layers)}
+        # Debug hook, called as probe(layer, hidden) after every layer. Mirrors
+        # `TTModel.probe` exactly (same call site, same tensor) so the two can
+        # be diffed layer by layer -- see `scripts/dev/decode_vs_reference.py`.
+        self.probe = None
 
     # -- weight helpers ---------------------------------------------------
 
@@ -433,6 +437,9 @@ class Qwen4ExpModel:
 
             mixed, hyper, inject = self._gated_residual(hidden, layer, "ffn")
             hidden = self._reinject(hyper, self._moe(mixed, layer), inject)
+
+            if self.probe is not None:
+                self.probe(layer, hidden)
 
         hidden, _, _ = self._gated_residual(hidden, None, "")
         return hidden
