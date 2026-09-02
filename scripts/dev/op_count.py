@@ -1,6 +1,6 @@
 """Where do a step's device ops go?
 
-    uv run python scripts/dev/op_count.py [top] [--prefill N]    (default 25)
+    uv run python scripts/dev/op_count.py [top] [--prefill N] [--by-caller]
 
 The single-user step is dispatch-bound -- 6355 ops at ~36 us traced -- so the
 only thing that shortens it is issuing fewer. This wraps every callable in the
@@ -10,18 +10,24 @@ go after and, just as usefully, which are already negligible.
 Counting, not profiling: an instrumented profile inflates totals ~40 % with
 per-section syncs, and the question here is "how many", not "how long".
 
+`--by-caller` attributes each call to the `twtest` line that issued it, which is
+what actually says where to cut -- "multiply, 3241" does not.
+
 `--prefill N` counts one N-token chunked prefill instead. That is the number
 that says whether tracing chunked prefill is worth the paged-cache refactor it
 needs: multiply by the ~0.30 ms an eager dispatch costs and compare against the
 measured wall clock.
 """
 import sys
+import traceback
 
 import ttnn
 
 from _device_model import open_model
 
 argv = sys.argv[1:]
+BY_CALLER = "--by-caller" in argv
+argv = [a for a in argv if a != "--by-caller"]
 PREFILL = 0
 if "--prefill" in argv:
     i = argv.index("--prefill")
@@ -29,6 +35,7 @@ if "--prefill" in argv:
     argv = argv[:i] + argv[i + 2:]
 TOP = int(argv[0]) if argv else 25
 counts: dict[str, int] = {}
+by_caller: dict[str, int] = {}
 
 
 def wrap(ns, prefix=""):
@@ -46,6 +53,13 @@ def wrap(ns, prefix=""):
         def made(fn=fn, key=key):
             def counted(*a, **kw):
                 counts[key] = counts.get(key, 0) + 1
+                if BY_CALLER:
+                    # the innermost twtest frame is the line that issued this op
+                    for fr in reversed(traceback.extract_stack()[:-1]):
+                        if "/twtest/" in fr.filename and "op_count" not in fr.filename:
+                            site = f"{fr.filename.split('/twtest/')[-1]}:{fr.lineno} {fr.name}"
+                            by_caller[site] = by_caller.get(site, 0) + 1
+                            break
                 return fn(*a, **kw)
 
             return counted
@@ -74,4 +88,8 @@ if PREFILL:
 for name, n in sorted(counts.items(), key=lambda kv: -kv[1])[:TOP]:
     print(f"RESULT {n:6d}  {100 * n / total:5.1f}%  {name}", flush=True)
 print(f"RESULT per layer (48): {total / 48:.1f}", flush=True)
+if BY_CALLER:
+    print("RESULT --- by call site ---", flush=True)
+    for site, n in sorted(by_caller.items(), key=lambda kv: -kv[1])[:TOP]:
+        print(f"RESULT {n:6d}  {100 * n / total:5.1f}%  {site}", flush=True)
 ttnn.close_mesh_device(mesh)

@@ -443,7 +443,7 @@ avoids two traces -- and `speculation_check.py` shows a round cheaper than
 `speculate=0` on the copy-heavy prompt.
 
 
-### 5.7 Fewer launches — and what it is actually worth
+### 5.7 Fewer launches — worth little on the traced step, a lot on prefill
 
 **Read this before spending a day on it.** `docs/iterations/012` framed the
 single-user step as op-count bound, "6355 ops x ~36 us traced". That arithmetic
@@ -473,12 +473,41 @@ current distribution, 6143 calls, 128 a layer:
 Done: the hyper-connection mix averages in one op instead of summing and
 scaling.
 
-Two warnings for whatever is next. Op count is a poor proxy for cost -- the
+**Prefill is where this item is now worth something.** The framing above was
+written when the eager path was a fallback. It is not any more: chunked prefill
+is on for one-slot engines, it is *not* traced, and it issues **12293** device
+calls for a 128-token chunk against 6143 for a single-token step
+(`op_count.py --prefill 128`). At ~1060 ms a chunk that is essentially all
+dispatch. Op-count reduction pays here at full rate.
+
+`--by-caller` attributes each call to the `twtest` line that issued it, which is
+what says where to cut; "multiply, 1993" does not. The distribution is flat --
+the largest single site is 4.2 % -- so expect many small wins rather than one
+big one.
+
+**A worked example, measured and rejected.** The shared expert is dense and has
+no routing, so `moe_chunk` -- which exists to bound the routed MoE's
+|union| x M waste -- buys it nothing, and it was running once per sub-chunk:
+eight dispatches x 4 x 48. Hoisting it to the whole chunk saves 1296 calls
+(9.5 %) and takes a chunk from 1089 to 1017 ms. It is also genuinely per-token,
+unlike `moe_block` (5.8): `shared_expert_rows_check.py` finds no row over 1 % at
+any group size to 128.
+
+It still lost. "Per-token within 1 %" is not "identical" -- against the per-row
+answer a 32-row group is 0.000 % and a 128-row group 0.500 % -- and over 107
+scored positions whole-chunk gave 20.6 % top-1 / NLL 6.389 against 24.3 % /
+5.648 sub-chunked. Reverted, with the reasoning left in `prefill` so it is not
+re-attempted. The lesson generalises: on this path a dispatch saving that
+changes any group size is buying speed with bf16 accuracy, and 7 % is not a good
+price. Look for savings that leave every group width alone.
+
+Three warnings for whatever is next. Op count is a poor proxy for cost -- the
 `reinject` docstring records a three-op form running **9.5x slower** than the
 nine-op one it replaced, because `repeat_interleave` is pathological on those
-shapes. And every PR here needs the same A/B: `device_quality.py` unchanged,
-`op_count.py` before and after, and `bench_step.py` at one configuration for
-both paths.
+shapes. Accuracy on this path is not repeatable at 32 scored positions, so use
+107+ and quote NLL (invariant 8). And every PR here needs the same A/B:
+`device_quality.py` unchanged, `op_count.py` before and after, and
+`bench_step.py` at one configuration for both paths.
 
 
 ### 5.8 The MoE row-group cliff — localised to `expert_ffn`, cap justified

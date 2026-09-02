@@ -1945,35 +1945,63 @@ class TTModel:
                     cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
                 )
                 pieces = []
+                # Same weight selection as decode. Naming the split halves here
+                # while the model is fused loads them lazily *on top of* the
+                # fused tensor -- another ~11 GB per device, which is an
+                # out-of-memory at the first MoE layer, not a slow path.
+                if self.fuse_expert_gate_up:
+                    gate_w, up_w = self.w.fused_gate_up(layer), None
+                else:
+                    gate_w = self.w.blk(layer, "ffn_gate_exps.weight")
+                    up_w = self.w.blk(layer, "ffn_up_exps.weight")
                 for sub in range(0, seq, moe_chunk):
                     width = min(moe_chunk, seq - sub)
                     part = ttnn.slice(mixed, (0, 0, sub, 0), (1, 1, sub + width, cfg.hidden_size))
-                    # Same weight selection as decode. Naming the split halves
-                    # here while the model is fused loads them lazily *on top of*
-                    # the fused tensor -- another ~11 GB per device, which is an
-                    # out-of-memory at the first MoE layer, not a slow path.
-                    if self.fuse_expert_gate_up:
-                        gate_w, up_w = self.w.fused_gate_up(layer), None
-                    else:
-                        gate_w = self.w.blk(layer, "ffn_gate_exps.weight")
-                        up_w = self.w.blk(layer, "ffn_up_exps.weight")
-                    routed = self.all_reduce(
-                        moe.moe_block(
-                            part, self.w.blk(layer, "ffn_gate_inp.weight"),
-                            gate_w, up_w,
-                            self.w.blk(layer, "ffn_down_exps.weight"),
-                            cfg.num_experts_per_tok, cfg.num_experts,
-                            cfg.hidden_size, cfg.expert_intermediate,
+                    pieces.append(
+                        self.all_reduce(
+                            moe.moe_block(
+                                part, self.w.blk(layer, "ffn_gate_inp.weight"),
+                                gate_w, up_w,
+                                self.w.blk(layer, "ffn_down_exps.weight"),
+                                cfg.num_experts_per_tok, cfg.num_experts,
+                                cfg.hidden_size, cfg.expert_intermediate,
+                            )
                         )
                     )
-                    shared = moe.shared_expert(
-                        part, self.w.blk(layer, "ffn_gate_shexp.weight"),
-                        self.w.blk(layer, "ffn_up_shexp.weight"),
-                        self.w.blk(layer, "ffn_down_shexp.weight"),
-                        self.w.blk(layer, "ffn_gate_inp_shexp.weight"),
+                routed = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=-2)
+                # The shared expert stays sub-chunked, and it is worth saying why
+                # because the opposite looks obviously right. It has no routing
+                # to broadcast -- four dense linears and a sigmoid gate -- so
+                # `moe_chunk`, which exists to bound the routed MoE's
+                # |union| x M waste, buys it nothing, and running it once on the
+                # whole chunk saves 1296 dispatches (9.5 % of the prefill's
+                # total, 1089 -> 1017 ms). It is also genuinely per-token:
+                # `shared_expert_rows_check.py` finds no row over 1 % at any
+                # group size up to 128, unlike `moe_block` (5.8).
+                #
+                # It still costs accuracy, because "per-token within 1 %" is not
+                # "identical": against the per-row answer a 32-row group is
+                # 0.000 % and a 128-row group 0.500 %, bf16 rounding that the
+                # sub-chunked form happens to avoid. Measured over 107 scored
+                # positions, whole-chunk is 20.6 % top-1 / NLL 6.389 against
+                # 24.3 % / 5.648 sub-chunked. 7 % of a prefill is not worth that
+                # here, so the dispatches stay. See handoff 5.7.
+                sub_pieces = []
+                for sub in range(0, seq, moe_chunk):
+                    width = min(moe_chunk, seq - sub)
+                    part = ttnn.slice(mixed, (0, 0, sub, 0), (1, 1, sub + width, cfg.hidden_size))
+                    sub_pieces.append(
+                        moe.shared_expert(
+                            part, self.w.blk(layer, "ffn_gate_shexp.weight"),
+                            self.w.blk(layer, "ffn_up_shexp.weight"),
+                            self.w.blk(layer, "ffn_down_shexp.weight"),
+                            self.w.blk(layer, "ffn_gate_inp_shexp.weight"),
+                        )
                     )
-                    pieces.append(ttnn.add(routed, shared))
-                ffn = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=-2)
+                shared = (
+                    sub_pieces[0] if len(sub_pieces) == 1 else ttnn.concat(sub_pieces, dim=-2)
+                )
+                ffn = ttnn.add(routed, shared)
                 hidden = reinject(hidden, ffn, inject, cfg.hc_count)
                 if self.probe is not None:
                     self.probe(layer, hidden)
