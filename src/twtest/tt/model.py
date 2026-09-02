@@ -34,9 +34,14 @@ from .ops import HIFI4, gated_residual_mix, grouped_rms_norm, reinject, rms_norm
 from .weights import TTWeights
 
 
-# Largest MoE row-group that leaves chunked prefill's output unchanged. 8, 16
-# and 32 agree on every token; 64 and 128 degrade monotonically, and why is not
-# yet known. See `TTModel.prefill`.
+# Largest MoE row-group that still computes a per-token MoE.
+#
+# `moe.moe_block` must be exact per row -- each row picks its own experts and is
+# weighted by its own probabilities -- so grouping rows can only change speed.
+# It does not: `scripts/dev/moe_rows_check.py` builds the answer one row at a
+# time and compares, and row-groups of 1, 8, 16 and 32 reproduce it exactly
+# while 64 gets **33 of 64 rows wrong**, worst row 102.9 %. 32 is one tile.
+# See `TTModel.prefill` and handoff 5.8.
 _MAX_MOE_CHUNK = 32
 
 
@@ -1830,24 +1835,37 @@ class TTModel:
         Which way that trade falls is a measurement, and the FLOP count is the
         wrong end of it: a 128-token chunk issues 19733 device calls
         (`op_count.py --prefill 128`) and is dispatch-bound, so wasting compute
-        to issue fewer calls wins -- up to a point. `moe_chunk_sweep.py` for
-        speed, `device_quality.py --prefill 128 --moe-chunk` for quality:
+        to issue fewer calls wins -- up to a point. `moe_chunk_sweep.py`:
 
-            moe_chunk    8   3332.8 ms    38.4 tok/s   53.1 % top-1  NLL 3.108
-            moe_chunk   16   2032.6 ms    63.0 tok/s   53.1 % top-1  NLL 3.038
-            moe_chunk   32   1101.0 ms   116.3 tok/s   53.1 % top-1  NLL 3.108
-            moe_chunk   64    936.1 ms   136.7 tok/s   43.8 % top-1  NLL 4.021
-            moe_chunk  128    998.7 ms   128.2 tok/s   21.9 % top-1  NLL 5.477
+            moe_chunk    8   3332.8 ms    38.4 tok/s
+            moe_chunk   16   2032.6 ms    63.0 tok/s
+            moe_chunk   32   1101.0 ms   116.3 tok/s     <- default
+            moe_chunk   64    936.1 ms   136.7 tok/s
+            moe_chunk  128    998.7 ms   128.2 tok/s
 
         The default had been 16, chosen from the waste figures alone; 32 is
-        1.85x faster and agrees with 8 on every token and every NLL digit.
+        1.85x faster.
 
-        Above 32 the output degrades, and it is a cliff rather than a slope --
-        8, 16 and 32 agree while 64 and 128 fall away monotonically -- so it
-        reads as a limit crossed in the MoE broadcast path rather than
-        accumulated precision. The cause is not identified. That is why
-        `moe_chunk` is capped rather than merely documented: the fastest setting
-        is on the wrong side of the cliff, and it changes the answer silently.
+        Past 32 the answer changes, and `_MAX_MOE_CHUNK` refuses rather than
+        documents it, because the fastest setting is on the wrong side and it
+        fails silently. Two independent measurements say so:
+
+        * prefill is bit-deterministic in `moe_chunk` -- three repeats at one
+          setting give identical logits -- and across settings the final logits
+          move 55.9 % at 64 and 144.9 % at 128, with a different argmax
+          (`moe_chunk_noise.py`).
+        * `moe_block` stops being per-token. Each row picks its own experts, so
+          grouping may only change speed; `moe_rows_check.py` computes the
+          answer a row at a time and finds groups of 1, 8, 16 and 32 exact, and
+          64 wrong on 33 of 64 rows, worst row 102.9 %.
+
+        Where it is *not*: routing is exact at 64 (`keep`, `weights` and the
+        expert union all match the host), and `topk`, the threshold mask,
+        `max` over the row axis, `permute`, the expert-axis reduction and
+        `sparse_matmul` itself are each exact at every row count in isolation,
+        as are four `sparse_program_config` variants. The defect only appears
+        in `expert_ffn` at production scale, so it does not reduce to a small
+        case -- see handoff 5.8 before spending a day on it.
         """
         from .deltanet import CHUNK
 

@@ -162,27 +162,36 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
    defaults). A cold single run once misreported a 1.3× win as 0.94×. Discard
    the first request when timing the server (it includes JIT). To time a
    position, set `state.positions` directly — generating to 65536 is 9 hours.
-8. **Instrumented profiles are inflated ~40 %** by per-section syncs; read the
+8. **Accuracy hygiene too, and it is weaker than you think.**
+   `device_quality.py --prefill 128` scores 32 positions and is **not**
+   repeatable: two runs of the identical configuration gave 50.0 % and 53.1 %
+   top-1 (NLL 3.110 and 3.108). One run per setting cannot separate an effect
+   from noise, and a 10-point "cliff" was once built on exactly that. Prefer a
+   deterministic proxy where one exists -- prefill's own logits repeat to
+   0.0000 % (`moe_chunk_noise.py`) -- or a per-row invariant that needs no
+   reference at all (`moe_rows_check.py`); failing that, repeat the run and
+   quote NLL, which moves far less than top-1 on 32 samples.
+9. **Instrumented profiles are inflated ~40 %** by per-section syncs; read the
    shares, not the totals.
-9. **V heads are tiled over K heads** -- v-head j reads k-head `j % n_k`, so
+10. **V heads are tiled over K heads** -- v-head j reads k-head `j % n_k`, so
    Q/K expand with `repeat`. Upstream interleaves; the GGUF converter permutes
    the head order, so upstream is not authoritative here and the measurement is
    (`reference_quality.py`: 80.9 % tiled, 12.8 % grouped). The device cannot
    serve that pairing from its shard -- it all-gathers the sixteen heads and
    selects twelve (`TTModel.head_select`).
-10. **A per-layer distance is a weak metric.** The tensor between layers is the
+11. **A per-layer distance is a weak metric.** The tensor between layers is the
    hyper-connection stream -- four redundant copies the output mixer averages --
    so a stream can wander far while the mixed result the LM head sees does not.
    Compare the mixed hidden or the token. And an additive attention mask in
    TILE_LAYOUT pads with *zeros*, which means "attend to me": slice to a whole
    tile and let the causal condition mask the pad.
-11. **QSA attends to selected tokens, not to everything.** The selection is on
+12. **QSA attends to selected tokens, not to everything.** The selection is on
     for `budget < max_seq_len <= 65536` and off outside that -- below the budget
     dense is exactly right, above 65536 the selection cannot address the cache.
     Off *and* over the budget means the device is running a different model, and
     `TTEngine` prints a notice; do not quote a long-context result without
     checking which regime it came from.
-12. **A device matmul is not a float32 matmul.** `ttnn.matmul` on float32
+13. **A device matmul is not a float32 matmul.** `ttnn.matmul` on float32
     inputs, at HiFi4 with `fp32_dest_acc_en`, is **0.16 %** off torch for a
     128x128 -- the Tensix multiplier decomposes fp32 into bf16 pieces. Every
     elementwise op measured is at ~1e-5. So an algorithm that is merely
@@ -195,15 +204,16 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     passed, and *magnitude alone does not reproduce the failure* -- random signs
     cancel inside the powers. Build the fixture the way the model builds the
     tensor (`test_block_inverse_survives_correlated_keys`).
-13. **A per-layer distance still cannot tell noise from a bug** (013's lesson,
+14. **A per-layer distance still cannot tell noise from a bug** (013's lesson,
     re-earned). Chunked prefill's hidden state is ~32 % from the reference by
     position 127 of a chunk and the *token* is fine: 128 tokens prefilled score
     53.1 % against 51.6 % for stepping the same ones. Judge prefill by a
     same-positions decode control, which is what `--score-from` is for.
-14. **Verification standard.** A change to the model is done when (a) unit
+15. **Verification standard.** A change to the model is done when (a) unit
     tests pass, (b) `device_quality.py` is run and next-token accuracy does not
     regress from 83 %, (c) the number it claims to move is measured with the
-    hygiene in (7), and (d) if it touches prefill, `device_quality.py --prefill`
+    hygiene in (7) and (8) -- repeat it, one run has no noise floor -- and
+    (d) if it touches prefill, `device_quality.py --prefill`
     and `prefill_state_check.py` are run too -- an output can be right while the
     state left behind is not. Paste the output into the iteration note.
     Reproducing one prompt's text is not (b), and neither is agreement with the
@@ -471,34 +481,62 @@ shapes. And every PR here needs the same A/B: `device_quality.py` unchanged,
 both paths.
 
 
-### 5.8 The MoE row-group cliff — a real bug, currently walled off
+### 5.8 The MoE row-group cliff — localised to `expert_ffn`, cap justified
 
-`prefill(moe_chunk=)` groups rows for the MoE. Speed says take the biggest group
-you can; the output says otherwise, and the shape of the disagreement is the
-interesting part:
+`prefill(moe_chunk=)` groups rows for the MoE. Speed wants the biggest group;
+the answer changes past 32, which is one tile:
 
-| moe_chunk | wall clock | tok/s | next-token top-1 | NLL |
+| moe_chunk | wall clock | tok/s | logits vs 16 | argmax |
 |---|---|---|---|---|
-| 8 | 3332.8 ms | 38.4 | 53.1 % | 3.108 |
-| 16 | 2032.6 ms | 63.0 | 53.1 % | 3.038 |
-| 32 | **1101.0 ms** | 116.3 | 53.1 % | 3.108 |
-| 64 | 936.1 ms | 136.7 | 43.8 % | 4.021 |
-| 128 | 998.7 ms | 128.2 | 21.9 % | 5.477 |
+| 16 | 2032.6 ms | 63.0 | — | 1105 |
+| 32 | **1101.0 ms** | 116.3 | 0.0000 % | 1105 |
+| 64 | 936.1 ms | 136.7 | 55.9 % | 1154 |
+| 128 | 998.7 ms | 128.2 | 144.9 % | 50 |
 
-8, 16 and 32 agree on every token (8 and 32 agree to every NLL digit); 64 and
-128 fall away monotonically. A slope would be accumulated precision. A cliff
-between 32 and 64 is a **limit being crossed** somewhere in the MoE broadcast
-path, and there is a known candidate: `ttnn.scatter` takes uint16 indices only,
-which caps reach at 65536, and the broadcast formulation materialises
-|union of selected experts| x M rows.
+**Measure this on prefill's logits, not on next-token accuracy.** The cap was
+first set from one `device_quality.py --prefill 128` run per setting, and two
+runs at the *same* setting then gave 50.0 % and 53.1 % top-1 — so that evidence
+could not tell a real effect from run noise, and the reasoning built on it ("8,
+16 and 32 agree on every token") was not supported. Prefill's logits *are*
+bit-deterministic: three repeats per setting agree to 0.0000 %
+(`moe_chunk_noise.py`). Use that.
 
-`_MAX_MOE_CHUNK = 32` refuses anything larger, because the fastest setting is on
-the wrong side and it changes the answer silently. Do not raise the cap to buy
-the remaining 1.2x without finding the cause first.
+**What is actually wrong.** `moe_block` must be exact per row — each row selects
+its own experts and is weighted by its own probabilities, so grouping may only
+change speed. `scripts/dev/moe_rows_check.py` builds the answer one row at a
+time, which needs no reference implementation, and compares:
 
-Done when: the mechanism is identified and either fixed -- 64 and 128 agreeing
-with 32 on every token -- or the cap is justified by the op limit that forces it,
-in `_moe_block` where the next reader will look.
+| group | worst row | rows over 1 % |
+|---|---|---|
+| 1, 8, 16, 32 | 0.000 % | 0/64 |
+| 64 | 102.9 % | **33/64** |
+
+**Where it is not**, so this is not re-searched:
+
+* Routing is exact at 64 — `keep`, `weights` and the expert union all match the
+  host. (Check *all* rows, not row 0: row 0 agrees at every group size, which is
+  what made the MoE look innocent for a while.)
+* In isolation, at every row count from 8 to 128: `ttnn.topk` and the threshold
+  mask (exact), `ttnn.max` over the row axis (exact at 64; drops 1 expert of 473
+  at 128), `ttnn.permute(0,3,2,1)` (exact), the expert-axis `ttnn.sum` (bf16
+  floor), and `ttnn.sparse_matmul` across every combination of 1–64 selected
+  experts (bf16 floor).
+* Four `sparse_program_config` variants — `out_subblock_h` 2 and 4,
+  `fuse_batch=True` — give byte-identical error; `mcast_in0=False` is rejected
+  by the op. So `per_core_M > 1` is the boundary but the config is not the bug.
+
+That leaves `expert_ffn` at production scale (E=512, K=2560, the fused
+gate|up), which is where the reduced probes stop reproducing it. The untested
+piece is `ttnn.repeat(x, (1, 512, 1, 1))` — 168 MB at 64 rows, 335 MB at 128 —
+and `sparse_matmul`'s device-side `nnz` counting at that size; note the op
+docstring already warns that an `nnz` disagreeing with the mask *hangs* the
+device, so its accounting is known to be delicate.
+
+Done when: the mechanism is found and either fixed — 64 and 128 reproducing the
+per-row answer, `moe_rows_check.py` clean — or reported upstream with the cap
+kept. The remaining prize is 1.2x on prompt intake, so do not raise the cap for
+it without `moe_rows_check.py` coming back clean.
+
 
 ## 6. Recipes
 

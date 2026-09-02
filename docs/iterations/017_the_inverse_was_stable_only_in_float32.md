@@ -103,12 +103,18 @@ without a clock. Measured, the waste is worth paying:
 1.85x, bit-identical output. And a second finding fell out of checking rather
 than assuming: `moe_chunk` is **not** a pure speed knob, though the reasoning
 that it must be — the split is over rows, each row picks its own experts — is
-what made it tempting to skip the measurement. 8, 16 and 32 agree on every
-token; 64 and 128 degrade monotonically. A cliff between 32 and 64 is a limit
-crossed, not precision accumulated, and `ttnn.scatter`'s uint16 indices (reach
-65536) against the broadcast's |union| x M rows is the standing candidate.
-`_MAX_MOE_CHUNK = 32` refuses the rest rather than documenting it, because the
-fastest setting is on the wrong side and it fails silently. See §5.8.
+what made it tempting to skip the measurement. `_MAX_MOE_CHUNK = 32` refuses
+the rest rather than documenting it, because the fastest setting is on the wrong
+side and it fails silently. See §5.8.
+
+> **Corrected in `019`.** Two claims in this section did not survive. The table
+> above is *one* `device_quality.py` run per setting, and that measurement is
+> not repeatable at 32 scored positions — two runs at `moe_chunk=32` gave 50.0 %
+> and 53.1 % — so "8, 16 and 32 agree on every token" was luck rather than
+> evidence, and the cliff had to be re-derived from prefill's logits, which
+> *are* bit-deterministic. The mechanism named here was wrong too: this path
+> deliberately uses no `scatter` at all. The cap is right; `019` has the real
+> justification and localises the defect to `expert_ffn`.
 
 ## Where it leaves 5.2
 
