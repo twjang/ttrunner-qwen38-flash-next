@@ -45,6 +45,17 @@ class _Sequence:
     created: float = field(default_factory=time.time)
 
 
+def reusable_prefix(held: list[int] | None, prompt: list[int]) -> bool:
+    """Can a slot holding `held` be handed to a request for `prompt` as is?
+
+    Only when `held` is an exact prefix of `prompt` and leaves at least one
+    token to feed -- the step that consumes it is what produces the first
+    output logits, and a recurrent state cannot be rewound to get it back.
+    `None` means the slot's state is not accounted for and must be reset.
+    """
+    return held is not None and len(held) < len(prompt) and prompt[: len(held)] == held
+
+
 class TTEngine(Engine):
     def __init__(
         self,
@@ -193,6 +204,13 @@ class TTEngine(Engine):
         state = self.model.new_state(batch=B)
         slots: list[_Sequence | None] = [None] * B
         free: list[int] = list(range(B))
+        # The exact token sequence each slot's state has consumed, or None when
+        # the state is not reusable. This is what makes prefix reuse possible:
+        # a slot that a finished sequence left behind still holds that whole
+        # conversation as recurrent state, conv rings and K/V, so the next turn
+        # -- which contains the previous turn as an exact prefix -- only has to
+        # feed the tokens it added.
+        prefix: list[list[int] | None] = [None] * B
 
         # Captured here rather than in __init__: it runs a warmup step, which
         # compiles every kernel and takes tens of seconds, and it must happen on
@@ -233,27 +251,45 @@ class TTEngine(Engine):
             free.append(slot)
             self._stats.running = sum(x is not None for x in slots)
 
+        def admit(seq: _Sequence, slot: int) -> None:
+            """Give `seq` a slot, reusing the state already there when it can.
+
+            A slot is reusable only while its `prefix` is exactly what its state
+            consumed. That holds for as long as nothing steps it: an idle engine
+            does not step at all, so with one slot a follow-up turn always hits.
+            With several slots, a step taken for someone else feeds this one a
+            filler token and invalidates it -- handled below, where the fed
+            tokens are recorded.
+
+            At least one token must be left to feed, because the step that
+            consumes it is what produces the first output logits. A prompt that
+            is *exactly* the cached prefix therefore starts over.
+            """
+            held = prefix[slot]
+            prompt = seq.request.prompt_token_ids
+            if reusable_prefix(held, prompt):
+                seq.prompt_pos = len(held)
+                self._stats.cached_prompt_tokens += len(held)
+            else:
+                self.model.reset_slot(state, slot)
+                prefix[slot] = []
+            seq.slot = slot
+            slots[slot] = seq
+            self._stats.running = sum(x is not None for x in slots)
+
         while not self._shutdown.is_set():
             while free:
                 try:
                     seq = self._admit.get_nowait()
                 except queue.Empty:
                     break
-                slot = free.pop()
-                self.model.reset_slot(state, slot)
-                seq.slot = slot
-                slots[slot] = seq
-                self._stats.running = sum(x is not None for x in slots)
+                admit(seq, free.pop())
             if all(x is None for x in slots):
                 try:
                     seq = self._admit.get(timeout=0.05)
                 except queue.Empty:
                     continue
-                slot = free.pop()
-                self.model.reset_slot(state, slot)
-                seq.slot = slot
-                slots[slot] = seq
-                self._stats.running = sum(x is not None for x in slots)
+                admit(seq, free.pop())
 
             # One token per slot: the next prompt token while the prompt is still
             # being consumed, otherwise the token this slot sampled last round.
@@ -289,11 +325,22 @@ class TTEngine(Engine):
                 if argmax is None:             # uneven vocab shard, or sampling needed
                     logits = self.model.logits(hidden)
             except Exception as exc:           # a device fault kills every slot
+                prefix[:] = [None] * B
                 for i, seq in enumerate(slots):
                     if seq is not None:
                         seq.out_queue.put(exc)
                         retire(i, seq)
                 continue
+
+            # The step happened, so every slot's state moved on by exactly one
+            # token. An occupied slot extends its prefix; an empty one just ate
+            # a filler token, which puts its state out of step with any prefix
+            # we could claim for it.
+            for i, seq in enumerate(slots):
+                if seq is None:
+                    prefix[i] = None
+                elif prefix[i] is not None:
+                    prefix[i].append(tokens[i])
 
             for i in sampling:
                 seq = slots[i]

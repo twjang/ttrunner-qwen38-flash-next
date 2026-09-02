@@ -44,6 +44,9 @@ class TokenEvent:
 class EngineStats:
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Prompt tokens a backend did not have to feed because a slot already held
+    # them as state -- see TTEngine's prefix reuse.
+    cached_prompt_tokens: int = 0
     queued: int = 0
     running: int = 0
     started_at: float = field(default_factory=time.time)
