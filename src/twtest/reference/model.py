@@ -303,10 +303,17 @@ class Qwen4ExpModel:
         keep = chosen_valid.unsqueeze(-1).expand(-1, -1, -1, ratio).flatten(2)
         mask.scatter_(2, token_idx, keep)
 
-        # the trailing partial block is always visible
-        tail_start = n_blocks * ratio
+        # The trailing partial block is always visible -- the one *this* query is
+        # in, not the one the last query is in. Deriving it from the global
+        # `kv_len` made a whole-prompt call disagree with the same prompt fed
+        # token by token, which is how QSA decodes: for a query at position p
+        # only blocks ending at or before p are eligible, so everything after
+        # the last such block has to come from the tail. With kv_len an exact
+        # multiple of `ratio` the global form left no tail at all, and every
+        # query before the last got a fully masked row.
+        tail_start = ((query_pos + 1) // ratio) * ratio
         pos = torch.arange(kv_len, device=hidden.device)
-        tail = (pos[None, :] >= tail_start) & (pos[None, :] <= query_pos[:, None])
+        tail = (pos[None, :] >= tail_start[:, None]) & (pos[None, :] <= query_pos[:, None])
         mask |= tail[None]
         return mask.unsqueeze(1)
 
