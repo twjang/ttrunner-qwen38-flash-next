@@ -352,3 +352,28 @@ def test_the_hyper_connection_mix_averages_in_one_op() -> None:
     assert "ttnn.mean(per_stream, dim=-2, keepdim=True)" in src
     assert "ttnn.sum(per_stream" not in src
     assert "1.0 / hc_count" not in src.split("inject = None")[0]
+
+
+def test_sparse_matmul_uses_one_k_block_past_a_row_tile() -> None:
+    """`in0_block_w` must span all of K once `per_core_M > 1`.
+
+    `ttnn.sparse_matmul` returns wrong rows past the first 32-row tile whenever
+    `per_core_M > 1` and K spans more than one block, silently. Measured at
+    E=64, N=320, M=64 over a K of 80 tiles: 10 blocks -> 32/64 rows wrong,
+    5 -> 32/64, 2 -> 16/64, 1 -> clean. That is what stopped `moe_block` being
+    per-token past 32 rows (handoff 5.8).
+
+    Below the threshold the old candidate list stands, deliberately: at one row
+    tile there is nothing to fix, and widening the block there changes the
+    accumulation order -- doing it unconditionally moved prefill's NLL from
+    5.648 to 6.301 at the default `moe_chunk=32`.
+    """
+    from twtest.tt.moe import sparse_program_config
+
+    k, n = 2560, 320
+    k_tiles = k // 32
+    assert sparse_program_config(64, k, n).in0_block_w == k_tiles, "M=64 needs one K block"
+    assert sparse_program_config(128, k, n).in0_block_w == k_tiles
+    narrow = sparse_program_config(32, k, n).in0_block_w
+    assert narrow < k_tiles, "at one row tile the original width must be kept"
+    assert k_tiles % narrow == 0, "the op asserts Kt % in0_block_w == 0"

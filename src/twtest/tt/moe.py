@@ -37,12 +37,45 @@ def sparse_program_config(m: int, k: int, n: int, grid_x: int = 10, grid_y: int 
     activation block is multicast to every core while the cores split N. With
     `per_core_N == 1` each core owns a single output tile column, which suits the
     narrow expert shapes here (N = 640 -> 20 tiles, N = 2560 -> 80 tiles).
+
+    **`k` must be the input's real last dimension, not a nominal size.** It sets
+    `in0_block_w`, and the op asserts `Kt % in0_block_w == 0` against the actual
+    tensor.
+
+    `in0_block_w` is the whole of K -- one block, no K loop -- and that is a
+    correctness requirement, not a tuning choice. `ttnn.sparse_matmul` returns
+    *wrong rows past the first 32-row tile* whenever `per_core_M > 1` and K
+    spans more than one block, and it does so silently. Measured at
+    E=64, N=320, M=64, varying only `in0_block_w` over a K of 80 tiles:
+
+        in0_block_w   K blocks   rows wrong
+                  8         10        32/64
+                 16          5        32/64
+                 40          2        16/64
+                 80          1         0/64
+
+    and by K at the default block width: K=256 (one block) clean, K=512 16/64,
+    K>=1024 32/64. That is what made `moe_block` stop being per-token past 32
+    rows and forced `_MAX_MOE_CHUNK`; see handoff 5.8 and
+    `scripts/dev/sparse_matmul_rows_check.py`.
+
+    The old candidate list (8, 5, 4, 2, 1) hid this for the down-projection,
+    which it happened to give a single block by luck -- 5 candidates against a
+    real Kt of 5 -- while the gate/up matmul got ten blocks and was wrong.
     """
     n_tiles, k_tiles, m_tiles = _tiles(n), _tiles(k), _tiles(m)
     cores = min(grid_x * grid_y, n_tiles)
     per_core_n = (n_tiles + cores - 1) // cores
-    # widest block that still divides K, capped so the L1 block stays small
-    in0_block_w = next((b for b in (8, 5, 4, 2, 1) if k_tiles % b == 0), 1)
+    # One K block only where the bug can bite -- `per_core_M > 1`. At one row
+    # tile the op is correct with any block width, and widening it there is not
+    # free: it changes the accumulation order, and doing so unconditionally moved
+    # prefill's NLL from 5.648 to 6.301 at the default `moe_chunk=32`, where
+    # there was nothing to fix. Below the threshold this is the original
+    # candidate list, so those numbers are untouched.
+    in0_block_w = (
+        k_tiles if m_tiles > 1
+        else next((b for b in (8, 5, 4, 2, 1) if k_tiles % b == 0), 1)
+    )
     return _MM1D(
         compute_with_storage_grid_size=ttnn.CoreCoord(grid_x, grid_y),
         in0_block_w=in0_block_w,
@@ -145,8 +178,12 @@ def expert_ffn(
     broadcast = ttnn.repeat(x, (1, num_experts, 1, 1))
     kw = {"sparsity": sparsity, "nnz": nnz, "is_input_a_sparse": True, "is_input_b_sparse": True}
 
-    pc_in = sparse_program_config(m, hidden_size, intermediate_size)
-    pc_out = sparse_program_config(m, intermediate_size, hidden_size)
+    # Both configs come from the tensors, not from the nominal sizes. The expert
+    # weights are sharded, so this device's intermediate width is
+    # `gate_w.shape[-1] // 2`, a quarter of `intermediate_size` -- passing the
+    # nominal value asks for an `in0_block_w` the op rejects outright
+    # ("Kt (5) must be divisible by in0_block_w (20)").
+    k_in = broadcast.shape[-1]
 
     if up_w is None:
         # gate_w carries gate|up fused on the output axis: one sparse_matmul
@@ -157,14 +194,16 @@ def expert_ffn(
         # device requantises them and changes the output.
         n = gate_w.shape[-1] // 2
         both = ttnn.sparse_matmul(
-            broadcast, gate_w, program_config=sparse_program_config(m, hidden_size, 2 * n),
+            broadcast, gate_w, program_config=sparse_program_config(m, k_in, 2 * n),
             compute_kernel_config=HIFI4, **kw,
         )
         e = both.shape[1]
         gate = ttnn.slice(both, (0, 0, 0, 0), (1, e, m, n))
         up = ttnn.slice(both, (0, 0, 0, n), (1, e, m, 2 * n))
     else:
+        pc_in = sparse_program_config(m, k_in, gate_w.shape[-1])
         gate = ttnn.sparse_matmul(broadcast, gate_w, program_config=pc_in, compute_kernel_config=HIFI4, **kw)
         up = ttnn.sparse_matmul(broadcast, up_w, program_config=pc_in, compute_kernel_config=HIFI4, **kw)
     hidden = ttnn.multiply(ttnn.silu(gate), up)
+    pc_out = sparse_program_config(m, hidden.shape[-1], hidden_size)
     return ttnn.sparse_matmul(hidden, down_w, program_config=pc_out, compute_kernel_config=HIFI4, **kw)

@@ -672,17 +672,53 @@ time, which needs no reference implementation, and compares:
   `fuse_batch=True` — give byte-identical error; `mcast_in0=False` is rejected
   by the op. So `per_core_M > 1` is the boundary but the config is not the bug.
 
-That leaves `expert_ffn` at production scale (E=512, K=2560, the fused
-gate|up), which is where the reduced probes stop reproducing it. The untested
-piece is `ttnn.repeat(x, (1, 512, 1, 1))` — 168 MB at 64 rows, 335 MB at 128 —
-and `sparse_matmul`'s device-side `nnz` counting at that size; note the op
-docstring already warns that an `nnz` disagreeing with the mask *hangs* the
-device, so its accounting is known to be delicate.
+**Found, and fixed.** `ttnn.repeat` is exact at production scale, so it was the
+sparse matmul after all — the earlier probe missed it by running at E=64, K=256,
+N=128, about a hundredth of the real shape.
+`scripts/dev/sparse_matmul_rows_check.py` isolates it with real weights:
+`ttnn.sparse_matmul` returns **wrong rows past the first 32-row tile** whenever
+`per_core_M > 1` and K spans more than one block, silently. Neither the expert
+count nor N nor the mask density matters — it is wrong at a union of 1. K is the
+trigger, through the block count:
 
-Done when: the mechanism is found and either fixed — 64 and 128 reproducing the
-per-row answer, `moe_rows_check.py` clean — or reported upstream with the cap
-kept. The remaining prize is 1.2x on prompt intake, so do not raise the cap for
-it without `moe_rows_check.py` coming back clean.
+| in0_block_w | K blocks (K=2560) | rows wrong |
+|---|---|---|
+| 8 (the old default) | 10 | 32/64 |
+| 16 | 5 | 32/64 |
+| 40 | 2 | 16/64 |
+| **80 = k_tiles** | **1** | **0/64** |
+
+and by K at the default width: K=256 (one block) clean, K=512 16/64, K≥1024
+32/64.
+
+`sparse_program_config` now uses `in0_block_w = k_tiles` — one block, no K loop —
+**when `per_core_M > 1`**, keeping the original candidate list below that. The
+condition is load-bearing: at one row tile there is nothing to fix, and widening
+the block changes the accumulation order, which moved prefill's NLL from 5.648 to
+6.301 when applied unconditionally. `expert_ffn` also derives both configs from
+the *tensors* now: the down-projection had been given the global intermediate
+size where the weights are sharded, so its nominal Kt (20) was four times the
+real one (5) — and the old candidate list landed on 5 by luck, which is why only
+the gate/up matmul was ever wrong.
+
+Result: `moe_block` at 64 rows goes from **33 of 64 rows wrong (worst 102.9 %) to
+1 of 64 (worst 6.8 %)**, with decode (83.0 % / NLL 0.682) and prefill (24.3 % /
+5.648) bit-identical to before.
+
+**The residual is a different bug, and a much smaller one.** That last row is
+routing, not arithmetic: `keep = ge(probs, threshold)` with bf16 probabilities
+that tie, where `ttnn.topk`'s k-th value comes back marginally different at 64
+rows than at 32. Logits at group 64 are still 23.9 % from group 32 (down from
+55.9 %) though the argmax now agrees; at 128 the argmax still differs.
+
+**So the cap stays at 32** — the answer still changes past it — but for a named,
+minor reason rather than an unexplained cliff. Raising it is now a judgement
+about whether a one-row-in-64 tie is acceptable, worth about 1.18x on prompt
+intake (1101 → 936 ms).
+
+Done when: `moe_rows_check.py` is clean at 64 and 128 — which now means the topk
+tie, the matmul part being done — or the cap is accepted as permanent with the
+tie documented. Do not raise it without a quality measurement.
 
 
 ## 6. Recipes
