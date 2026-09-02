@@ -418,13 +418,19 @@ class TTModel:
         k = self._slice_last(qkv, kd, 2 * kd)
         v = self._slice_last(qkv, 2 * kd, 2 * kd + self.value_dim_local)
 
-        # The checkpoint stores V heads tiled over K heads, so Q/K must be tiled
-        # (repeat), not repeat_interleave'd, to 48 heads. The tiling has to happen
-        # *inside* each sequence: flattening batch and head together first and
-        # then repeating would wrap across sequences and pair sequence b's query
-        # with sequence b-1's value.
-        q = ttnn.repeat(ttnn.reshape(q, (batch, 1, n_k, hd)), (1, 1, reps, 1))
-        k = ttnn.repeat(ttnn.reshape(k, (batch, 1, n_k, hd)), (1, 1, reps, 1))
+        # V heads are grouped over K heads -- v-head j reads k-head j // reps --
+        # so Q/K expand by repeat_interleave, matching upstream. This is also the
+        # only expansion compatible with head-sharding: device d holds k-heads
+        # [4d, 4d+4) and v-heads [12d, 12d+12), and the global pairing sends
+        # v-head 12d+i to k-head 4d + i//reps, which is exactly what interleaving
+        # the local heads produces. Tiling (repeat) pairs v-head j with k-head
+        # j % n_k instead, which no device holds the k heads for.
+        #
+        # The expansion has to happen *inside* each sequence: flattening batch
+        # and head together first would wrap across sequences and pair sequence
+        # b's query with sequence b-1's value.
+        q = ttnn.repeat_interleave(ttnn.reshape(q, (batch, 1, n_k, hd)), reps, dim=2)
+        k = ttnn.repeat_interleave(ttnn.reshape(k, (batch, 1, n_k, hd)), reps, dim=2)
         q = ttnn.reshape(q, (batch * n_v, 1, 1, hd))
         k = ttnn.reshape(k, (batch * n_v, 1, 1, hd))
         v = ttnn.reshape(v, (batch * n_v, 1, 1, hd))
@@ -1007,8 +1013,9 @@ class TTModel:
         per_dev = []
         for d in range(self.n_dev):
             qkv_h = qkv_all[d]
-            q_h = qkv_h[..., :kd].reshape(1, seq, n_k, hd).repeat(1, 1, reps, 1)
-            k_h = qkv_h[..., kd : 2 * kd].reshape(1, seq, n_k, hd).repeat(1, 1, reps, 1)
+            # grouped, not tiled -- see _linear_attention_step
+            q_h = qkv_h[..., :kd].reshape(1, seq, n_k, hd).repeat_interleave(reps, dim=2)
+            k_h = qkv_h[..., kd : 2 * kd].reshape(1, seq, n_k, hd).repeat_interleave(reps, dim=2)
             v_h = qkv_h[..., 2 * kd :].reshape(1, seq, n_v, hd)
             prep = prepare(q_h, k_h, v_h, g_all[d], b_all[d])
             prep.pop("_meta")

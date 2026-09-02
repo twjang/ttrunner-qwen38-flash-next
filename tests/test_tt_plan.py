@@ -227,28 +227,54 @@ def test_shared_expert_gate_is_a_column() -> None:
         assert tuple(device_layout(name, torch.zeros(n)).shape) == (1, 1, 1, n), name
 
 
-def test_head_tiling_order_is_per_sequence() -> None:
-    """V heads are stored tiled over K heads; the tiling must not cross sequences.
+def test_head_expansion_is_grouped_and_per_sequence() -> None:
+    """V heads are *grouped* over K heads: v-head j reads k-head j // reps.
 
-    With 16 K heads and 48 V heads, V row (b, r*16+k) must be paired with Q row
-    (b, k). Flattening (batch, head) first and then repeating gives row
-    j % (batch*16), which is correct only for batch == 1 -- for batch 2 it pairs
-    sequence 0's r=1 heads with sequence 1's data.
+    That is repeat_interleave, which is what upstream does
+    (`query.repeat_interleave(num_v_heads // num_k_heads, dim=2)`). Tiling
+    instead -- pairing v-head j with k-head j % n_k -- is a different model, and
+    it cost the device path 41 % against the float32 reference in the very first
+    DeltaNet layer.
+
+    Grouping is also what removes the batch hazard tiling had: interleaving
+    never wraps past a head, so flattening (batch, head) first gives the same
+    answer, where tiling the flattened block paired sequence 0's heads with
+    sequence 1's data for any batch > 1.
     """
     batch, n_k, reps, hd = 3, 16, 3, 4
     n_v = n_k * reps
     q = torch.arange(batch * n_k * hd, dtype=torch.float32).reshape(batch, 1, n_k, hd)
 
-    # the correct form: repeat inside the sequence, then flatten
-    good = q.repeat(1, 1, reps, 1).reshape(batch * n_v, hd)
-    # the broken form: flatten first, then tile the whole block
-    bad = q.reshape(batch * n_k, hd).repeat(reps, 1)
-
+    good = q.repeat_interleave(reps, dim=2).reshape(batch * n_v, hd)
     for b in range(batch):
-        for r in range(reps):
-            for k in range(n_k):
-                assert torch.equal(good[b * n_v + r * n_k + k], q[b, 0, k]), "correct form broke"
-    assert not torch.equal(good, bad[: good.shape[0]]), "test would not catch the bug"
+        for j in range(n_v):
+            assert torch.equal(good[b * n_v + j], q[b, 0, j // reps]), "grouping broke"
+
+    tiled = q.repeat(1, 1, reps, 1).reshape(batch * n_v, hd)
+    assert not torch.equal(good, tiled), "tiling and grouping must differ"
+    # grouping is order-insensitive here; tiling was not
+    assert torch.equal(good, q.reshape(batch * n_k, hd).repeat_interleave(reps, dim=0))
+    assert not torch.equal(tiled, q.reshape(batch * n_k, hd).repeat(reps, 1))
+
+
+def test_grouped_expansion_survives_head_sharding() -> None:
+    """Grouping is the only expansion a head-sharded DeltaNet can implement.
+
+    Device d holds k-heads [d*n_k/D, ...) and v-heads [d*n_v/D, ...). Under
+    grouping, global v-head j needs k-head j // reps, which always lands in the
+    same device's own shard -- so expanding the local heads gives the global
+    answer. Under tiling, v-head j needs k-head j % n_k, which is spread over
+    every device.
+    """
+    n_k, reps, n_dev = 16, 3, 4
+    n_v = n_k * reps
+    k_per, v_per = n_k // n_dev, n_v // n_dev
+    for d in range(n_dev):
+        for i in range(v_per):
+            j = d * v_per + i                       # global v head
+            assert j // reps == d * k_per + i // reps, "grouping must stay on-device"
+    # tiling does not: device 0's v heads need k heads it does not hold
+    assert any((d * v_per + i) % n_k >= k_per for d in (0,) for i in range(v_per))
 
 
 def test_reinject_broadcast_equals_the_slice_form() -> None:

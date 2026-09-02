@@ -216,12 +216,17 @@ class Qwen4ExpModel:
         dt_bias = self.bw(layer, "ssm_dt.bias")
         g = a_decay.float() * F.softplus(a.float() + dt_bias.float())
 
-        # The checkpoint stores V heads tiled over K heads, so the K-side heads
-        # are tiled to match -- repeat, not repeat_interleave.
+        # V heads are grouped over K heads: v-head j reads k-head j // reps. That
+        # is repeat_interleave, as upstream does it
+        # (modeling_qwen4_exp.py: `query.repeat_interleave(num_v_heads //
+        # num_k_heads, dim=2)`). Tiling instead pairs v-head j with k-head
+        # j % n_k, which is a different model -- and one that cannot be
+        # head-sharded at all, since a device holding a contiguous block of v
+        # heads would need k heads from every other device.
         if n_v > n_k:
             reps = n_v // n_k
-            query = query.repeat(1, 1, reps, 1)
-            key = key.repeat(1, 1, reps, 1)
+            query = query.repeat_interleave(reps, dim=2)
+            key = key.repeat_interleave(reps, dim=2)
 
         prev_state = cache[layer].recurrent_state if cache is not None else None
         rule = recurrent_gated_delta_rule if seq == 1 else chunk_gated_delta_rule
