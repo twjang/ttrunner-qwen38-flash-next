@@ -3,10 +3,11 @@
     uv run python scripts/dev/simulated_precision.py [total] [--experts DTYPE]
                                                      (default 48, plan dtype)
 
-`--experts` overrides the dtype used for the MoE expert stacks, which is how to
-price a change to the precision policy before spending a 40 GB conversion on
-it: they are the only bfloat4_b tensors in the model and they dominate the
-24.94 GB, so raising them is a memory trade.
+`--experts DTYPE` overrides the dtype used for the MoE expert stacks, which is
+how to price a change to the precision policy before spending a 40 GB conversion
+on it. `--group experts|dense` quantises only one of the two families, which is
+what separates "the 4-bit experts are the problem" from "the bfloat8_b dense
+weights are".
 
 The device agrees with the float32 oracle on 40 % of greedy tokens. Every block
 is at its dtype floor and nothing structural is left, so the gap is precision --
@@ -41,11 +42,18 @@ from twtest.tt.plan import Residency, plan_for
 
 argv = sys.argv[1:]
 EXPERTS = None
-if "--experts" in argv:
-    i = argv.index("--experts")
-    EXPERTS = argv[i + 1]
-    argv = argv[:i]
+GROUP = "all"
+for flag, setter in (("--experts", "EXPERTS"), ("--group", "GROUP")):
+    if flag in argv:
+        i = argv.index(flag)
+        if setter == "EXPERTS":
+            EXPERTS = argv[i + 1]
+        else:
+            GROUP = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+argv = [a for a in argv if not a.startswith("--")]
 TOTAL = int(argv[0]) if argv else 48
+assert GROUP in ("all", "experts", "dense"), GROUP
 torch.set_num_threads(8)
 
 TEXT = (
@@ -74,8 +82,13 @@ def quantise(name: str, flat: np.ndarray) -> np.ndarray:
         return flat
     if plan.residency is not Residency.DEVICE:
         return flat                       # stays on the host, dequantised
+    is_expert = "_exps." in name
+    if GROUP == "experts" and not is_expert:
+        return flat                       # left exact, to isolate the experts
+    if GROUP == "dense" and is_expert:
+        return flat
     dtype = plan.dtype
-    if EXPERTS is not None and "_exps." in name:
+    if EXPERTS is not None and is_expert:
         dtype = EXPERTS
     try:
         out = round_trip(flat, dtype)
@@ -94,7 +107,8 @@ def predictions(store: WeightStore):
 
 exact_store = WeightStore(gguf, cache_bytes=2 << 30, row_cache_bytes=8 << 30)
 exact, h_exact = predictions(exact_store)
-print(f"RESULT exact reference ready, {len(ids)} positions", flush=True)
+print(f"RESULT exact reference ready, {len(ids)} positions "
+      f"(group={GROUP}, experts={EXPERTS or 'plan'})", flush=True)
 
 quant_store = WeightStore(
     gguf, cache_bytes=2 << 30, row_cache_bytes=8 << 30, quant_sim=quantise
