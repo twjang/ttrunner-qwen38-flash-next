@@ -145,16 +145,62 @@ def test_chunked_conv_taps_are_keyed_by_layer() -> None:
     assert '("ssm_chunk", channels)' not in src
 
 
-def test_chunked_attention_masks_the_tile_padding() -> None:
-    """The K/V slice and the additive mask are TILE_LAYOUT, so a key length that
-    is not a multiple of 32 is padded -- with zeros, which an additive mask reads
-    as "attend to me". Slicing to a whole tile and running the causal condition
-    over that width is what masks the pad; a slice to `total` does not."""
-    src = inspect.getsource(TTModel._attention_chunk)
-    assert "ttnn.TILE_SIZE" in src
-    assert "(1, n_kv, kv_len, hd)" in src
-    assert "torch.arange(kv_len)" in src
-    assert "(1, n_kv, total, hd)" not in src
+
+def _code_of(fn) -> str:
+    """Source with comments stripped.
+
+    These contracts assert on op names, and the code they guard carries a long
+    comment naming the ops it deliberately no longer calls -- the tile-padding
+    mask, the `repeat_interleave` -- because that history is why the current
+    form is what it is. Matching on raw source would make the explanation fail
+    the test that the explanation exists for.
+    """
+    lines = []
+    for line in inspect.getsource(fn).split("\n"):
+        stripped = line.split("#", 1)[0] if "#" in line else line
+        lines.append(stripped)
+    return "\n".join(lines)
+
+def test_chunked_attention_builds_no_host_mask() -> None:
+    """There must be no additive attention mask in the chunk path at all.
+
+    There used to be, and it was wrong: the K/V slice and the mask were both
+    TILE_LAYOUT, so a key length that was not a multiple of 32 got padded --
+    with zeros, which an additive mask reads as "attend to me". The softmax
+    spread over up to 31 all-zero keys and the block returned roughly v/32
+    instead of v (`docs/iterations/013`). It was fixed by slicing to a whole
+    tile; it is now *impossible*, because
+    `chunked_scaled_dot_product_attention` is causal internally and there is no
+    mask to pad.
+
+    Keeping this as a test rather than deleting it: a future change that
+    reintroduces an explicit mask here reintroduces the padding question with
+    it, and the failure was silent the first time.
+    """
+    src = _code_of(TTModel._attention_chunk)
+    assert "attn_mask" not in src, "the chunk path must not build an attention mask"
+    assert "torch.where" not in src and "torch.arange" not in src, (
+        "no host-built mask or position vector in the chunk path"
+    )
+    assert "repeat_interleave" not in src, (
+        "chunked SDPA reads n_kv directly; expanding KV heads is wasted work"
+    )
+
+
+def test_chunked_attention_takes_its_position_from_the_device() -> None:
+    """The chunk start must be a device tensor, or the path cannot be captured.
+
+    A trace records ops, not Python values: `fill_cache(update_idx=start)` and a
+    host-built mask bake one chunk's position into the recorded program, so
+    every replay rewrites the same slot. The paged ops take the position as
+    data -- a page table for the write, `chunk_start_idx_tensor` for the read --
+    which is what makes one capture serve every chunk (handoff 5.2).
+    """
+    src = _code_of(TTModel._attention_chunk)
+    assert "chunk_start_idx_tensor" in src
+    assert 'self._input(' in src, "the start must go through the bound-buffer path"
+    assert "ttnn.fill_cache(" not in src, "fill_cache takes a Python int position"
+    assert "paged_fill_cache" in src
 
 
 def test_chunked_prefill_turns_the_trace_off() -> None:

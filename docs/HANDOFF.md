@@ -287,7 +287,29 @@ float32 at those chunks -- that is bf16 accumulating over more keys. Paged and
 dense agree with *each other* far more closely than either agrees with float32,
 and at chunk 256 paged is the closer of the two (6.119 vs 6.456).
 
-**So this is now a mechanical refactor, in this order:**
+**Steps 1-4 are done.** The K/V cache is paged, every position in both paths is
+device data, and the chunk path contains no host->device copy at all. Verified
+bit-identical to the flat path at every gate:
+
+| | before | after |
+|---|---|---|
+| decode | 83.0 % top-1, NLL 0.682 | **identical** |
+| prefill=32, 128 scored | 71.9 %, NLL 1.433 | **identical** |
+| prefill=128, 107 scored | 24.3 %, NLL 5.648 | **identical** |
+| chunk wall clock | 1060.5 ms | 1070.5 ms |
+
+Two things that took measuring. `chunked_scaled_dot_product_attention`'s two
+chunk sizes buy different things -- `q_chunk_size` is the outer iteration count
+and drives speed, `k_chunk_size` fixes the accumulation order and therefore the
+answer. All-32 is correct at every start but 36 % slower (1442 ms); all-128 is
+fast but moved prefill's NLL to 5.980; **q=128, k=32** is both, and is selected
+only when the chunk is a full 128 at a 128-aligned start, with the all-32 config
+as the fallback. And a misaligned start is *silent*, not an error: at
+q_chunk_size=128 a start of 32 returns 257 % nonsense.
+
+**What is left is step 5 alone: the capture.**
+
+The original plan, for the record:
 
 1. Allocate `st.keys`/`st.values` paged, `[T/32, n_kv, 32, head_dim]`, plus a
    per-slot page table as a device tensor.

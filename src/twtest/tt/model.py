@@ -34,6 +34,15 @@ from .ops import HIFI4, gated_residual_mix, grouped_rms_norm, reinject, rms_norm
 from .weights import TTWeights
 
 
+# K/V page size. One tile, so every cache write stays tile-aligned and a chunk
+# start is a legal `chunk_start_idx` for the chunked SDPA program config below.
+KV_BLOCK = 32
+
+# The DeltaNet op's fixed chunk width, which is also `prefill`'s default chunk
+# and therefore the width the traced prefill path will capture.
+DELTANET_CHUNK = 128
+
+
 # Largest MoE row-group that still computes a per-token MoE.
 #
 # `moe.moe_block` must be exact per row -- each row picks its own experts and is
@@ -187,6 +196,38 @@ class TTModel:
             k_chunk_size=sdpa_k_chunk,
             exp_approx_mode=False,
         )
+        # `chunked_scaled_dot_product_attention` requires the chunk's start to be
+        # a multiple of *both* chunk sizes, and violating that is silent: at
+        # q_chunk_size=128 a start of 32 returns 257 % nonsense rather than an
+        # error (`scripts/dev/paged_attention_probe.py`). `prefill` guarantees
+        # only 32-alignment -- its chunk is a multiple of TILE_SIZE and it can
+        # resume from any tile-aligned base -- so 32 is the size that covers
+        # everything it can produce, and it is exact at every start measured.
+        self.chunked_sdpa_program_config = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(8, 8),
+            q_chunk_size=KV_BLOCK,
+            k_chunk_size=KV_BLOCK,
+            exp_approx_mode=False,
+        )
+        # ... and a wide one for the common case. A 32-wide chunk config is
+        # correct at every start prefill can produce but does four times the
+        # inner iterations of a 128-wide one, which cost 1060 -> 1442 ms a chunk
+        # when it was used unconditionally. `_attention_chunk` picks the wide
+        # config only when the start is 128-aligned *and* the chunk is a full
+        # 128 -- the default, and the only shape the traced path will capture --
+        # and falls back to the narrow one otherwise.
+        # Wide in q, narrow in k. The two axes buy different things: q_chunk_size
+        # is the outer iteration count and drives the speed, k_chunk_size sets
+        # the accumulation order and therefore the answer. At k=128 prefill's
+        # NLL moved 5.648 -> 5.980; at k=32 it reproduces the pre-paged path
+        # exactly, and q=128 keeps the speed.
+        self.chunked_sdpa_wide_config = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(8, 8),
+            q_chunk_size=DELTANET_CHUNK,
+            k_chunk_size=KV_BLOCK,
+            exp_approx_mode=False,
+        )
+        self._page_tables: dict[int, ttnn.Tensor] = {}
         self.w = weights
         self.host = host_store
         self.mesh = mesh
@@ -349,6 +390,48 @@ class TTModel:
         if rem:
             ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, rows), ttnn.CoreCoord(rem - 1, rows)))
         return ttnn.CoreRangeSet(set(ranges))
+
+    def _kv_page_table(self, batch: int) -> ttnn.Tensor:
+        """Logical block -> physical block, one row per sequence.
+
+        Each slot owns a contiguous run of blocks, so the mapping is the identity
+        shifted by the slot: row b is `[b*n, b*n+1, ...]`. Nothing here is
+        dynamic -- the point of the page table is not paging, it is that the ops
+        take the *position* from device memory rather than from a Python int,
+        which is what lets the attention layers be captured (5.2).
+
+        Built once per batch and cached, because a trace capture must not
+        allocate.
+        """
+        hit = self._page_tables.get(batch)
+        if hit is not None:
+            return hit
+        n = self.max_seq_len // KV_BLOCK
+        rows = torch.arange(batch * n, dtype=torch.int32).reshape(batch, n)
+        table = ttnn.from_torch(
+            rows, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.mesh, mesh_mapper=self.replicate,
+        )
+        self._page_tables[batch] = table
+        return table
+
+    def _ensure_kv(self, st: "LayerState", batch: int, n_kv: int, hd: int) -> None:
+        """Allocate this layer's K/V cache the first time it is written.
+
+        Paged when `traceable_kv`: `[batch * T/32, n_kv, 32, head_dim]`, the same
+        total bytes as the flat `[batch, n_kv, T, head_dim]` it replaces, but the
+        layout `paged_fill_cache`, `paged_update_cache` and both paged SDPA ops
+        want. The flat form stays for the legacy path, which uses `update_cache`
+        and cannot take a position tensor at all.
+        """
+        if st.keys is not None:
+            return
+        if self.traceable_kv:
+            shape = (batch * (self.max_seq_len // KV_BLOCK), n_kv, KV_BLOCK, hd)
+        else:
+            shape = (batch, n_kv, self.max_seq_len, hd)
+        st.keys = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
+        st.values = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
 
     def _l1_height_sharded(self, t: ttnn.Tensor, width: int) -> ttnn.Tensor:
         """L1 height-sharded copy with shard width == the last dimension.
@@ -767,10 +850,7 @@ class TTModel:
         q = self._apply_rope_dev(q, cos, sin)
         k = self._apply_rope_dev(k, cos, sin)
 
-        if st.keys is None:
-            shape = (batch, n_kv, self.max_seq_len, hd)
-            st.keys = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
-            st.values = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
+        self._ensure_kv(st, batch, n_kv, hd)
         positions = list(position) if isinstance(position, (list, tuple)) else [position] * batch
         positions_for_rope = positions
         # `update_cache` accepts an INTERLEAVED input and takes the position as a
@@ -793,22 +873,27 @@ class TTModel:
             )
             k_s = self._l1_height_sharded(ttnn.typecast(k, ttnn.bfloat16), hd)
             v_s = self._l1_height_sharded(ttnn.typecast(v, ttnn.bfloat16), hd)
-            ttnn.experimental.paged_update_cache(st.keys, k_s, update_idxs_tensor=pos_tensor)
-            ttnn.experimental.paged_update_cache(st.values, v_s, update_idxs_tensor=pos_tensor)
-            if self.use_indexer:
-                out = ttnn.transformer.scaled_dot_product_attention_decode(
-                    q, st.keys, st.values, is_causal=False,
-                    attn_mask=self._indexer_select(mixed, layer, st, positions, cos, sin),
-                    cur_pos_tensor=pos_tensor,
-                    scale=hd**-0.5, program_config=self.sdpa_program_config,
-                    compute_kernel_config=HIFI4,
-                )
-            else:
-                out = ttnn.transformer.scaled_dot_product_attention_decode(
-                    q, st.keys, st.values, is_causal=True, cur_pos_tensor=pos_tensor,
-                    scale=hd**-0.5, program_config=self.sdpa_program_config,
-                    compute_kernel_config=HIFI4,
-                )
+            page_table = self._kv_page_table(batch)
+            ttnn.experimental.paged_update_cache(
+                st.keys, k_s, update_idxs_tensor=pos_tensor, page_table=page_table
+            )
+            ttnn.experimental.paged_update_cache(
+                st.values, v_s, update_idxs_tensor=pos_tensor, page_table=page_table
+            )
+            # The paged decode op takes the same `attn_mask` shape the flat one
+            # does, so the QSA selection passes through unchanged: the indexer
+            # masks *logical* positions and never addresses the cache.
+            mask = (
+                self._indexer_select(mixed, layer, st, positions, cos, sin)
+                if self.use_indexer else None
+            )
+            out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+                q, st.keys, st.values, page_table_tensor=page_table,
+                is_causal=not self.use_indexer, attn_mask=mask,
+                cur_pos_tensor=pos_tensor,
+                scale=hd**-0.5, program_config=self.sdpa_program_config,
+                compute_kernel_config=HIFI4,
+            )
         else:
             k_upd = ttnn.typecast(ttnn.permute(k, (0, 2, 1, 3)), ttnn.bfloat16)
             v_upd = ttnn.typecast(ttnn.permute(v, (0, 2, 1, 3)), ttnn.bfloat16)
@@ -1006,10 +1091,8 @@ class TTModel:
         q = self._apply_rope_dev(q, cos, sin)
         kr = self._apply_rope_dev(kt, cos, sin)
 
-        if st.keys is None:
-            shape = (1, n_kv, self.max_seq_len, hd)
-            st.keys = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
-            st.values = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
+        self._ensure_kv(st, 1, n_kv, hd)
+        page_table = self._kv_page_table(1)
 
         # every row is written before any is read, so row i's window already
         # contains rows 0..i
@@ -1024,19 +1107,20 @@ class TTModel:
             v_row = ttnn.reshape(ttnn.slice(vt, (0, i, 0, 0), (1, i + 1, n_kv, hd)), (1, 1, n_kv, hd))
             ttnn.experimental.paged_update_cache(
                 st.keys, self._l1_height_sharded(ttnn.typecast(k_row, ttnn.bfloat16), hd),
-                update_idxs_tensor=idx,
+                update_idxs_tensor=idx, page_table=page_table,
             )
             ttnn.experimental.paged_update_cache(
                 st.values, self._l1_height_sharded(ttnn.typecast(v_row, ttnn.bfloat16), hd),
-                update_idxs_tensor=idx,
+                update_idxs_tensor=idx, page_table=page_table,
             )
 
         outs = []
         for i in range(k):
             q_row = ttnn.reshape(ttnn.slice(q, (0, i, 0, 0), (1, i + 1, n_q, hd)), (1, 1, n_q, hd))
             outs.append(
-                ttnn.transformer.scaled_dot_product_attention_decode(
-                    q_row, st.keys, st.values, is_causal=True, cur_pos_tensor=idxs[i],
+                ttnn.transformer.paged_scaled_dot_product_attention_decode(
+                    q_row, st.keys, st.values, page_table_tensor=page_table,
+                    is_causal=True, cur_pos_tensor=idxs[i],
                     scale=hd**-0.5, program_config=self.sdpa_program_config,
                     compute_kernel_config=HIFI4,
                 )
@@ -1754,42 +1838,62 @@ class TTModel:
         # rope: cos/sin come out [1, seq, 1, rope_dim]; transposed to
         # [1, 1, seq, rope_dim] they broadcast over the head axis of
         # q/k laid out as [1, n_heads, seq, hd].
+        # Bound buffers, not `to_dev`: a capture cannot see a host->device copy,
+        # so the rope table has to live at a fixed address that the filler
+        # rewrites before each replay -- the same treatment the decode step's
+        # inputs already get. The name carries `seq` because the buffer's shape
+        # depends on it, exactly as `stepn{k}_cos` carries k.
         cos_t, sin_t = self.rope(list(range(start, start + seq)))
-        cos = ttnn.permute(self.to_dev(cos_t, ttnn.float32), (0, 2, 1, 3))
-        sin = ttnn.permute(self.to_dev(sin_t, ttnn.float32), (0, 2, 1, 3))
+        cos = ttnn.permute(self._input(f"chunk{seq}_cos", cos_t, ttnn.float32), (0, 2, 1, 3))
+        sin = ttnn.permute(self._input(f"chunk{seq}_sin", sin_t, ttnn.float32), (0, 2, 1, 3))
         q = self._apply_rope_dev(ttnn.permute(q, (0, 2, 1, 3)), cos, sin)
         k = self._apply_rope_dev(ttnn.permute(k, (0, 2, 1, 3)), cos, sin)
 
-        if st.keys is None:
-            shape = (1, n_kv, self.max_seq_len, hd)
-            st.keys = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
-            st.values = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
-        ttnn.fill_cache(st.keys, k, 0, update_idx=start)
-        ttnn.fill_cache(st.values, ttnn.permute(v, (0, 2, 1, 3)), 0, update_idx=start)
+        self._ensure_kv(st, 1, n_kv, hd)
+        page_table = self._kv_page_table(1)
+        # `paged_fill_cache` writes its input at the *start* of whatever page
+        # table it is handed, so a chunk at absolute `start` passes a table
+        # sliced from that block onward rather than the whole one.
+        blocks = self.max_seq_len // KV_BLOCK
+        fill_table = ttnn.slice(page_table, (0, start // KV_BLOCK), (1, blocks))
+        ttnn.experimental.paged_fill_cache(st.keys, k, fill_table, batch_idx=0)
+        ttnn.experimental.paged_fill_cache(
+            st.values, ttnn.permute(v, (0, 2, 1, 3)), fill_table, batch_idx=0
+        )
 
-        total = start + seq
-        # Slice to a whole number of tiles. Both the K/V slice and the mask are
-        # TILE_LAYOUT, so a key length that is not a multiple of 32 gets padded
+        # `chunked_scaled_dot_product_attention` is causal internally and reads
+        # `n_kv` directly, which removes three things at once: the explicit
+        # additive mask, the tile-padded `kv_len` slice that mask needed, and the
+        # `repeat_interleave` that expanded 2 KV heads to 24.
+        #
+        # The mask deserves an obituary, because its bug cost an iteration
+        # (`docs/iterations/013`). Both the K/V slice and the mask were
+        # TILE_LAYOUT, so a key length that was not a multiple of 32 got padded
         # -- and an additive mask pads with *zeros*, which means "attend to me".
-        # The softmax then spread over up to 31 all-zero key positions and
-        # diluted the real ones: at one token this block returned roughly v/32
-        # instead of v (99.7 % wrong against a float32 host computation), and
-        # the error decayed as real positions crowded the padding out. Padding
-        # explicitly and letting the causal condition run over the padded width
-        # masks it, because every query position is < total by construction.
-        kv_len = min(-(-total // ttnn.TILE_SIZE) * ttnn.TILE_SIZE, self.max_seq_len)
-        keys = ttnn.slice(st.keys, (0, 0, 0, 0), (1, n_kv, kv_len, hd))
-        values = ttnn.slice(st.values, (0, 0, 0, 0), (1, n_kv, kv_len, hd))
-        groups = n_q // n_kv
-        keys = ttnn.repeat_interleave(keys, groups, dim=1)
-        values = ttnn.repeat_interleave(values, groups, dim=1)
-
-        qpos = torch.arange(seq).unsqueeze(-1) + start
-        kpos = torch.arange(kv_len).unsqueeze(0)
-        mask = torch.where(kpos <= qpos, 0.0, float("-inf")).reshape(1, 1, seq, kv_len)
-        out = ttnn.transformer.scaled_dot_product_attention(
-            q, keys, values, attn_mask=self.to_dev(mask, ttnn.bfloat16), is_causal=False,
-            scale=hd**-0.5, compute_kernel_config=HIFI4,
+        # The softmax spread over up to 31 all-zero key positions: at one token
+        # this block returned roughly v/32 instead of v, 99.7 % wrong against a
+        # float32 host computation. Slicing to a whole tile and letting the
+        # causal condition run over the padded width fixed it. None of that can
+        # recur here, because there is no mask to pad.
+        #
+        # The start is a *device tensor*, so a capture records the read rather
+        # than the value and one trace serves every chunk -- the whole point of
+        # this path (5.2). It must be a multiple of both program-config chunk
+        # sizes, and violating that is silent rather than an error, which is why
+        # `chunked_sdpa_program_config` uses 32: `prefill` guarantees only
+        # tile-alignment.
+        start_t = self._input(
+            "chunk_start", torch.tensor([start], dtype=torch.int32), ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+        )
+        wide = seq == DELTANET_CHUNK and start % DELTANET_CHUNK == 0
+        out = ttnn.transformer.chunked_scaled_dot_product_attention(
+            q, st.keys, st.values, page_table, chunk_start_idx_tensor=start_t,
+            scale=hd**-0.5,
+            program_config=(
+                self.chunked_sdpa_wide_config if wide else self.chunked_sdpa_program_config
+            ),
+            compute_kernel_config=HIFI4,
         )
         out = ttnn.reshape(ttnn.permute(out, (0, 2, 1, 3)), (1, 1, seq, n_q * hd))
         gate = ttnn.reshape(gate, (1, 1, seq, n_q * hd))
@@ -1900,6 +2004,12 @@ class TTModel:
                 "on a 128-token chunk next-token top-1 falls from 53.1 % to 43.8 % "
                 "at 64 and 21.9 % at 128, while 8, 16 and 32 agree on every token. "
                 "Raise the cap with a measurement, not a reason."
+            )
+        if not self.traceable_kv:
+            raise NotImplementedError(
+                "chunked prefill reads a paged K/V cache, which only "
+                "traceable_kv=True allocates; the legacy path's flat cache has "
+                "no page table for `chunked_scaled_dot_product_attention`"
             )
         if state.batch != 1:
             raise NotImplementedError("chunked prefill is single-sequence for now")
@@ -2024,7 +2134,9 @@ class TTModel:
         hist = state.histories[0]
         base = len(hist) - seq
         per_token = [hist[: base + i + 1] for i in range(seq)]
-        emb = self.to_dev(self.ngram_embed(per_token), ttnn.bfloat16)  # [1,1,seq,ple_dim]
+        # Bound for the same reason as the chunk's rope table: host work is
+        # invisible to a trace capture.
+        emb = self._input(f"chunk{seq}_ngram", self.ngram_embed(per_token), ttnn.bfloat16)
 
         key = grouped_rms_norm(
             ttnn.linear(emb, self.w.blk(layer, "ple_key.weight"), compute_kernel_config=HIFI4),
