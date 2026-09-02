@@ -255,23 +255,54 @@ tuned for -- slot reuse already covers that case, because an idle engine does
 not step and the state simply stays.
 
 
-### 5.5 Short multi-row step (the MTP verify step) (2 days)
+### 5.5 Short multi-row step — **done** (`step_n`)
 
-Roadmap A1.2/B1.1. Do not start this before 5.1:
-speculation is only exact if the verifier is the model you meant to run. A `step_n(tokens[k])` that runs the DeltaNet recurrence
-unrolled k times *inside* one batched step (MoE/attention/HC over k rows),
-keeping the intermediate recurrent states so a prefix of j ≤ k tokens can be
-committed by `ttnn.copy`. First measurement: time it for k = 2, 4, 8 against
-k × 229 ms.
+`TTModel.step_n(tokens, state)` advances one sequence by k tokens in a single
+step and returns the mixed hidden at all k positions. The k tokens ride the
+batch axis for everything per-token; only the DeltaNet convolution and the
+recurrence are unrolled. Verified to reproduce k sequential steps **exactly**
+(0.00 % at k = 1, 2, 4, 8) with `scripts/dev/step_n_check.py`.
 
-Done when: `step_n` on k tokens reproduces `step` called k times (hidden
-maxdiff at the bf16 floor you measured in 5.1), and its time for k = 4 is
-< 2 × one step.
+Warmed, against 517.8 ms for one eager step (`step_n_bench.py`):
+
+| k | step_n | k steps | speedup | per token |
+|---|---|---|---|---|
+| 1 | 531.5 ms | 517.8 | 0.97x | 531.5 |
+| 2 | 672.3 | 1035.5 | 1.54x | 336.1 |
+| 4 | 864.4 | 2071.0 | 2.40x | 216.1 |
+| 8 | 1233.1 | 4142.1 | 3.36x | 154.1 |
+| 16 | 2000.4 | 8284.1 | 4.14x | 125.0 |
+
+Measure warmed: each k is a new set of kernel shapes, and the first call read
+3103 ms at k=4 where the warmed figure is 864.
+
+The chunked path is *not* the verifier, and `short_chunk_bench.py` is why: it
+carries a ~1.3 s fixed cost per call whatever k is (`deltanet.prepare()`
+round-trips ~30 MB a layer to the host), so it only beats eager decode past
+k = 3 and never beats a 236 ms traced step -- and being host-bound it cannot be
+captured either.
+
+Two pieces are deliberately left to 5.6, because they are speculation wiring
+rather than a multi-row step: `step_n` is not yet captured as a trace (each k
+needs its own capture, and its `_input` names need entries in
+`TracedDecoder._fill_inputs` the way the indexer's did), and committing only a
+prefix of the k tokens needs a state snapshot -- or a replay, which the numbers
+above make affordable.
+
 
 ### 5.6 Speculation: n-gram first, MTP second (2 + 4 days)
 
-* n-gram drafting (roadmap B2) needs only 5.5 plus an accept loop in the
-  engine. Greedy accept rule: accept while `argmax(verify_i) == draft_i`.
+* n-gram drafting (roadmap B2) needs only an accept loop in the engine on top
+  of `step_n`, plus the two pieces 5.5 left: a trace per k, and either a state
+  snapshot or a replay of the accepted prefix. Greedy accept rule: accept while
+  `argmax(verify_i) == draft_i`, which makes the output identical to
+  non-speculative decode rather than merely close.
+
+  Mind the baseline. `step_n` at k=4 costs 864 ms eager against 2071 for four
+  eager steps, but a *traced* step is 236 ms, so four of them are 944 ms --
+  already better than eager `step_n`. Speculation only pays once `step_n`
+  itself is traced. Capture it per k, the way `TracedDecoder` captures the
+  single-token step.
 * MTP (roadmap B1): the head is `blk.48` in `MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`.
   Order of work: (i) exercise Q4_K/Q5_0 dequant against the codebook (never
   exercised — `docs/iterations/003`), (ii) load `blk.48` through `convert.py`
