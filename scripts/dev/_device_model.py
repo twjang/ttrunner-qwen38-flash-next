@@ -25,12 +25,24 @@ GGUF_DIR = os.environ.get(
 TT_CACHE = os.environ.get("TWTEST_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
 
 
-def open_model(max_seq_len: int = 512, preload: bool = True):
+def open_model(max_seq_len: int = 512, preload: bool = True, trace_region_bytes: int | None = None,
+               num_command_queues: int | None = None):
     """Returns (mesh, cfg, model). Preloading everything but the split expert
-    halves takes ~1.5 min and makes the first step's timing honest."""
+    halves takes ~1.5 min and makes the first step's timing honest.
+
+    `trace_region_bytes` mirrors `TTEngine`, which always passes one (128 MB,
+    scaled by the number of capture widths). Leaving it None takes ttnn's
+    default, which is what every harness here did while the engine's captures
+    hung -- so it is a difference worth being able to reproduce, not a knob.
+    """
     torch.set_num_threads(8)
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-    mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 4))
+    kw = {} if trace_region_bytes is None else {"trace_region_size": trace_region_bytes}
+    if num_command_queues is not None:
+        # Two queues let two traces be issued independently, which is the usual
+        # tt-metal answer to "these two captures interfere".
+        kw["num_command_queues"] = num_command_queues
+    mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 4), **kw)
     gguf = GGUFModel.from_dir(GGUF_DIR)
     cfg = Qwen4ExpConfig.from_gguf(gguf.metadata)
     host = WeightStore(gguf, cache_bytes=2 << 30, row_cache_bytes=8 << 30)

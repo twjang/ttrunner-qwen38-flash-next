@@ -25,7 +25,22 @@ for the specific observation you are about to build on.
   scratchpad — read-only references, not dependencies.
 * Do not run anything destructive on hardware you did not bring up yourself
   (no `tt-smi -r` on a device another process holds; check `pgrep -af python`
-  first).
+  first). Never `pkill -f <pattern>` -- the pattern matches the killing shell
+  and has taken this session down twice; use
+  `ps -eo pid,args --no-headers | awk '/name/ && !/awk/ {print $1}'`. Never
+  `kill -9` a job mid-capture; SIGTERM, then reset.
+* **"It stopped failing" is not "it works."** Verify the thing still produces
+  the right answer, not just that the symptom went away. A second command queue
+  made the speculation hang disappear and was committed as the fix; the replay
+  was in fact not executing at all, and returned `[201058, 0]` where the eager
+  path returns `[75, 220]` (`docs/iterations/018`). A no-op passes every test
+  except the one that matters.
+* **When a bisection keeps coming back green, make the failure describe
+  itself.** Sixteen candidate causes of that same hang were excluded by
+  rebuilding the working setup rung by rung, and all sixteen were correct and
+  useless, because every rung tested the setup and the setup was never broken.
+  Three `print` statements and `faulthandler.dump_traceback_later` located it in
+  one run each. Instrument the failing side before enumerating differences.
 
 ## 1. What this is, in one screen
 
@@ -348,41 +363,57 @@ prefix of the k tokens needs a state snapshot -- or a replay, which the numbers
 above make affordable.
 
 
-### 5.6 Speculation — runs, but neither exact nor faster yet
+### 5.6 Speculation — the hang is diagnosed; it is a ttnn trace-replay bug
 
 Built end to end and opt-in via `TTEngine(speculate=k)`, where k is the tokens a
-verify *feeds* and it drafts `k - 1`. `docs/iterations/016` has the whole
-iteration. Two findings there matter more than the code:
+verify *feeds* and it drafts `k - 1`. `docs/iterations/016` has the iteration and
+`018` the diagnosis. Set `TWTEST_ALLOW_SPECULATION=1` to lift the refusal.
 
-**It is not identical to token-by-token decoding**, despite greedy acceptance.
-The verifier batches k rows where the stepper runs one, bf16 rounding differs in
-the last bits, and argmax amplifies it -- measured divergence at token 29 and 39.
-Every emitted token is still the argmax of the verifier's own logits, so it is
-*a* greedy decode, not the same one. Do not repeat the "exact by construction"
-claim; it is standard and it is wrong here.
+**The capture was never the problem.** For four board resets the record said
+capturing `step_n` inside the engine hangs the device. It does not: the setup
+completes, both traces capture, and the engine enters its serve loop. What hangs
+is the **first replay of the verifier**, and a stack dump says so directly --
+`ttnn.execute_trace` in `TracedStepN.step_n` (traced.py:130), from
+`speculate_round` (engine.py:565).
 
-**It is not yet faster.** Generation-only, against a 240 ms baseline:
+**It is the interleaving.** A speculating engine replays the decoder's trace on
+plain rounds and `step_n` on drafted ones. `traced_step_n_check.py` never does
+that -- it releases both captures before replaying `step_n` alone -- which is why
+no harness ever hung. `scripts/dev/spec_capture_ladder.py` is the sixty-line
+reproduction, no engine, no asyncio, no admission loop:
 
-| `speculate` | drafted | copy-heavy | open prose |
-|---|---|---|---|
-| 2 | 1 | 414.6 ms/tok | 492.3 ms/tok |
-| 9 | 8 | 253.9 ms/tok | 507.9 ms/tok |
+| configuration | outcome |
+|---|---|
+| cq 0, replay `step_n` alone | correct, 265 ms |
+| cq 0, replay decoder, then `step_n` | **hangs** in `ttnn.execute_trace` |
+| cq 1, replay decoder, then `step_n` | returns in **12 ms**, **wrong tokens** |
 
-Open prose is 2.1x worse than baseline while drafting *less* often than
-copy-heavy, which is backwards from any drafting-cost model -- so the overhead is
-not in the drafter, and where it is remains unknown.
+**Two non-fixes, so nobody spends a day on them again.** A device sync between
+the replays does nothing -- both calls already pass `blocking=True` and
+`synchronize_device` with no `cq_id` waits on every queue. A second command
+queue stops the hang and is *worse*: the replay does not execute, it merely
+stops blocking, returning `[201058, 0]` where the eager `step_n` returns
+`[75, 220]`, which showed up first as the engine accepting 0 of every 5 drafted
+tokens with a 9.6 ms verify. It was briefly committed as the fix on the evidence
+that the hang stopped; do not repeat that.
 
-**The instrumentation now exists** -- `TTEngine.speculation_report()` breaks a
-round into snapshot / verify / restore / replay and reports the drafter's own
-cost. It took one run to show that a *plain* round was costing 487.5 ms against
-a traced 236, because a harness was still disabling the trace; the drafter
-itself costs five microseconds. Start every measurement with it.
+**Next step is upstream, not another workaround.** The reproduction is small
+enough to hand to tt-metal. Until then the flag stays refused, because it takes
+the boards with it.
 
-**Do not propose an eleventh cause for the hang; bisect instead.** Ten are
-excluded in `docs/iterations/016`, including everything the standalone harnesses
-do differently. Take `scripts/dev/traced_step_n_check.py`, which works, and move
-it toward the engine one step at a time -- its own state object, then the
-admission loop, then the asyncio queue -- until it breaks.
+**It is also not identical to token-by-token decoding**, despite greedy
+acceptance. The verifier batches k rows where the stepper runs one, bf16 rounding
+differs in the last bits, and argmax amplifies it -- measured divergence at
+tokens 29 and 39. Every emitted token is still the argmax of the verifier's own
+logits, so it is *a* greedy decode, not the same one. Do not repeat the "exact by
+construction" claim.
+
+**Instrumentation to start from.** `TTEngine.speculation_report()` breaks a round
+into snapshot / verify / restore / replay and reports the drafter's own cost; the
+`mark()` lines print each setup step while speculating; `TWTEST_STACK_DUMP=<s>`
+in `speculation_check.py` dumps every thread's stack on a timer. The first of
+those once showed a *plain* round costing 487.5 ms against a traced 236 because a
+harness was disabling the trace, and the third ended this hunt in one run.
 
 Verified independently and worth keeping: `step_n` reproduces k sequential steps
 (0.00 % on the hidden), `TracedStepN` replays at 255 ms for k=2 against 472 for
@@ -393,7 +424,13 @@ and the drafter and accept rule are unit-tested. Offline pricing says
 **One engine per process.** A second `TTEngine` built after closing the first
 hangs on its own capture -- an engine-lifecycle bug, not a speculation one, and
 it blocks anything that opens a mesh twice. `close` now releases its captured
-traces, which was part of it but not all.
+traces, which was part of it but not all. Note this is *not* the speculation
+hang: that reproduces with the speculative engine as the only one in the process
+(`TWTEST_SPEC_ONLY=2`).
+
+Done when: the interleaved replay works -- upstream fix or a formulation that
+avoids two traces -- and `speculation_check.py` shows a round cheaper than
+`speculate=0` on the copy-heavy prompt.
 
 
 ### 5.7 Fewer launches — and what it is actually worth

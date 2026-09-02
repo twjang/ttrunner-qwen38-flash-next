@@ -10,16 +10,20 @@ its tokens for comparison across runs.
 
     uv run python scripts/dev/speculation_check.py [k]            (default 8)
 
-Greedy acceptance makes speculation *exact*: the tokens it emits are the tokens
-one-at-a-time decoding would have emitted, so the only honest test is to run both
-and compare them token for token. Anything else is a benchmark of a different
-model.
+Greedy acceptance does *not* make speculation exact here, though the argument
+that it must is standard and was believed for a cycle: the verifier batches k
+rows where the stepper runs one, bf16 rounding differs in the last bits, and
+argmax amplifies it -- measured divergence at tokens 29 and 39. Every emitted
+token is still the argmax of the verifier's own logits, so this is *a* greedy
+decode rather than the same one, and the token comparison below is a measure of
+how far it drifts, not a pass/fail.
 
 Two prompts, because prompt-lookup drafting is a bet on repetition: one that
 quotes its context back (where it should pay) and one that does not (where it
 should cost nothing).
 """
 import asyncio
+import faulthandler
 import os
 import sys
 import time
@@ -27,6 +31,15 @@ from pathlib import Path
 
 from twtest.engine import GenerationRequest
 from twtest.tt.engine import TTEngine
+
+# TWTEST_STACK_DUMP=<seconds> dumps every thread's stack on a timer. The
+# speculative engine spins somewhere in the serve loop -- setup completes and no
+# token is ever emitted -- and six candidate causes were excluded by rebuilding
+# the setup elsewhere before anyone simply asked the process where it was.
+if os.environ.get("TWTEST_STACK_DUMP"):
+    faulthandler.dump_traceback_later(
+        float(os.environ["TWTEST_STACK_DUMP"]), repeat=True, exit=False
+    )
 
 K = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 N = 48

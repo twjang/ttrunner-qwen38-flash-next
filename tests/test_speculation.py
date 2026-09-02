@@ -76,16 +76,45 @@ def test_the_engine_does_not_promise_identical_output() -> None:
 
 
 def test_speculation_refuses_rather_than_wedging_the_device() -> None:
-    """Capturing inside the engine hangs the device thread and the boards come
-    back only after `tt-smi -r`. A flag that bricks the accelerators is worse
-    than no flag, so it raises rather than tries."""
+    """Replaying the two traces alternately hangs, and the boards then need
+    `tt-smi -r`. A flag that bricks the accelerators is worse than no flag, so
+    it raises rather than tries -- unless a developer opts in explicitly."""
+    import inspect
+    import os
+
+    from twtest.tt.engine import TTEngine
+
+    src = inspect.getsource(TTEngine.__init__)
+    assert "raise NotImplementedError" in src
+    assert "replayed" in src and "alternately" in src, (
+        "the refusal must name what actually hangs -- the *replay* of the "
+        "verifier, not its capture; see docs/iterations/018"
+    )
+    assert "TWTEST_ALLOW_SPECULATION" in src, "there must be a way to work on it"
+    # and the escape must be opt-in, not merely present
+    assert not os.environ.get("TWTEST_ALLOW_SPECULATION"), (
+        "this test asserts the default; unset TWTEST_ALLOW_SPECULATION to run it"
+    )
+
+
+def test_the_second_command_queue_is_not_reintroduced() -> None:
+    """It stops the hang and returns wrong tokens, which is a worse trade.
+
+    On its own queue the step_n replay does not execute -- it merely stops
+    blocking -- returning [201058, 0] where the eager `step_n` returns
+    [75, 220], and coming back in 12 ms against 265. It showed up first as the
+    engine accepting 0 of every 5 drafted tokens, and it was briefly committed
+    as the fix on the evidence that the hang had stopped. See
+    `docs/iterations/018` and `scripts/dev/spec_capture_ladder.py`.
+    """
     import inspect
 
     from twtest.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
-    assert "hangs the device thread" in src
-    assert "raise NotImplementedError" in src
+    assert "num_command_queues" not in src, (
+        "a second command queue trades the hang for a silently wrong replay"
+    )
 
 
 def test_acceptance_stops_at_the_first_disagreement() -> None:

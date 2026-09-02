@@ -23,6 +23,7 @@ cost 43 % for the next doubling.
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import threading
 import time
@@ -147,6 +148,8 @@ class TTEngine(Engine):
         # Concurrent captures are fine -- a second live trace was measured not to
         # slow the first one's replay at all (236.1 vs 236.3 ms) -- but they are
         # large, so the region is sized for them here, before the mesh opens.
+        # Replaying them *alternately* is a different matter, and it is what
+        # blocks speculation; see the refusal below.
         self._widths = (
             sorted({w for w in (2, 4, 8, 16) if w < speculate} | {speculate})
             if speculate else []
@@ -331,29 +334,53 @@ class TTEngine(Engine):
                     f"speculate is the tokens fed per verify, 2..17 (it drafts "
                     f"speculate - 1); got {speculate}"
                 )
-            # Refused, and not for performance. Capturing inside this engine
-            # hangs the device thread, and the boards come back only after
-            # `tt-smi -r`; it has done so seven times. A flag that bricks the
+            # Refused, and not for performance. The *capture* is fine -- that
+            # was the standing diagnosis for four board resets and it was
+            # wrong. Both traces capture cleanly here; what hangs is replaying
+            # them alternately, which is exactly what a speculating engine does
+            # (plain rounds replay the decoder, drafted rounds replay step_n).
+            # The stack dump lands on `ttnn.execute_trace` in
+            # `TracedStepN.step_n`, and the boards come back only after
+            # `tt-smi -r`; they have done so seven times. A flag that bricks the
             # accelerators is worse than no flag.
             #
-            # Ten candidate causes are excluded by experiment in
-            # docs/iterations/016 -- including everything the standalone
-            # harnesses do differently, which is why they never hang. Two of the
-            # fixes those experiments produced are kept because they are right
-            # regardless: `close` releases its captured traces, and the snapshot
-            # buffers are allocated before any capture.
+            # `scripts/dev/spec_capture_ladder.py` is the sixty-line
+            # reproduction -- no engine, no asyncio, no admission loop:
+            #
+            #   cq 0, replay step_n alone            correct, 265 ms
+            #   cq 0, replay decoder then step_n     HANGS in execute_trace
+            #   cq 1, replay decoder then step_n     returns in 12 ms, WRONG
+            #                                        tokens ([201058, 0] for
+            #                                        [75, 220])
+            #
+            # A second command queue therefore trades the hang for silent
+            # corruption, which is worse, and is not taken. Nor is it a missing
+            # sync: `synchronize_device` with no cq_id already waits on every
+            # queue, and inserting one changes nothing. See
+            # docs/iterations/018.
             #
             # Everything else the scheme needs is built and verified on its own.
             # It is also *not* identical to stepping token by token -- the
             # verifier batches k rows where the stepper runs one -- so even once
             # the hang is fixed, "exact" is the wrong word for it.
-            raise NotImplementedError(
-                "speculation is built and verified but not wired: capturing "
-                "inside the engine hangs the device and needs tt-smi -r. See "
-                "docs/iterations/016 for the ten causes already excluded, and "
-                "scripts/dev/traced_step_n_check.py for the standalone "
-                "measurement (255 ms at k=2 against 472 for two traced steps)."
-            )
+            # `TWTEST_ALLOW_SPECULATION=1` lifts the refusal. It exists so the
+            # bisection in 5.6 can drive the *real* engine rather than a
+            # reconstruction of it -- the harnesses never hang, which is the
+            # whole difficulty -- and because two of the excluded causes
+            # produced fixes that are now in place, so the hang has to be
+            # re-tested rather than assumed. Not for serving: if it hangs, the
+            # boards need `tt-smi -r all`.
+            if not os.environ.get("TWTEST_ALLOW_SPECULATION"):
+                raise NotImplementedError(
+                    "speculation is built and verified but not wired: the "
+                    "decoder's trace and the verifier's cannot be replayed "
+                    "alternately. On one command queue the step_n replay hangs "
+                    "in ttnn.execute_trace and the boards need tt-smi -r; on a "
+                    "second queue it returns wrong tokens in 12 ms. See "
+                    "docs/iterations/018, scripts/dev/spec_capture_ladder.py "
+                    "for the sixty-line reproduction, and set "
+                    "TWTEST_ALLOW_SPECULATION=1 to work on it."
+                )
             if self.model.use_indexer:
                 raise NotImplementedError(
                     "step_n does not carry the QSA selection yet, so speculation "
@@ -404,6 +431,17 @@ class TTEngine(Engine):
 
         TILE = 32                      # fill_cache asserts a tile-aligned index
         B = self._max_concurrency
+
+        # Setup progress, on only while speculation is enabled. The hang leaves
+        # no output at all otherwise, which is what made it look mysterious --
+        # six candidate differences were excluded by rebuilding the setup in
+        # `spec_capture_ladder.py` before anyone asked the failing side where it
+        # actually stops.
+        def mark(what: str) -> None:
+            if self._speculate:
+                print(f"[tt] setup: {what}", flush=True)
+
+        mark("creating state")
         state = self.model.new_state(batch=B)
         # one set of snapshot buffers, reused every round
         snap_buf: dict = {}
@@ -414,8 +452,11 @@ class TTEngine(Engine):
             # thing the standalone harnesses never do, and they never hang.
             # A step first, because the layer state does not exist until one has
             # run and there is nothing to snapshot.
+            mark("warmup step")
             self.model.step([0] * B, state)     # token 0: a harmless warmup
+            mark("allocating snapshot buffers")
             snap_buf["s"] = self.model.snapshot(state)
+            mark("snapshot buffers allocated")
         slots: list[_Sequence | None] = [None] * B
         free: list[int] = list(range(B))
         # The exact token sequence each slot's state has consumed, or None when
@@ -435,9 +476,12 @@ class TTEngine(Engine):
             try:
                 from .traced import TracedDecoder
 
+                mark("capturing the decoder")
                 decoder = TracedDecoder(self.model, state)
+                mark("decoder captured; resetting")
                 decoder.reset()
                 self._decoder = decoder
+                mark("decoder ready")
             except Exception as exc:
                 self._decoder = None
                 print(f"[tt] trace capture failed, falling back to eager: {exc}")
@@ -459,9 +503,12 @@ class TTEngine(Engine):
                 from .traced import TracedStepN
 
                 for width in widths:
+                    mark(f"capturing step_n width={width}")
                     verifiers[width] = TracedStepN(self.model, state, width)
+                    mark(f"step_n width={width} captured")
                 self._verifiers = verifiers
                 if self._decoder is not None:
+                    mark("resetting the decoder after the step_n captures")
                     self._decoder.reset()
                 # rewind what the warmups and the capture consumed. The
                 # decoder's own reset does this too, so it runs only when there
@@ -481,6 +528,7 @@ class TTEngine(Engine):
                     st_.ple_step = 0
                 state.positions = [0] * B
                 state.histories = [[] for _ in range(B)]
+                mark("rewound; entering the serve loop")
             except Exception as exc:
                 for v in verifiers.values():
                     v.release()
