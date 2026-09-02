@@ -1256,9 +1256,12 @@ class TTModel:
         remaining piece of speculative decoding.
 
         The chunked path is *not* the right verifier, which is why this exists:
-        it has a ~1.3 s fixed cost per call (`deltanet.prepare()` round-trips
-        ~30 MB a layer to the host) and so never beats a 236 ms traced step for
-        small k, and being host-bound it cannot be captured either.
+        the DeltaNet op fixes its chunk at 128 and pads up to it, so a k-token
+        pass does most of a 128-token pass's work -- 850 ms for k=1 against a
+        236 ms traced step (`short_chunk_bench.py`). It is no longer *host*
+        bound -- `prepare_device` moved that on device, which took the fixed
+        cost from ~1.3 s to 850 ms -- but 850 ms is still the wrong shape for
+        verifying two or three drafted tokens.
         """
         cfg = self.cfg
         k = len(tokens)
@@ -1600,12 +1603,14 @@ class TTModel:
     ) -> ttnn.Tensor:
         """Gated DeltaNet over a whole chunk via `gated_delta_attn_seq`.
 
-        The op's eight inputs are prepared on the host. That costs a round trip
-        per layer (~30 MB for a 128-token chunk), which is worth it here because
-        it amortises over 128 tokens -- unlike decode, where the same preparation
-        would cost more than the recurrence it replaces.
+        The op's eight inputs are prepared on device by `prepare_device`, so a
+        chunk costs no host round trip at all. The equivalent host routine is
+        kept as `deltanet.prepare` and is what the port is checked against
+        (`scripts/dev/deltanet_prepare_device_check.py`): they agree to the
+        hardware's fp32 matmul floor, which is 0.16 % for a 128x128 matmul even
+        at HiFi4 with fp32 accumulation.
         """
-        from .deltanet import CHUNK, prepare
+        from .deltanet import CHUNK, prepare_device
 
         cfg = self.cfg
         # Local head counts: the DeltaNet weights are head-sharded, so each device
@@ -1629,40 +1634,37 @@ class TTModel:
             ttnn.softplus(ttnn.add(a, self.w.blk(layer, "ssm_dt.bias"))),
         )
 
-        # Host preparation, per device. `from_dev` would return device 0's copy,
-        # which for head-sharded tensors is only its own heads -- every device
-        # would then run the recurrence on device 0's q/k/v. Gather all four,
-        # prepare each device's heads separately, and shard the results back on
-        # dim 0, which prepare() lays out as batch*heads.
-        def gather(t, width):
-            full = ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=-1))
-            return full.reshape(1, seq, self.n_dev, width).permute(2, 0, 1, 3).float()
-
+        # Device preparation, per device, in place. Each device already holds
+        # exactly its own heads, so there is nothing to gather: the eight op
+        # inputs are built from the sharded q/k/v with `prepare_device`, which
+        # is `prepare` rewritten in ttnn ops. That removes a ~30 MB round trip
+        # per layer per chunk, and -- the reason it was worth doing -- leaves a
+        # graph a trace capture can see, where host arithmetic is invisible.
         kd = self.key_dim_local
-        qkv_all = gather(qkv, self.conv_dim_local)          # [n_dev, 1, seq, conv_dim_local]
-        g_all = gather(g, n_v)
-        b_all = torch.sigmoid(gather(b, n_v))
+        total = -(-seq // CHUNK) * CHUNK
+        n_chunks = total // CHUNK
 
-        per_dev = []
-        for d in range(self.n_dev):
-            qkv_h = qkv_all[d]
-            # No expansion -- each device's q/k heads already match its v heads
-            # one for one; see `_linear_attention_step`.
-            q_h = qkv_h[..., :kd].reshape(1, seq, n_v, hd)
-            k_h = qkv_h[..., kd : 2 * kd].reshape(1, seq, n_v, hd)
-            v_h = qkv_h[..., 2 * kd :].reshape(1, seq, n_v, hd)
-            prep = prepare(q_h, k_h, v_h, g_all[d], b_all[d])
-            prep.pop("_meta")
-            per_dev.append(prep)
+        def heads(t, lo, hi):
+            """[1, 1, seq, n_v*hd] -> [n_v, NC, CHUNK, hd], zero-padded."""
+            x = self._slice_last(t, lo, hi)
+            width = (hi - lo) // n_v
+            x = ttnn.permute(ttnn.reshape(x, (1, seq, n_v, width)), (2, 0, 1, 3))
+            if total != seq:
+                # `prepare` pads with F.pad; zeros here mean decay 0 and beta 0,
+                # so the padded positions contribute nothing to the scan.
+                pad = ttnn.zeros(
+                    (n_v, 1, total - seq, width), dtype=x.dtype,
+                    layout=ttnn.TILE_LAYOUT, device=self.mesh,
+                )
+                x = ttnn.concat([x, pad], dim=-2)
+            return ttnn.reshape(ttnn.typecast(x, ttnn.float32), (n_v, n_chunks, CHUNK, width))
 
-        dev = {
-            name: ttnn.from_torch(
-                torch.cat([p[name] for p in per_dev], dim=0),
-                dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.mesh,
-                mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
-            )
-            for name in per_dev[0]
-        }
+        hq, hk, hv = (
+            heads(qkv, 0, kd), heads(qkv, kd, 2 * kd),
+            heads(qkv, 2 * kd, 2 * kd + self.value_dim_local),
+        )
+        hg, hb = heads(g, 0, n_v), heads(ttnn.sigmoid(b), 0, n_v)
+        dev = prepare_device(hq, hk, hv, hg, hb, mesh=self.mesh)
         initial = None
         if st.recurrent is not None:
             initial = ttnn.reshape(st.recurrent, (n_v, hd, hd))
@@ -1684,14 +1686,12 @@ class TTModel:
             )
         ttnn.copy(ttnn.reshape(final_state, (n_v, 1, hd, hd)), st.recurrent)
 
-        # [BH, NC, C, Dv] -> [1, 1, seq*n_v, hd], per device
-        n_chunks = out.shape[1]
-        out_all = ttnn.to_torch(out, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0))
-        out_all = out_all.reshape(self.n_dev, n_v, n_chunks * CHUNK, hd)[:, :, :seq]
-        out_h = out_all.permute(0, 2, 1, 3).reshape(self.n_dev, 1, seq * n_v, hd)
-        out_d = ttnn.from_torch(
-            out_h, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh,
-            mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
+        # [BH, NC, C, Dv] -> [1, 1, seq*n_v, hd], on device and per device.
+        out = ttnn.slice(
+            ttnn.reshape(out, (n_v, 1, n_chunks * CHUNK, hd)), (0, 0, 0, 0), (n_v, 1, seq, hd)
+        )
+        out_d = ttnn.typecast(
+            ttnn.reshape(ttnn.permute(out, (1, 2, 0, 3)), (1, 1, seq * n_v, hd)), ttnn.bfloat16
         )
 
         z_heads = ttnn.reshape(z, (1, 1, seq * n_v, hd))
@@ -1824,15 +1824,15 @@ class TTModel:
         from .deltanet import CHUNK
 
         cfg = self.cfg
-        # `prepare()` pads a short sequence up to the op's 128-wide chunk with
-        # zero decay and zero beta, which leave the carried state untouched, so a
-        # chunk *smaller* than CHUNK is well defined -- just wasteful. It is also
+        # `prepare_device` pads a short sequence up to the op's 128-wide chunk
+        # with zero decay and zero beta, which leave the carried state untouched,
+        # so a chunk *smaller* than CHUNK is well defined -- just wasteful. It is
         # more accurate: the op's error grows with position inside a chunk
         # (measured against the reference's own chunked delta rule at layer 0,
         # 0.36 % at position 0 and 60 % by position 127, and 25-60 % overall at
         # every DeltaNet layer), so keeping the real tokens near the top of the
         # chunk is what buys the accuracy back. A chunk *larger* than CHUNK would
-        # need the op's inter-chunk scan, which prepare() does not build here.
+        # need the op's inter-chunk scan, which this path does not build here.
         # It must also be a whole number of tiles: `fill_cache` asserts
         # `update_idx % TILE_HEIGHT == 0`, and the attention chunk writes the K/V
         # cache at the chunk's absolute start.
@@ -1993,3 +1993,4 @@ class TTModel:
         # prefill is single-sequence: [1,1,C,seq] -> [1,1,seq,C]
         conv = ttnn.silu(ttnn.transpose(acc, -2, -1))
         return ttnn.add(gated, conv)
+

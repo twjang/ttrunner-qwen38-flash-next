@@ -112,3 +112,58 @@ def test_block_inverse_rejects_non_power_of_two() -> None:
 
     with pytest.raises(ValueError, match="power of two"):
         block_inverse(torch.eye(48).expand(1, 48, 48))
+
+
+def test_block_inverse_survives_correlated_keys() -> None:
+    """The regime the model actually produces, which the 0.4-scaled case hides.
+
+    `l_unit` is `I + (k_beta @ k^T) * pairwise` masked strictly lower. When a
+    head's keys point in nearly the same direction and its decay is slow, every
+    inner product is near +1 and every `pairwise` near 1, so the strictly lower
+    part is *dense, positive and near 1* -- head 7 of layer 0 reaches 0.983.
+
+    Magnitude alone does not reproduce the failure: with random signs the powers
+    cancel internally and stay small. It is the correlation that does it, and
+    that is why this test builds the matrix from keys rather than by scaling a
+    random one. The telescoping Neumann sum this file was originally written
+    against gets 2.5 absolute error here on an inverse bounded by 1, because
+    `N^16` grows to ~1e8 before nilpotency cancels it back down. Float32 hid
+    that; on device, where a matmul carries ~1e-3 relative error rather than
+    ~1e-7, the same cancellation left 6209.
+    """
+    from twtest.tt.deltanet import BLOCK, block_inverse
+
+    torch.manual_seed(0)
+    rows = torch.arange(BLOCK)
+    strictly_lower = (rows[None, :] < rows[:, None]).float()
+    base = torch.randn(1, 128)
+    keys = base + 0.05 * torch.randn(4, BLOCK, 128)      # nearly parallel
+    keys = keys / keys.norm(dim=-1, keepdim=True)
+    beta = torch.sigmoid(torch.randn(4, BLOCK, 1) * 0.3 + 2.0)   # near 1
+    unit = torch.eye(BLOCK) + ((beta * keys) @ keys.transpose(-1, -2)) * strictly_lower
+
+    assert float((unit * strictly_lower).abs().max()) > 0.9, "not the regime under test"
+    want = torch.linalg.inv(unit.double()).float()
+    got = block_inverse(unit)
+    assert float((got - want).abs().max()) < 1e-4
+    # ... and the intermediates must not have grown on the way, or the same
+    # computation on device (~1e-3 per matmul) will not survive it.
+    assert float(got.abs().max()) < 10.0 * float(want.abs().max())
+
+
+def test_block_diag_inverse_is_block_diagonal() -> None:
+    """One pass over the 128-wide matrix must yield exactly the four 32-blocks."""
+    from twtest.tt.deltanet import BLOCK, CHUNK, block_diag_inverse
+
+    torch.manual_seed(0)
+    unit = torch.eye(CHUNK) + torch.randn(2, CHUNK, CHUNK).tril(-1) * 0.5
+    inv = block_diag_inverse(unit, BLOCK)
+    for b in range(CHUNK // BLOCK):
+        sl = slice(b * BLOCK, (b + 1) * BLOCK)
+        want = torch.linalg.inv(unit[:, sl, sl].double()).float()
+        assert float((inv[:, sl, sl] - want).abs().max()) < 1e-4, f"block {b}"
+    off = inv.clone()
+    for b in range(CHUNK // BLOCK):
+        sl = slice(b * BLOCK, (b + 1) * BLOCK)
+        off[:, sl, sl] = 0.0
+    assert float(off.abs().max()) == 0.0, "leaked outside the diagonal blocks"

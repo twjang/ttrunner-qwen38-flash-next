@@ -46,8 +46,17 @@ TEXT = (
     "Ancient Egyptian, using hieroglyphic and Demotic scripts, while the bottom "
     "is in Ancient Greek. Because the decree has only minor differences between "
     "the three versions, the stone proved to be the key to deciphering Egyptian "
-    "hieroglyphs, a writing system that had been unreadable for centuries."
-)
+    "hieroglyphs, a writing system that had been unreadable for centuries. "
+    "The stone was found in 1799 by French soldiers rebuilding a fort near the "
+    "town of Rashid in the Nile Delta, and passed to British hands under the "
+    "Capitulation of Alexandria two years later. Thomas Young established that "
+    "the cartouches spelled a royal name phonetically, and Champollion showed "
+    "that the hieroglyphic script recorded sounds as well as meanings, reading "
+    "the name of Ramesses in 1822. The stele is a fragment of a larger stone "
+    "whose missing upper portion probably carried a winged disc, and copies of "
+    "the same decree have since been found at other sites, which is how the "
+    "damaged passages of the Greek text were eventually restored."
+)  # long enough for a full unpadded 128-token chunk
 
 SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "512"))
 mesh, cfg, m = open_model(max_seq_len=SEQ)

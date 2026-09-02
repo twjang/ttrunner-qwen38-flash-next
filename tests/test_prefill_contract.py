@@ -61,10 +61,25 @@ def test_chunked_deltanet_uses_local_head_counts() -> None:
     """The DeltaNet weights are head-sharded; global counts prepare one device."""
     src = inspect.getsource(TTModel._linear_attention_chunk)
     assert "self.n_v_local" in src and "self.conv_dim_local" in src
-    assert "ShardTensorToMesh" in src, (
-        "each device's own heads must be prepared and sharded back; from_dev "
-        "returns device 0's copy, which for a head-sharded tensor is its heads only"
-    )
+
+
+def test_chunked_deltanet_never_leaves_the_device() -> None:
+    """No host round trip in the chunk path -- for correctness, then for tracing.
+
+    This began as a guard on a gather bug: the preparation ran on the host, and
+    reading the sharded q/k/v with `from_dev` returned device 0's heads, so
+    every device ran the recurrence on device 0's data. `prepare_device` removes
+    the question -- each device prepares the heads it already holds, and there
+    is no gather to get wrong.
+
+    It also removes the reason chunked prefill could not be traced. A capture
+    records device ops; host arithmetic between them is invisible, so a graph
+    with `prepare()` in the middle replays as garbage. Keep this path free of
+    `to_torch`/`from_torch` or that comes back.
+    """
+    src = inspect.getsource(TTModel._linear_attention_chunk)
+    for host_op in ("to_torch", "from_torch", "ShardTensorToMesh", "ConcatMeshToTensor"):
+        assert host_op not in src, f"{host_op} puts the host back in the chunk path"
 
 
 def test_prefill_selects_the_same_expert_weights_as_decode() -> None:
