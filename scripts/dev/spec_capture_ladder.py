@@ -194,6 +194,18 @@ def two_stepn():
     b = TracedStepN(m, st, 4)
     print("RESULT both captured; replaying k=2", flush=True)
     a.step_n(toks[8:10])
+    if os.environ.get("TWTEST_EAGER_BETWEEN"):
+        # The mechanism says the *host* launch-message pointer is left at the
+        # executed trace's program count while the next trace was recorded
+        # against zero. Ordinary (non-trace) dispatch maintains those pointers
+        # through the normal path, so a real program in between might resync
+        # them. If it does, both 5.2's traced prefill and 5.6 are unblocked.
+        print("RESULT running an eager program between the replays", flush=True)
+        z = ttnn.zeros((1, 1, 32, 32), dtype=ttnn.bfloat16,
+                       layout=ttnn.TILE_LAYOUT, device=mesh)
+        ttnn.add(z, z)
+        ttnn.synchronize_device(mesh)
+        print("RESULT eager program done", flush=True)
     print("RESULT k=2 replayed; replaying k=4  <-- the alternation", flush=True)
     b.step_n(toks[10:14])
     print("RESULT k=4 replayed; replaying k=2 again", flush=True)

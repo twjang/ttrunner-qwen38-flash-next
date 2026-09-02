@@ -510,6 +510,18 @@ That also says it cannot be worked around by construction here. A decode step, a
 `step_n` verifier and a prefill chunk have inherently different program counts,
 and padding them to match is neither possible nor sane.
 
+**Three workarounds excluded by experiment, so they are not re-tried:**
+
+1. `ttnn.synchronize_device` between the replays -- no effect. Both
+   `execute_trace` calls already pass `blocking=True`, and with no `cq_id` the
+   sync waits on every queue.
+2. A second command queue -- stops the hang and is *worse*: the replay does not
+   execute, it merely stops blocking, returning `[201058, 0]` where the eager
+   `step_n` returns `[75, 220]`.
+3. An ordinary (non-trace) program between the replays, on the theory that
+   normal dispatch maintains the pointers the trace path leaves stale -- still
+   hangs (`TWTEST_EAGER_BETWEEN=1` on the ladder).
+
 **Next step is upstream, and the report is now specific**: the two functions
 above, in `tt_metal/impl/trace/dispatch.cpp`, with a sixty-line reproduction and
 a control that isolates the variable. It is worth more than one item -- the same
