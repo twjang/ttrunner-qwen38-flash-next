@@ -290,30 +290,43 @@ prefix of the k tokens needs a state snapshot -- or a replay, which the numbers
 above make affordable.
 
 
-### 5.6 Speculation: n-gram first, MTP second (2 + 4 days)
+### 5.6 Speculation — built and verified, one step from working
 
-* n-gram drafting (roadmap B2) needs only an accept loop in the engine on top
-  of `step_n`, plus the two pieces 5.5 left: a trace per k, and either a state
-  snapshot or a replay of the accepted prefix. Greedy accept rule: accept while
-  `argmax(verify_i) == draft_i`, which makes the output identical to
-  non-speculative decode rather than merely close.
+Everything the scheme needs exists and is verified on its own
+(`docs/iterations/016`):
 
-  Mind the baseline. `step_n` at k=4 costs 864 ms eager against 2071 for four
-  eager steps, but a *traced* step is 236 ms, so four of them are 944 ms --
-  already better than eager `step_n`. Speculation only pays once `step_n`
-  itself is traced. Capture it per k, the way `TracedDecoder` captures the
-  single-token step.
-* MTP (roadmap B1): the head is `blk.48` in `MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`.
-  Order of work: (i) exercise Q4_K/Q5_0 dequant against the codebook (never
-  exercised — `docs/iterations/003`), (ii) load `blk.48` through `convert.py`
-  into the device cache (residency: replicate everything but the experts,
-  shard the experts like the main layers), (iii) implement the head eagerly
-  with the wiring in roadmap B1 and measure top-1 agreement with the *actual*
-  next token over ≥ 200 tokens of a real prompt, (iv) only if ≥ 0.6, wire it
-  behind 5.5 with a second trace for the k+1-row verify graph.
+| piece | state |
+|---|---|
+| `TTModel.step_n` | reproduces k sequential steps **exactly** (0.00 %) |
+| `TracedStepN` | 255 ms at k=2 against 472 for two traced steps; matches eager |
+| `snapshot` / `restore` | a discarded draft rolls back token-for-identically |
+| `prompt_lookup_draft`, `accepted_prefix` | unit-tested |
+| the accept loop in `_device_loop` | written, greedy, exact by construction |
+| offline pricing | **1.70-2.14x** on prompts that quote their context; 0.95-1.00x on open prose |
 
-Done when: tokens/second at batch 1 improves with greedy output identical to
-non-speculative decode (speculation with greedy acceptance is exact).
+`TTEngine(speculate=k)` **raises**, and not for performance: capturing the
+`step_n` graph inside the engine's device thread hangs it, and the boards come
+back only after `tt-smi -r`. Three times. The same capture standalone is fine --
+`scripts/dev/traced_step_n_check.py` -- so it is the capture *in that context*,
+not the capture.
+
+**Start here.** Reproduce the hang with the smallest possible engine (one slot,
+`max_seq_len=2048`, `speculate=2`) and bisect the three suspects 016 lists: the
+post-capture state rewind that allocates a zeros buffer per ring; two live
+captures; and capturing on the device thread rather than the main one. Try
+capturing `TracedStepN` *before* `TracedDecoder`, and try hoisting the rewind's
+zero buffers to before the capture.
+
+Then, in order: make allocating during a second capture safe (which unlocks the
+width ladder, and with it partial acceptance and larger k), carry the QSA
+selection through `step_n` (`_attention_step_n` reads per row, so there is room
+for a per-row mask), and only then MTP -- whose value is that it drafts on *every*
+position rather than only where the context repeats, which is exactly what
+limits prompt-lookup on open prose.
+
+Done when: `speculation_check.py` reports identical output *and* a speedup on the
+copy-heavy prompt.
+
 
 ### 5.7 Fewer launches (ongoing; each item is a self-contained PR)
 

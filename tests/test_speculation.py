@@ -77,10 +77,25 @@ def test_the_engine_refuses_speculation_it_cannot_serve() -> None:
     from twtest.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
-    # batched decoding, an untraced verifier, and the sparse selection
+    # batched decoding has no single sequence to verify
     assert "max_concurrency=1 (got {max_concurrency})" in src
-    assert "beaten by the path it replaces" in src
+    # step_n has no sparse selection, so it would silently disagree past 2048
     assert "step_n does not carry the QSA selection yet" in src
+
+
+def test_speculation_refuses_rather_than_wedging_the_device() -> None:
+    """Capturing the step_n graph inside the engine hangs the device thread and
+    the boards come back only after `tt-smi -r`. A flag that bricks the
+    accelerators is worse than no flag, so it raises rather than tries."""
+    import inspect
+
+    from twtest.tt.engine import TTEngine
+
+    src = inspect.getsource(TTEngine.__init__)
+    assert "hangs the device" in src
+    assert "raise NotImplementedError" in src
+    # and the trace is not silently left on either way
+    assert "and not self._speculate" in src
 
 
 def test_there_is_exactly_one_capture() -> None:

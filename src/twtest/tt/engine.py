@@ -290,18 +290,48 @@ class TTEngine(Engine):
                     "speculation verifies one sequence at a time, so it needs "
                     f"max_concurrency=1 (got {max_concurrency})"
                 )
-            if not use_trace or self._chunked_prefill:
-                raise ValueError(
-                    "speculation needs the trace: an untraced step_n costs 864 ms "
-                    "at k=4 where four traced steps cost 944, so it would be "
-                    "beaten by the path it replaces"
+            if self._chunked_prefill:
+                raise NotImplementedError(
+                    "chunked prefill and speculation both want the device's one "
+                    "trace slot; enable one or the other"
                 )
+            # Refused outright, and not for performance: capturing the
+            # `step_n` graph inside this engine hangs the device thread and the
+            # boards come back only after `tt-smi -r`. It happened three times,
+            # with the decoder's trace live and without it, and the warning that
+            # precedes it is
+            #
+            #   Allocating device buffers is unsafe due to the existence of an
+            #   active trace. These buffers may be corrupted once ...
+            #
+            # A flag that bricks the accelerators is worse than no flag, so this
+            # raises rather than tries.
+            #
+            # Everything the scheme needs is built and verified on its own:
+            # `TTModel.step_n` reproduces k sequential steps exactly,
+            # `TracedStepN` replays it at 255 ms for k=2 against 472 for two
+            # traced steps, `snapshot`/`restore` roll a rejected draft back
+            # token-for-identically, and `prompt_lookup_draft` /
+            # `accepted_prefix` are unit-tested. The offline pricing says
+            # 1.70-2.14x on prompts that quote their context. What is missing is
+            # a capture that survives inside the engine's device thread -- see
+            # docs/iterations/016 and HANDOFF 5.6.
+            raise NotImplementedError(
+                "speculation is built but not wired: capturing step_n inside the "
+                "engine hangs the device and needs tt-smi -r to recover. The "
+                "pieces are verified individually -- see docs/iterations/016 for "
+                "what is left and scripts/dev/traced_step_n_check.py for the "
+                "standalone measurement."
+            )
             if self.model.use_indexer:
                 raise NotImplementedError(
                     "step_n does not carry the QSA selection yet, so speculation "
                     "and a context in (2048, 65536] cannot both be on"
                 )
-        self._use_trace = use_trace and max_concurrency < 48 and not self._chunked_prefill
+        self._use_trace = (
+            use_trace and max_concurrency < 48
+            and not self._chunked_prefill and not self._speculate
+        )
         self._decoder = None
         self._admit: queue.SimpleQueue = queue.SimpleQueue()
         self._shutdown = threading.Event()
@@ -327,6 +357,7 @@ class TTEngine(Engine):
 
     def _device_loop(self) -> None:
         import torch
+        import ttnn
 
         from ..reference.generate import SamplingParams, sample
 
@@ -371,13 +402,28 @@ class TTEngine(Engine):
         # captured 5 would be 288) and only on partial acceptance.
         verifiers: dict[int, object] = {}
         widths = self._widths
-        if self._speculate and self._decoder is not None:
+        if self._speculate:
             try:
                 from .traced import TracedStepN
 
                 for width in widths:
                     verifiers[width] = TracedStepN(self.model, state, width)
-                self._decoder.reset()
+                # rewind what the warmups and the capture consumed
+                for st_ in state.layers:
+                    for name in ("recurrent", "conv", "ple_conv", "keys", "values"):
+                        buf = getattr(st_, name)
+                        if buf is None:
+                            continue
+                        for entry in (buf if isinstance(buf, list) else [buf]):
+                            ttnn.copy(
+                                ttnn.zeros(list(entry.shape), dtype=entry.dtype,
+                                           layout=entry.layout, device=self.mesh),
+                                entry,
+                            )
+                    st_.conv_step = 0
+                    st_.ple_step = 0
+                state.positions = [0] * B
+                state.histories = [[] for _ in range(B)]
             except Exception as exc:
                 for v in verifiers.values():
                     v.release()

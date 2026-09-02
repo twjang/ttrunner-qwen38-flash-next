@@ -1,4 +1,10 @@
-"""Does speculation change the answer, and does it go faster?
+"""Does speculation change the answer?
+
+Not "does it go faster": it cannot yet. Capturing the `step_n` graph while the
+decoder's trace is live wedges the device (docs/iterations/016), so speculation
+runs with an eager decoder, where a non-drafted round costs 518 ms against a
+traced 236. What can be established now is exactness -- and that is the property
+the whole scheme rests on.
 
     uv run python scripts/dev/speculation_check.py [k]            (default 8)
 
@@ -60,7 +66,10 @@ async def main():
     for spec in (0, K):
         engine = TTEngine(
             cache_dir=CACHE, gguf_dir=GGUF, tokenizer_path=TOKENIZER,
-            max_concurrency=1, max_seq_len=2048, use_trace=True, speculate=spec,
+            max_concurrency=1, max_seq_len=2048,
+            # one live trace only: capturing step_n while the decoder's trace is
+            # live wedges the device, so speculation runs with an eager decoder
+            use_trace=not spec, speculate=spec,
         )
         try:
             for label, text in PROMPTS.items():
