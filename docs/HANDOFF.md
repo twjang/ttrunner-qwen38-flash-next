@@ -660,7 +660,14 @@ It still lost. "Per-token within 1 %" is not "identical" -- against the per-row
 answer a 32-row group is 0.000 % and a 128-row group 0.500 % -- and over 107
 scored positions whole-chunk gave 20.6 % top-1 / NLL 6.389 against 24.3 % /
 5.648 sub-chunked. Reverted, with the reasoning left in `prefill` so it is not
-re-attempted. The lesson generalises: on this path a dispatch saving that
+re-attempted.
+
+**Re-measured after the routing/compute split**, because that moved the baseline
+and a stale rejection is worth as little as a stale acceptance: the hoist now
+buys 925.1 -> 887.6 ms (4 %) for NLL 5.823 -> **6.650**, top-1 unchanged at
+25.2 %. Same verdict, wider margin. It is the largest single call site left --
+`shared_expert` is 960 dispatches, 8.2 % of the chunk -- and it is not available
+at this price. The lesson generalises: on this path a dispatch saving that
 changes any group size is buying speed with bf16 accuracy, and 7 % is not a good
 price. Look for savings that leave every group width alone.
 
