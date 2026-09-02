@@ -452,6 +452,11 @@ class TTModel:
                 (batch * n_v, 1, hd, hd), dtype=self.state_dtype,
                 layout=ttnn.TILE_LAYOUT, device=self.mesh,
             )
+        # The recurrent state is float32 already, and casting q/k/v/g/beta to
+        # float32 here changes nothing measurable (24.35 % vs 24.14 % at step 24
+        # of `branch_sequence_check.py`): the error is in those tensors when they
+        # arrive, from bf16 projections and the conv, and a wider container does
+        # not recover bits that were never there.
         # writes st.recurrent in place and returns the output
         out = linear_attn.decode_step(q, k, v, g_exp, beta, st.recurrent)
 
@@ -1032,10 +1037,16 @@ class TTModel:
         initial = None
         if st.recurrent is not None:
             initial = ttnn.reshape(st.recurrent, (n_v, hd, hd))
+        # HiFi4 with fp32 accumulation, for consistency with every other matmul
+        # in the model. Measured: it changes nothing here, bit for bit -- the
+        # op's inputs are already float32 and it does not appear to drop
+        # precision in the places this config controls. The intra-chunk error
+        # (0.36 % at position 0 of a 128-token chunk, 60 % by position 127,
+        # against the reference's own chunked delta rule) is not this.
         out, final_state = ttnn.transformer.gated_delta_attn_seq(
             dev["L_unit"], dev["v_beta_sc"], dev["k_bd_sc"], dev["intra_attn"],
             dev["q_decay"], dev["k_decay_t"], dev["dl_exp"], dev["L_inv"],
-            initial_state=initial,
+            initial_state=initial, compute_kernel_config=HIFI4,
         )
         if st.recurrent is None:
             st.recurrent = ttnn.zeros(
@@ -1184,8 +1195,23 @@ class TTModel:
         from .deltanet import CHUNK
 
         cfg = self.cfg
-        if chunk != CHUNK:
-            raise ValueError(f"gated_delta_attn_seq fixes the chunk at {CHUNK}, got {chunk}")
+        # `prepare()` pads a short sequence up to the op's 128-wide chunk with
+        # zero decay and zero beta, which leave the carried state untouched, so a
+        # chunk *smaller* than CHUNK is well defined -- just wasteful. It is also
+        # more accurate: the op's error grows with position inside a chunk
+        # (measured against the reference's own chunked delta rule at layer 0,
+        # 0.36 % at position 0 and 60 % by position 127, and 25-60 % overall at
+        # every DeltaNet layer), so keeping the real tokens near the top of the
+        # chunk is what buys the accuracy back. A chunk *larger* than CHUNK would
+        # need the op's inter-chunk scan, which prepare() does not build here.
+        # It must also be a whole number of tiles: `fill_cache` asserts
+        # `update_idx % TILE_HEIGHT == 0`, and the attention chunk writes the K/V
+        # cache at the chunk's absolute start.
+        if not 0 < chunk <= CHUNK or chunk % ttnn.TILE_SIZE:
+            raise ValueError(
+                f"chunk must be a multiple of {ttnn.TILE_SIZE} in "
+                f"{ttnn.TILE_SIZE}..{CHUNK} (the op's chunk width), got {chunk}"
+            )
         if state.batch != 1:
             raise NotImplementedError("chunked prefill is single-sequence for now")
         final = None

@@ -26,6 +26,9 @@ from twtest.reference.model import Qwen4ExpModel
 
 TOTAL = int(sys.argv[1]) if len(sys.argv) > 1 else 48
 PRE = int(sys.argv[2]) if len(sys.argv) > 2 else 16
+# Prefill step size. The DeltaNet op's error grows with position inside its
+# 128-wide chunk, so a smaller step trades prefill throughput for accuracy.
+CHUNKS = [int(x) for x in sys.argv[3:]] or [128]
 
 TEXT = (
     "The Rosetta Stone is a granodiorite stele inscribed with three versions of "
@@ -62,13 +65,16 @@ step_out = [m.greedy_tokens(m.step([t], st))[0] for t in ids]
 del st
 
 # -- device prefill for the first PRE, then decode -------------------------
-st = m.new_state(batch=1)
-hp = m.prefill(ids[:PRE], st)
-pre_out = [None] * PRE
-pre_out[PRE - 1] = m.greedy_tokens(hp)[0]
-for t in ids[PRE:]:
-    pre_out.append(m.greedy_tokens(m.step([t], st))[0])
-del st
+prefills = {}
+for c in CHUNKS:
+    st = m.new_state(batch=1)
+    hp = m.prefill(ids[:PRE], st, chunk=min(c, PRE))
+    out = [None] * PRE
+    out[PRE - 1] = m.greedy_tokens(hp)[0]
+    for t in ids[PRE:]:
+        out.append(m.greedy_tokens(m.step([t], st))[0])
+    prefills[c] = out
+    del st
 
 
 def score(name, got, lo):
@@ -86,8 +92,9 @@ def score(name, got, lo):
 
 
 score("step", step_out, 1)
-score("prefill", pre_out, PRE - 1)
 idx = [i for i in range(PRE - 1, TOTAL)]
-same = sum(pre_out[i] == step_out[i] for i in idx)
-print(f"RESULT prefill vs step {same}/{len(idx)} = {100 * same / len(idx):.1f}%", flush=True)
+for c, out in prefills.items():
+    score(f"pre/{c}", out, PRE - 1)
+    same = sum(out[i] == step_out[i] for i in idx)
+    print(f"RESULT pre/{c:<4d} vs step {same}/{len(idx)} = {100 * same / len(idx):.1f}%", flush=True)
 ttnn.close_mesh_device(mesh)
