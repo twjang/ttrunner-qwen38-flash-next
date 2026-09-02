@@ -143,6 +143,38 @@ for start in (0, 128, 256):
           flush=True)
 
 # --------------------------------------------------------------------------
+# The decode *write*. `paged_update_cache` already backs the flat path; in paged
+# mode it takes `page_table=` (not `page_table_tensor=`, which it rejects) and
+# keeps the same precondition -- the input must be L1 height-sharded, one shard
+# per core, tile-high, shard width == head_dim, counted from the padded height.
+# `TTModel._l1_height_sharded` already builds exactly that.
+print("\nPROBE --- decode writes into the paged cache ---", flush=True)
+
+
+def l1_height_sharded(t, width):
+    shape = list(t.shape)
+    n = 1
+    for d in shape[:-2]:
+        n *= d
+    n *= (shape[-2] + 31) // 32
+    grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(n - 1, 0))})
+    spec = ttnn.ShardSpec(grid, [32, width], ttnn.ShardOrientation.ROW_MAJOR)
+    return ttnn.to_memory_config(t, ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, spec))
+
+
+WPOS = 300
+wrow = torch.randn(1, B, NKV, DH).bfloat16()
+wpos = dn(torch.tensor([WPOS] * B, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+probe("paged_update_cache(page_table=)", lambda: ttnn.experimental.paged_update_cache(
+    keys, l1_height_sharded(dn(wrow), DH), update_idxs_tensor=wpos, page_table=page_table,
+))
+back = hn(keys, BLOCKS).permute(1, 0, 2, 3).reshape(NKV, T, DH)
+werr = float((back[:, WPOS] - wrow[0, 0].float()).abs().max())
+print(f"PROBE   wrote position {WPOS} exactly: {werr == 0.0} (max abs {werr:g})", flush=True)
+host_k[0, :, WPOS] = wrow[0, 0]          # keep the reference in step
+
+# --------------------------------------------------------------------------
 # The decode half. A paged cache is only worth anything if the *decode* path can
 # read it too -- otherwise prefill and decode need two layouts and there is no
 # room for both (K/V is 6.4 GB a slot at full context). Both paged variants

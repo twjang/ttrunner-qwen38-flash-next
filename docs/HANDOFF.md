@@ -272,7 +272,7 @@ in this build and was measured at this model's real shapes -- b=1, 24 q heads,
 | `ttnn.experimental.paged_fill_cache` | page table (device tensor) | cache round-trips **exactly** (max abs 0) |
 | `ttnn.transformer.chunked_scaled_dot_product_attention` | `chunk_start_idx_tensor` (device) | **1.0 / 1.5 / 1.9 %** from the dense device path at chunk 0 / 128 / 256 |
 | `ttnn.transformer.paged_scaled_dot_product_attention_decode` | `page_table_tensor` + `cur_pos_tensor` | 3.7 % from a float32 reference |
-| `ttnn.experimental.paged_update_cache` | `update_idxs_tensor` + page table | documented paged mode; already used flat |
+| `ttnn.experimental.paged_update_cache` | `update_idxs_tensor` + `page_table=` | writes the position **exactly** (max abs 0) |
 
 Two things that table settles. The chunked op is **causal internally**, so it
 needs no mask and no growing slice -- (3) and (4) go together, and the
@@ -305,10 +305,26 @@ and at chunk 256 paged is the closer of the two (6.119 vs 6.456).
    `k_chunk_size` (an upstream workaround the op documents), so fix the prefill
    chunk at 128 for the traced path.
 
-**One complication, named so it is not a surprise:** the QSA indexer addresses
-the cache with uint16 `ttnn.scatter` indices over a flat layout, so step 1
-touches it. It is off for `max_seq_len <= 2048`, which is where prefill is
-measured, so it can follow rather than block -- but it must not be forgotten.
+**API notes, all found the hard way:**
+
+* `paged_update_cache` takes `page_table=`; `page_table_tensor=` is rejected as
+  an unknown argument. `chunked_scaled_dot_product_attention` and
+  `paged_scaled_dot_product_attention_decode` take `page_table_tensor=`.
+* `paged_update_cache` keeps its flat-mode precondition: the input must be L1
+  height-sharded, one shard per core, **tile-high**, shard width == head_dim,
+  counted from the *padded* height. A `(1, 256)` shard fails with "Physical
+  shard shape must be tile {32, 32} sized". `TTModel._l1_height_sharded` already
+  builds exactly this, so the existing call site needs only the extra kwarg.
+* `paged_fill_cache` writes its input at the *start* of the page table it is
+  given, so a chunk at offset `start` passes a page table sliced from block
+  `start / block_size` onward, not the whole one.
+
+**The QSA indexer is not a complication after all**, which is worth saying
+because 5.2 previously claimed it was. It builds its mask from
+`st.indexer_blocks` over *logical* positions and never touches `st.keys`, and
+`paged_scaled_dot_product_attention_decode` accepts `attn_mask` with the same
+`[b, 1, s, s]` shape the flat op does. Its uint16 `ttnn.scatter` ceiling is a
+limit on sequence length (65536), not on cache layout.
 
 **Worth it?** A 128-token chunk issues 12293 device calls
 (`op_count.py --prefill 128`) at ~1060 ms, so it is essentially all dispatch,
