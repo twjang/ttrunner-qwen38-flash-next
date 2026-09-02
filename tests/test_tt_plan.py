@@ -335,3 +335,20 @@ def test_reinject_broadcast_equals_the_slice_form() -> None:
 
     assert torch.equal(slice_form, reference)
     assert torch.equal(broadcast_form, reference)
+
+
+def test_the_hyper_connection_mix_averages_in_one_op() -> None:
+    """`mean` rather than `sum` then a scalar multiply, 97 times a step.
+
+    Worth 29.6 ms eager (498.7 -> 469.1) and nothing traced, which is the useful
+    part of the measurement: 0.30 ms per removed op is a host dispatch, and a
+    trace replays with one. Fewer launches is an eager-path optimisation.
+    """
+    import inspect
+
+    from twtest.tt.ops import gated_residual_mix
+
+    src = inspect.getsource(gated_residual_mix)
+    assert "ttnn.mean(per_stream, dim=-2, keepdim=True)" in src
+    assert "ttnn.sum(per_stream" not in src
+    assert "1.0 / hc_count" not in src.split("inject = None")[0]

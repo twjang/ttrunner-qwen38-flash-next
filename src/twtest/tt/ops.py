@@ -100,10 +100,19 @@ def gated_residual_mix(
     shape = list(gated.shape)
     rows = shape[1] * shape[2]
     per_stream = ttnn.reshape(gated, (shape[0], rows, hc_count, hidden_size))
-    summed = ttnn.sum(per_stream, dim=-2, keepdim=True)
-    mixed = ttnn.multiply(
-        reshape_to(summed, (shape[0], shape[1], shape[2], hidden_size)), 1.0 / hc_count
-    )
+    # `mean` rather than `sum` then a scalar multiply: one op instead of two,
+    # 97 times a step. A/B'd rather than assumed, because op count is a poor
+    # proxy for cost here -- see `reinject`, where a three-op form ran 9.5x
+    # slower than the nine-op one it replaced.
+    #
+    #     eager    498.7 -> 469.1 ms   (-5.9 %)
+    #     traced   236.1 -> 236.0 ms   (unchanged)
+    #
+    # 29.6 ms for 97 ops is 0.30 ms apiece, which is a host dispatch. A trace
+    # replays with one dispatch, so it saves nothing there -- fewer launches is
+    # an *eager*-path optimisation, and the traced step is not dispatch-bound.
+    averaged = ttnn.mean(per_stream, dim=-2, keepdim=True)
+    mixed = reshape_to(averaged, (shape[0], shape[1], shape[2], hidden_size))
 
     inject = None
     if inject_w is not None:
