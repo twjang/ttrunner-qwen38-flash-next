@@ -150,6 +150,10 @@ class TTModel:
         # only -- the host->device copies that fill the bound buffers happen
         # outside it, so they are suppressed here.
         self._skip_copy = False
+        # Debug hook: called as probe(layer, hidden) after every layer in both
+        # `step` and `prefill`, so the two paths can be bisected layer by layer.
+        # Never set while tracing (host callbacks are invisible to capture).
+        self.probe = None
 
     # -- host <-> device -------------------------------------------------
 
@@ -749,6 +753,8 @@ class TTModel:
         positions = list(state.positions)
         for layer in range(cfg.num_layers):
             hidden = self._layer(hidden, layer, state, positions)
+            if self.probe is not None:
+                self.probe(layer, hidden)
 
         mixed, _ = gated_residual_mix(
             hidden,
@@ -872,8 +878,9 @@ class TTModel:
     # -- chunked prefill --------------------------------------------------------
 
     def _causal_conv_chunk(
-        self, x: ttnn.Tensor, weight: ttnn.Tensor, state: ttnn.Tensor | None, channels: int, seq: int
-    ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        self, x: ttnn.Tensor, weight: ttnn.Tensor, state: list | None, channels: int, seq: int,
+        layer: int = 0,
+    ) -> tuple[ttnn.Tensor, list]:
         """4-tap depthwise causal conv over `seq` positions at once.
 
         x: [1, 1, channels, seq] (channel-major). Expressed as a sum of four
@@ -897,7 +904,10 @@ class TTModel:
         # oldest first, then this chunk: [1,1,C,depth+seq]
         window = ttnn.concat([*state, x], dim=-1)
         acc = None
-        for tap, w_tap in enumerate(self.conv_taps(("ssm_chunk", channels), weight, channels, k)):
+        # Keyed by layer, like the decode path. Keyed by channel count alone (as
+        # this was), every DeltaNet layer after the first silently reused layer
+        # 0's taps -- layer 0 matched decode to 0.005 and layer 1 was off by 30 %.
+        for tap, w_tap in enumerate(self.conv_taps(("ssm_chunk", layer), weight, channels, k)):
             piece = ttnn.slice(window, (0, 0, 0, tap), (1, 1, channels, tap + seq))
             acc = ttnn.multiply(piece, w_tap) if acc is None else ttnn.add(
                 acc, ttnn.multiply(piece, w_tap)
@@ -939,7 +949,7 @@ class TTModel:
         z = ttnn.linear(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
         conv_out, st.conv = self._causal_conv_chunk(
             ttnn.transpose(qkv, -2, -1), self.w.blk(layer, "ssm_conv1d.weight"),
-            st.conv, self.conv_dim_local, seq,
+            st.conv, self.conv_dim_local, seq, layer,
         )
         qkv = ttnn.transpose(conv_out, -2, -1)              # [1,1,seq,conv_dim_local]
 
@@ -1015,7 +1025,12 @@ class TTModel:
         )
         gated = ttnn.multiply(normed, ttnn.sigmoid(z_heads))
         gated = ttnn.reshape(gated, (1, 1, seq, self.value_dim_local))
-        return ttnn.linear(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
+        # ssm_out is row-sharded on its contraction dim, exactly as in the decode
+        # step: every device holds a partial sum until the all-reduce. Without it
+        # each device saw only its own quarter of the DeltaNet output while the
+        # recurrent state (which does not pass through ssm_out) stayed correct.
+        out = ttnn.linear(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
+        return self.all_reduce(out)
 
     def _attention_chunk(
         self, mixed: ttnn.Tensor, layer: int, st: LayerState, start: int, seq: int
@@ -1087,32 +1102,33 @@ class TTModel:
     def prefill(self, token_ids: list[int], state: TTState, chunk: int = 128, moe_chunk: int = 16):
         """Consume a prompt in chunks; returns the final hidden state for the last token.
 
-        **Not correct yet -- do not wire this into the engine.** It runs, and it is
-        worth having: 128 prompt tokens in 5.77 s against 65.15 s through the
+        **Not verified yet -- do not wire this into the engine.** It runs, and it
+        is worth having: 128 prompt tokens in 5.77 s against 65.15 s through the
         decode path, 11.3x, which is the difference between a 100k-token prompt
-        being minutes or hours. But it does not agree with feeding the same prompt
-        one token at a time, and the disagreement is structural rather than drift:
+        being minutes or hours.
 
-            len=  4  prefill->154171  step->  2880   hidden maxdiff 28.9
-            len= 16  prefill->   695  step-> 14274   hidden maxdiff 45.1
-            len= 64  prefill->   351  step->    71   hidden maxdiff 26.2
+        Status (2026-09-02, per-layer bisection against the decode path on a
+        4-token prompt; `self.probe` is the hook, `docs/HANDOFF.md` the recipe):
 
-        It differs from the very first chunk, so it is not error accumulation over
-        a long prompt. Narrowed so far: after a 128-token prompt the layer-0
-        DeltaNet recurrent state is within 0.06 of the sequential path (plausibly
-        precision, the chunked op computes the same recurrence differently), while
-        the final hidden state is off by 45 -- so something amplifies through the
-        stack rather than starting large. `prepare()` does apply the q/k l2-norm
-        and the q scale, so that is not the missing piece.
+        * two structural bugs found and fixed -- the DeltaNet chunk returned the
+          `ssm_out` partial sums without the all-reduce, and its conv-tap cache
+          was keyed without the layer, so every DeltaNet layer after the first
+          used layer 0's conv weights. Layers 0-2 now agree with decode to ~1 %.
+        * what remains is small and grows with depth: 5 % relative at layer 3
+          (the first sparse-attention layer), ~25 % by layer 47, and the greedy
+          token still differs at every prompt length tried. Whether this is the
+          bf16 noise floor of two different-but-correct computations amplified by
+          48 MoE layers, or a third bug in `_attention_chunk`, is undecided; the
+          discriminating experiment is the per-layer diff of *decode* against
+          the CPU reference on the same prompt, which sets the noise floor.
 
-        What *was* fixed here, and is worth keeping: it no longer dies on shapes.
-        `_causal_conv_chunk` and `_ple_chunk` now speak the ring representation the
-        decode path uses, `_linear_attention_chunk` uses the local (head-sharded)
-        head counts and prepares each device's own heads instead of broadcasting
-        device 0's, and the MoE selects the same expert weights as decode -- naming
-        the split halves while the model is fused loaded another ~11 GB per device
-        and ran out of DRAM at the first MoE layer.
-        
+        Earlier fixes worth keeping: `_causal_conv_chunk` and `_ple_chunk` speak
+        the ring representation the decode path uses, `_linear_attention_chunk`
+        uses the local (head-sharded) head counts and prepares each device's own
+        heads instead of broadcasting device 0's, and the MoE selects the same
+        expert weights as decode -- naming the split halves while the model is
+        fused loaded another ~11 GB per device and ran out of DRAM at the first
+        MoE layer.
 
         `moe_chunk` matters: the MoE's broadcast formulation computes
         |union of selected experts| x M rows, and the union approaches all 512 as
@@ -1188,6 +1204,8 @@ class TTModel:
                     pieces.append(ttnn.add(routed, shared))
                 ffn = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=-2)
                 hidden = reinject(hidden, ffn, inject, cfg.hc_count)
+                if self.probe is not None:
+                    self.probe(layer, hidden)
 
             final, _ = gated_residual_mix(
                 hidden, self.w.get("output_hc_norm.weight"), self.w.get("output_hc_down.weight"),

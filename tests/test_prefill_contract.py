@@ -50,3 +50,20 @@ def test_prefill_selects_the_same_expert_weights_as_decode() -> None:
 def test_engine_refuses_chunked_prefill_while_it_is_wrong() -> None:
     src = inspect.getsource(TTEngine.__init__)
     assert "chunked_prefill" in src and "NotImplementedError" in src
+
+
+def test_chunked_deltanet_reduces_the_sharded_output() -> None:
+    """`ssm_out` is row-sharded: without the all-reduce each device keeps a quarter.
+
+    Found by per-layer bisection: the recurrent state (which never passes through
+    `ssm_out`) matched decode while the layer output did not.
+    """
+    src = inspect.getsource(TTModel._linear_attention_chunk)
+    assert "self.all_reduce(" in src
+
+
+def test_chunked_conv_taps_are_keyed_by_layer() -> None:
+    """Keyed by channel count alone, every DeltaNet layer reused layer 0's taps."""
+    src = inspect.getsource(TTModel._causal_conv_chunk)
+    assert '("ssm_chunk", layer)' in src
+    assert '("ssm_chunk", channels)' not in src
