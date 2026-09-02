@@ -721,12 +721,21 @@ matmul fixed, over 107 scored positions:
 1.18x on prompt intake is not worth that, and unlike before the reason is
 understood rather than mysterious.
 
-**Done.** The defect that made this an item — `sparse_matmul` dropping rows past
-the first tile — is found, fixed and locked by a test. What remains is inherent
-float behaviour, measured and documented, with the cap set accordingly. Reopen
-only if the tie-admitting threshold is replaced (`moe.moe_block` chose it over
-scatter deliberately; see its docstring), which would make grouping robust to
-rounding and let the cap rise.
+**And replacing the threshold would not help either**, which was the obvious
+next idea and is now measured rather than assumed. Exact top-k selection would
+be immune to *tie admission*, but the instability is not tie admission: at group
+64 the top-k **set** itself differs on 1 row in 64 -- the same one -- because a
+0.53 % perturbation genuinely reorders two experts across the k-th boundary.
+(Index *order* differs on 3 rows; only one of those changes the set.) Any
+selection rule built on these probabilities inherits that, so scatter-based
+exact top-k would buy nothing and cost the gather/scatter the design avoids.
+
+**Done, and closed.** The defect that made this an item -- `sparse_matmul`
+dropping rows past the first tile -- is found, fixed and locked by a test. What
+remains is inherent float behaviour: measured (0.53 % on the router's
+probabilities), traced to its consequence (one row in 64 routes differently),
+priced (NLL 5.648 at 32 against 6.443 at 64), and shown not to be fixable by
+changing the selection rule. The cap is set accordingly and should stay.
 
 
 ## 6. Recipes

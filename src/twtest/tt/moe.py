@@ -114,6 +114,15 @@ def moe_block(
     * The routing mask is built by thresholding the probabilities at the k-th
       largest value rather than scattering indices, so no gather/scatter op and
       no index tensor ever leaves the device.
+
+    Thresholding admits ties, so a row keeps ~11.5 experts where k is 10, and a
+    row's set can move when bf16 rounding shifts a probability across the
+    threshold. Exact top-k selection would fix the tie admission and *not* the
+    movement: measured, the top-k set itself differs on the same 1 row in 64
+    between a 64-row group and per-row calls, because the router's
+    probabilities differ by up to 0.53 % under a different tiling and that
+    genuinely reorders two experts across the k-th boundary. So scatter buys
+    nothing here. See handoff 5.8.
     """
     logits = ttnn.linear(x, router_w, compute_kernel_config=HIFI4)
     probs = ttnn.softmax(logits, dim=-1, compute_kernel_config=HIFI4)
