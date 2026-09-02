@@ -1951,25 +1951,21 @@ class TTModel:
         1.85x faster.
 
         Past 32 the answer changes, and `_MAX_MOE_CHUNK` refuses rather than
-        documents it, because the fastest setting is on the wrong side and it
-        fails silently. Two independent measurements say so:
+        documents it. Most of that gap was a real defect and is gone:
+        `ttnn.sparse_matmul` dropped rows past the first 32-row tile whenever
+        `per_core_M > 1` and K spanned more than one block, which
+        `sparse_program_config` now avoids -- `moe_block` at 64 rows went from
+        33 of 64 rows wrong to 1.
 
-        * prefill is bit-deterministic in `moe_chunk` -- three repeats at one
-          setting give identical logits -- and across settings the final logits
-          move 55.9 % at 64 and 144.9 % at 128, with a different argmax
-          (`moe_chunk_noise.py`).
-        * `moe_block` stops being per-token. Each row picks its own experts, so
-          grouping may only change speed; `moe_rows_check.py` computes the
-          answer a row at a time and finds groups of 1, 8, 16 and 32 exact, and
-          64 wrong on 33 of 64 rows, worst row 102.9 %.
-
-        Where it is *not*: routing is exact at 64 (`keep`, `weights` and the
-        expert union all match the host), and `topk`, the threshold mask,
-        `max` over the row axis, `permute`, the expert-axis reduction and
-        `sparse_matmul` itself are each exact at every row count in isolation,
-        as are four `sparse_program_config` variants. The defect only appears
-        in `expert_ffn` at production scale, so it does not reduce to a small
-        case -- see handoff 5.8 before spending a day on it.
+        What is left is irreducible. The router's probabilities differ between
+        groupings by up to 0.53 % (no row over 1 %), bf16 accumulating in a
+        different order under a different tiling, and `keep = ge(probs,
+        threshold)` admits ties, so one row in 64 picks a different expert set --
+        on that row the threshold is bit-identical and a twelfth expert simply
+        crossed it. Measured after the fix, 107 scored positions: NLL 5.648 at
+        32, 6.443 at 64, 6.136 at 128. The cap stays because 1.18x is not worth
+        that, not because the cause is unknown. Handoff 5.8 has the whole
+        investigation, including the six places the defect turned out not to be.
         """
         from .deltanet import CHUNK
 

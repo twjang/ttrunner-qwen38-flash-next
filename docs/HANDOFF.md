@@ -628,7 +628,7 @@ shapes. Accuracy on this path is not repeatable at 32 scored positions, so use
 `bench_step.py` at one configuration for both paths.
 
 
-### 5.8 The MoE row-group cliff — localised to `expert_ffn`, cap justified
+### 5.8 The MoE row-group cliff — **done**: defect fixed, cap measured
 
 `prefill(moe_chunk=)` groups rows for the MoE. Speed wants the biggest group;
 the answer changes past 32, which is one tile:
@@ -705,20 +705,35 @@ Result: `moe_block` at 64 rows goes from **33 of 64 rows wrong (worst 102.9 %) t
 1 of 64 (worst 6.8 %)**, with decode (83.0 % / NLL 0.682) and prefill (24.3 % /
 5.648) bit-identical to before.
 
-**The residual is a different bug, and a much smaller one.** That last row is
-routing, not arithmetic: `keep = ge(probs, threshold)` with bf16 probabilities
-that tie, where `ttnn.topk`'s k-th value comes back marginally different at 64
-rows than at 32. Logits at group 64 are still 23.9 % from group 32 (down from
-55.9 %) though the argmax now agrees; at 128 the argmax still differs.
+**The residual is not a bug at all**, which took one more measurement to
+establish and is the reason this item can close. The last differing row is
+routing, and the cause is upstream of `topk`: `probs` themselves differ between
+group 64 and per-row on 38 of 64 rows — by at most **0.529 %, with no row over
+1 %**. That is bf16 non-associativity, the router's matmul accumulating in a
+different order under a different tiling, and it is irreducible. `topk` is
+almost stable under it (indices differ on 3 rows, the k-th value on 1), and what
+turns a 0.5 % perturbation into a changed expert set is our own
+`keep = ge(probs, threshold)`, which admits ties: on the one row that moves, the
+threshold is *bit-identical* and a twelfth expert simply crossed it.
 
-**So the cap stays at 32** — the answer still changes past it — but for a named,
-minor reason rather than an unexplained cliff. Raising it is now a judgement
-about whether a one-row-in-64 tie is acceptable, worth about 1.18x on prompt
-intake (1101 → 936 ms).
+**So the cap stays at 32, permanently, as a measured policy choice.** With the
+matmul fixed, over 107 scored positions:
 
-Done when: `moe_rows_check.py` is clean at 64 and 128 — which now means the topk
-tie, the matmul part being done — or the cap is accepted as permanent with the
-tie documented. Do not raise it without a quality measurement.
+| moe_chunk | top-1 | NLL |
+|---|---|---|
+| 32 | **24.3 %** | **5.648** |
+| 64 | 23.4 % | 6.443 |
+| 128 | 22.4 % | 6.136 |
+
+1.18x on prompt intake is not worth that, and unlike before the reason is
+understood rather than mysterious.
+
+**Done.** The defect that made this an item — `sparse_matmul` dropping rows past
+the first tile — is found, fixed and locked by a test. What remains is inherent
+float behaviour, measured and documented, with the cap set accordingly. Reopen
+only if the tie-admitting threshold is replaced (`moe.moe_block` chose it over
+scatter deliberately; see its docstring), which would make grouping robust to
+rounding and let the cap rise.
 
 
 ## 6. Recipes

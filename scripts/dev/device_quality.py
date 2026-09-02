@@ -27,6 +27,8 @@ import ttnn
 
 from _device_model import open_model, tokenizer
 
+import twtest.tt.model as model_mod
+
 argv = sys.argv[1:]
 PREFILL = 0
 SCORE_FROM = 0
@@ -74,6 +76,12 @@ hits = top5 = 0
 nll = []
 start = 0
 if PREFILL:
+    if MOE_CHUNK is not None and MOE_CHUNK > model_mod._MAX_MOE_CHUNK:
+        # Lifting the cap is the point of asking: past 32 the MoE's answer moves,
+        # and whether it moves *enough to matter* is exactly what this measures.
+        print(f"RESULT lifting _MAX_MOE_CHUNK {model_mod._MAX_MOE_CHUNK} -> {MOE_CHUNK} "
+              "for this measurement", flush=True)
+        model_mod._MAX_MOE_CHUNK = MOE_CHUNK
     kw = {} if MOE_CHUNK is None else {"moe_chunk": MOE_CHUNK}
     h = m.prefill(ids[:PREFILL], st, **kw)
     lg = m.logits(h)[0].float()
