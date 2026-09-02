@@ -698,6 +698,22 @@ wall clock, never the call count alone. Accuracy on this path is not repeatable 
 `device_quality.py` unchanged, `op_count.py` before and after, and
 `bench_step.py` at one configuration for both paths.
 
+Done when: **5.2's step 5 lands.** This item had no definition of done for most
+of its life, which reads less like an oversight in the writing than a missing
+observation. 5.7 exists *because* prefill is dispatch-bound and untraced. A
+trace replays a whole graph on one dispatch, so capturing the prefill chunk
+takes the launch count out of the equation wholesale -- which is exactly why the
+item is already worth nothing on the traced decode step, as the paragraphs above
+spend some length establishing without drawing the conclusion. Grinding op count
+here buys percentages against a change that would buy the category.
+
+So treat 5.7 as a standing invitation while prefill runs eagerly, take a
+reduction only when the A/B above says it pays, and close it when the traced
+path exists. Three candidates are already priced -- one kept at 13.6 %, two
+refused, the shared-expert hoist (4 % of clock for 14 % of NLL) and the shared
+q/k/v permute (360 fewer calls, 30 % slower) -- so start from `op_count.py
+--by-caller`, not from that list.
+
 
 ### 5.8 The MoE row-group cliff — **done**: defect fixed, cap measured
 
