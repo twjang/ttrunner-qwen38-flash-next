@@ -1,6 +1,6 @@
 """Does the engine really skip a chat history it already holds?
 
-    uv run python scripts/dev/prefix_reuse_check.py
+    uv run python scripts/dev/prefix_reuse_check.py [--chunked] [--trace]
 
 Three turns of a conversation through `TTEngine` with one slot. Turn 2's prompt
 is turn 1's prompt plus what turn 1 emitted, so the slot already holds it and
@@ -28,7 +28,11 @@ CACHE = os.environ.get("TWTEST_TT_CACHE", str(Path.home() / "models/qwen38-tt-ca
 TOKENIZER = os.environ.get(
     "TWTEST_TOKENIZER", str(Path.home() / "models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json")
 )
+import sys
+
 N = 6
+CHUNKED = "--chunked" in sys.argv
+TRACE = "--trace" in sys.argv
 
 
 async def run(engine, ids, tag):
@@ -50,10 +54,17 @@ async def run(engine, ids, tag):
 async def main():
     engine = TTEngine(
         cache_dir=CACHE, gguf_dir=GGUF, tokenizer_path=TOKENIZER,
-        max_concurrency=1, max_seq_len=4096, use_trace=False,
+        max_concurrency=1, max_seq_len=4096, use_trace=TRACE,
+        chunked_prefill=CHUNKED,
     )
+    print(f"RESULT chunked_prefill={CHUNKED} trace={TRACE}", flush=True)
     try:
-        turn1 = engine.encode("The Rosetta Stone is a granodiorite stele inscribed with three")
+        turn1 = engine.encode(
+            "The Rosetta Stone is a granodiorite stele inscribed with three versions "
+            "of a decree issued in Memphis in 196 BC. The top and middle texts are "
+            "in Ancient Egyptian, using hieroglyphic and Demotic scripts, while the "
+            "bottom is in Ancient Greek. Because the decree has only minor"
+        )
         t1, ttft1 = await run(engine, turn1, "turn 1 (cold)")
 
         turn2 = turn1 + t1 + engine.encode(" and it was")

@@ -942,20 +942,30 @@ class TTModel:
             return list(reversed(ring))
         return [ring[(step + i) % n] for i in range(n)]
 
-    def _ring_from_oldest_first(self, cols: list, step: int) -> list:
+    def _ring_from_oldest_first(self, cols: list, step: int, into: list | None = None) -> list:
         """Lay `cols` (oldest first) out the way a decode step at `step` reads it.
 
         The inverse of `_ring_oldest_first`, so that a chunk leaves behind
         exactly the ring the decode path would have left after the same tokens
         -- which is what makes prefill's state comparable to decode's at all.
+
+        With `into`, the columns are *copied* into those buffers instead of
+        replacing them. Rebinding a ring to fresh tensors moves it, and a
+        captured trace replays against the addresses it recorded -- so a prefill
+        that rebound the rings would leave any traced decoder reading whatever
+        used to be there. That is what kept chunked prefill out of the engine
+        even once it was correct.
         """
         n = len(cols)
-        if self.trace_safe_rings:
-            return list(reversed(cols))
-        out = [None] * n
-        for i, col in enumerate(cols):
-            out[(step + i) % n] = col
-        return out
+        order = list(reversed(cols)) if self.trace_safe_rings else [None] * n
+        if not self.trace_safe_rings:
+            for i, col in enumerate(cols):
+                order[(step + i) % n] = col
+        if into is None:
+            return order
+        for dst, src in zip(into, order):
+            ttnn.copy(src, dst)
+        return into
 
     def _causal_conv_chunk(
         self, x: ttnn.Tensor, weight: ttnn.Tensor, state: list | None, channels: int, seq: int,
@@ -1002,7 +1012,9 @@ class TTModel:
             for i in range(depth)
         ]                                   # oldest .. newest
         new_step = step + seq
-        return ttnn.silu(acc), self._ring_from_oldest_first(cols, new_step), new_step
+        # `state` is the ring this chunk consumed; writing back into it keeps the
+        # buffers where a captured trace expects them.
+        return ttnn.silu(acc), self._ring_from_oldest_first(cols, new_step, into=state), new_step
 
     def _linear_attention_chunk(
         self, mixed: ttnn.Tensor, layer: int, st: LayerState, seq: int
@@ -1269,6 +1281,16 @@ class TTModel:
             )
         if state.batch != 1:
             raise NotImplementedError("chunked prefill is single-sequence for now")
+        # Absolute position the state is already at, so a prompt can be
+        # prefilled onto a slot that a previous turn left populated. `fill_cache`
+        # wants a tile-aligned index, so a caller resuming mid-tile has to step
+        # up to the boundary first.
+        base = state.positions[0]
+        if base % ttnn.TILE_SIZE:
+            raise ValueError(
+                f"prefill resumes only on a {ttnn.TILE_SIZE}-token boundary, "
+                f"and this slot is at {base}"
+            )
         final = None
         for begin in range(0, len(token_ids), chunk):
             ids = token_ids[begin : begin + chunk]
@@ -1288,7 +1310,7 @@ class TTModel:
                     cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
                 )
                 branch = (
-                    self._attention_chunk(mixed, layer, st, begin, seq)
+                    self._attention_chunk(mixed, layer, st, base + begin, seq)
                     if cfg.is_full_attention(layer)
                     else self._linear_attention_chunk(mixed, layer, st, seq)
                 )
@@ -1339,7 +1361,7 @@ class TTModel:
                 self.w.get("output_hc_up.weight"), None,
                 cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
             )
-            state.positions = [begin + seq]
+            state.positions = [base + begin + seq]
         # last position only
         last = ttnn.slice(final, (0, 0, final.shape[-2] - 1, 0), (1, 1, final.shape[-2], cfg.hidden_size))
         return last
@@ -1405,7 +1427,7 @@ class TTModel:
             for i in range(state_len)
         ]                                                       # oldest .. newest
         st.ple_step += seq
-        st.ple_conv = self._ring_from_oldest_first(cols, st.ple_step)
+        st.ple_conv = self._ring_from_oldest_first(cols, st.ple_step, into=st.ple_conv)
         # prefill is single-sequence: [1,1,C,seq] -> [1,1,seq,C]
         conv = ttnn.silu(ttnn.transpose(acc, -2, -1))
         return ttnn.add(gated, conv)

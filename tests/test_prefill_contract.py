@@ -73,9 +73,44 @@ def test_prefill_selects_the_same_expert_weights_as_decode() -> None:
     assert "fuse_expert_gate_up" in src and "fused_gate_up" in src
 
 
-def test_engine_refuses_chunked_prefill_while_it_is_wrong() -> None:
+def test_engine_allows_chunked_prefill_only_with_one_slot() -> None:
+    """`TTModel.prefill` consumes a whole prompt before returning, which a
+    shared lockstep batch cannot express -- so it is available at
+    max_concurrency=1 and refused loudly above it, rather than silently
+    ignored."""
     src = inspect.getsource(TTEngine.__init__)
-    assert "chunked_prefill" in src and "NotImplementedError" in src
+    assert "chunked_prefill and max_concurrency != 1" in src
+    assert "NotImplementedError" in src
+    assert "self._chunked_prefill = bool(chunked_prefill)" in src
+
+
+def test_prefill_leaves_the_last_prompt_token_to_the_decode_loop() -> None:
+    """The step that consumes it is what produces the first output logits, and
+    a recurrent state cannot be rewound to get it back. Prefill also has to
+    stop on a tile boundary, because `fill_cache` asserts a tile-aligned
+    index."""
+    src = inspect.getsource(TTEngine._device_loop)
+    block = src[src.index("if self._chunked_prefill:"):]
+    assert "len(prompt) - 1 - seq.prompt_pos" in block
+    assert "available % TILE" in block
+    assert "seq.prompt_pos % TILE == 0" in block
+
+
+def test_prefill_resumes_from_where_the_slot_already_is() -> None:
+    """So it composes with prefix reuse instead of assuming position 0."""
+    src = inspect.getsource(TTModel.prefill)
+    assert "base = state.positions[0]" in src
+    assert "base + begin" in src
+
+
+def test_chunk_rings_are_written_in_place() -> None:
+    """Rebinding a ring moves it, and a captured trace replays against the
+    addresses it recorded -- so a prefill that rebound the rings would leave a
+    traced decoder reading whatever used to be there."""
+    src = inspect.getsource(TTModel._ring_from_oldest_first)
+    assert "ttnn.copy(src, dst)" in src
+    assert "into=state" in inspect.getsource(TTModel._causal_conv_chunk)
+    assert "into=st.ple_conv" in inspect.getsource(TTModel._ple_chunk)
 
 
 def test_chunked_deltanet_reduces_the_sharded_output() -> None:
@@ -105,3 +140,11 @@ def test_chunked_attention_masks_the_tile_padding() -> None:
     assert "(1, n_kv, kv_len, hd)" in src
     assert "torch.arange(kv_len)" in src
     assert "(1, n_kv, total, hd)" not in src
+
+
+def test_chunked_prefill_turns_the_trace_off() -> None:
+    """Prefill runs eagerly and allocates gigabytes per call; a trace replays
+    against the addresses it captured. After a few prefills the replay returned
+    token 0 repeatedly -- eager prefill is correct, the combination is not."""
+    src = inspect.getsource(TTEngine.__init__)
+    assert "and not self._chunked_prefill" in src

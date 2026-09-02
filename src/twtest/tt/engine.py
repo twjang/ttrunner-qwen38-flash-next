@@ -147,18 +147,44 @@ class TTEngine(Engine):
 
         self._stats = EngineStats()
         self._max_concurrency = max_concurrency
-        # Chunked prefill (gated_delta_attn_seq over 128 tokens at a time) is
-        # perhaps 10x faster than replaying the decode step per prompt token, but
-        # `TTModel.prefill` is single-sequence: it consumes a whole prompt before
-        # returning, which a shared lockstep batch cannot express. Prompts are fed
-        # through the batched step path instead. Rejected loudly rather than
-        # ignored, so a caller asking for it is not silently given something else.
-        if chunked_prefill:
+        # Chunked prefill consumes 128 prompt tokens at a time through
+        # `gated_delta_attn_seq` instead of replaying the decode step per token:
+        # 5.77 s against 65.15 s for 128 tokens. It is single-sequence -- it
+        # takes a whole prompt before returning, which a shared lockstep batch
+        # cannot express -- so it is available only where there is one slot,
+        # which is the configuration this engine is tuned for anyway.
+        #
+        # It was off entirely until `docs/iterations/013`, when it was still
+        # wrong. It now predicts the next token of real text as well as the
+        # decode path does (87.5% against a same-positions control of 86.7%),
+        # and the rings it leaves are written in place, so a captured trace
+        # replays against the buffers it recorded.
+        if chunked_prefill and max_concurrency != 1:
             raise NotImplementedError(
                 "chunked_prefill is incompatible with batched decoding: "
-                "TTModel.prefill runs one sequence at a time"
+                "TTModel.prefill runs one sequence at a time, so it needs "
+                f"max_concurrency=1 (got {max_concurrency})"
             )
-        self._chunked_prefill = False
+        self._chunked_prefill = bool(chunked_prefill)
+        # Chunked prefill and a captured trace do not coexist. Prefill runs
+        # eagerly and allocates gigabytes of temporaries per call, and a trace
+        # replays a recorded graph against the addresses it captured -- after a
+        # few prefills the replay came back as token 0 repeated, the same class
+        # of failure the LM head caused before `TracedDecoder` warmed it. Eager
+        # prefill is *correct* (verified: warm and cold turns agree token for
+        # token); it is the combination that is not.
+        #
+        # Which to prefer depends on the shape of the work, so it is worth
+        # stating. A 2000-token prompt with 200 output tokens costs roughly
+        # 2000*0.50 + 200*0.236 = 1047 s traced with the prompt stepped, against
+        # 2000*0.045 + 200*0.52 = 194 s eager with the prompt prefilled. Short
+        # prompts invert it, and prefix reuse makes later turns of a chat cheap
+        # either way.
+        if self._chunked_prefill and use_trace:
+            print(
+                "[tt] chunked_prefill needs eager execution; trace capture is off. "
+                "Prompt ingestion is ~11x faster, each generated token ~2.2x slower."
+            )
         # Trace replays a captured step with a single dispatch, and for a single
         # user that is the whole game: 2.02x at batch 1 (516 -> 255 ms), 1.52x at
         # 16, 1.29x at 32, ~1.01x by 48 where each op carries enough device work
@@ -171,7 +197,7 @@ class TTEngine(Engine):
         # capture region, landing on memory the recorded graph depends on.
         # TracedDecoder now runs them before capturing. Above batch 48 the gain is
         # ~1 %, so capture is not worth its memory there.
-        self._use_trace = use_trace and max_concurrency < 48
+        self._use_trace = use_trace and max_concurrency < 48 and not self._chunked_prefill
         self._decoder = None
         self._admit: queue.SimpleQueue = queue.SimpleQueue()
         self._shutdown = threading.Event()
@@ -200,6 +226,7 @@ class TTEngine(Engine):
 
         from ..reference.generate import SamplingParams, sample
 
+        TILE = 32                      # fill_cache asserts a tile-aligned index
         B = self._max_concurrency
         state = self.model.new_state(batch=B)
         slots: list[_Sequence | None] = [None] * B
@@ -276,6 +303,22 @@ class TTEngine(Engine):
             seq.slot = slot
             slots[slot] = seq
             self._stats.running = sum(x is not None for x in slots)
+
+            # Consume the bulk of the prompt in one go. The last token is left
+            # for the decode loop, because the step that consumes it is what
+            # produces the first output logits. `TTModel.prefill` resumes from
+            # wherever the slot already is, so this composes with prefix reuse,
+            # but `fill_cache` wants a tile-aligned start -- so prefill only a
+            # whole number of tiles and let the loop step the remainder.
+            if self._chunked_prefill:
+                available = len(prompt) - 1 - seq.prompt_pos
+                take = available - available % TILE
+                if take and seq.prompt_pos % TILE == 0:
+                    chunk = prompt[seq.prompt_pos : seq.prompt_pos + take]
+                    self.model.prefill(chunk, state)
+                    seq.prompt_pos += take
+                    if prefix[slot] is not None:
+                        prefix[slot].extend(chunk)
 
         while not self._shutdown.is_set():
             while free:
