@@ -151,6 +151,46 @@ def moe_block(
     return ttnn.sum(ttnn.multiply(per_expert, gate_per_expert), dim=1, keepdim=True)
 
 
+def route(x, router_w, top_k: int):
+    """The routing half of `moe_block`: probabilities in, (weights, keep) out.
+
+    Split out so a caller can route in one row-group size and compute the
+    experts in another. That is not a free choice -- routing at a different
+    group size changes the answer (the router's probabilities move by up to
+    0.53 % under a different tiling and that reorders experts across the k-th
+    boundary; see `moe_block`) -- whereas the expert FFN is exactly per-token
+    once `sparse_program_config` gives it a single K block. So `prefill` routes
+    in 32-row groups, which is what `_MAX_MOE_CHUNK` pins, and computes the
+    experts over the whole chunk.
+    """
+    logits = ttnn.linear(x, router_w, compute_kernel_config=HIFI4)
+    probs = ttnn.softmax(logits, dim=-1, compute_kernel_config=HIFI4)
+    values, _ = ttnn.topk(probs, k=top_k, dim=-1, largest=True, sorted=True)
+    v = list(values.shape)
+    threshold = ttnn.slice(values, (0, 0, 0, top_k - 1), (v[0], v[1], v[2], top_k))
+    keep = ttnn.ge(probs, threshold, dtype=ttnn.bfloat16)
+    kept = ttnn.multiply(probs, keep)
+    return ttnn.divide(kept, ttnn.sum(kept, dim=-1, keepdim=True)), keep
+
+
+def apply_experts(x, weights, keep, gate_w, up_w, down_w, num_experts: int,
+                  hidden_size: int, intermediate_size: int):
+    """The compute half: run the union of selected experts over all of `x`.
+
+    `x`, `weights` and `keep` all carry the same M rows; `weights`/`keep` may
+    have been routed in smaller groups and concatenated.
+    """
+    sparsity = ttnn.to_layout(
+        ttnn.typecast(ttnn.max(keep, dim=-2, keepdim=True), ttnn.bfloat16),
+        ttnn.ROW_MAJOR_LAYOUT,
+    )
+    per_expert = expert_ffn(
+        x, gate_w, up_w, down_w, sparsity, None, num_experts, hidden_size, intermediate_size
+    )
+    gate_per_expert = ttnn.permute(weights, (0, 3, 2, 1))
+    return ttnn.sum(ttnn.multiply(per_expert, gate_per_expert), dim=1, keepdim=True)
+
+
 def shared_expert(
     x: ttnn.Tensor,
     gate_w: ttnn.Tensor,

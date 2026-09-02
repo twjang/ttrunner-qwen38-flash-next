@@ -72,12 +72,12 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 |---|---|
 | single user, 1 slot, 262144 ctx, traced | **236 ms/step**; eager 469 ms |
 | same, QSA selection on (context in (2048, 65536]) | 297 ms/step at 8192 |
-| same, eager, chunked prefill on | prompt at **8.6 ms/token** (was ~45) |
+| same, eager, chunked prefill on | prompt at **7.2 ms/token** (was ~45) |
 | `step_n` verifying k tokens, traced | 255 ms at k=2, 276.6 at k=4, 323.9 at k=8 |
 | same, eager | 496 ms/step |
 | batch 64, eager, fused experts | 97.4 tok/s aggregate |
 | server, 32 concurrent | 37.84 tok/s |
-| prefill, 128 tokens, `moe_chunk=32` | **1101 ms** (116.3 tok/s); was 2033 ms at the old `moe_chunk=16` default |
+| prefill, 128 tokens, `moe_chunk=32` | **925 ms** (138.4 tok/s); 2033 ms at the old `moe_chunk=16` default, 1070 ms before routing and expert compute were split |
 | unit tests | `uv run pytest -q` → 197 passed, ~3 s, no hardware needed |
 | **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; float32 reference 80.9 %** |
 | chunked prefill, judged against a same-positions decode control | 128 tokens prefilled: **53.1 %** vs 51.6 % stepped; 32 prefilled, 128 scored: **71.9 %** vs 71.7 % |
@@ -626,6 +626,27 @@ dispatch. Op-count reduction pays here at full rate.
 what says where to cut; "multiply, 1993" does not. The distribution is flat --
 the largest single site is 4.2 % -- so expect many small wins rather than one
 big one.
+
+**A worked example, measured and kept: split routing from expert compute.**
+The MoE's two halves want different row-group sizes, and only one of them is
+fussy. Routing at a wider group *changes the answer* -- bf16 moves the router's
+probabilities ~0.5 %, which reorders experts across the k-th boundary (5.8) --
+while the expert FFN is exactly per-token at any width, now that
+`sparse_program_config` gives it a single K block above one row tile. So
+`prefill` routes in `moe_chunk`-sized groups and calls `expert_ffn` **once** for
+the whole chunk instead of `seq / moe_chunk` times.
+
+12293 -> 11681 dispatches and **1070.5 -> 925.1 ms** a chunk, 13.6 %, taking
+prompt intake to 7.2 ms/token.
+
+It is *not* bit-identical, which I expected it to be and it is worth saying why:
+batching the expert compute to 128 rows forces the single-K-block program config
+(the narrow one is the buggy one above a row tile), and that changes the
+accumulation order. The move is inside the bf16 band and does not point one way
+-- over 107 scored positions top-1 goes 24.3 % -> **25.2 %** and NLL 5.648 ->
+5.823. With one row group it reduces exactly to the old path: prefill=32 is
+bit-identical at 71.9 % / 1.433, which is the check that says the split itself
+is faithful.
 
 **A worked example, measured and rejected.** The shared expert is dense and has
 no routing, so `moe_chunk` -- which exists to bound the routed MoE's

@@ -2060,21 +2060,35 @@ class TTModel:
                 else:
                     gate_w = self.w.blk(layer, "ffn_gate_exps.weight")
                     up_w = self.w.blk(layer, "ffn_up_exps.weight")
+                # Route in `moe_chunk`-sized groups, compute the experts over the
+                # whole chunk. The two halves want different group sizes and only
+                # one of them is fussy: routing at a wider group changes the
+                # answer (bf16 moves the router's probabilities ~0.5 %, which
+                # reorders experts across the k-th boundary -- 5.8), while the
+                # expert FFN is exactly per-token at any width now that
+                # `sparse_program_config` gives it a single K block. Splitting
+                # them keeps this bit-identical to routing *and* computing at
+                # `moe_chunk`, for one `expert_ffn` dispatch set instead of
+                # `seq / moe_chunk` of them.
+                routes, keeps = [], []
                 for sub in range(0, seq, moe_chunk):
                     width = min(moe_chunk, seq - sub)
                     part = ttnn.slice(mixed, (0, 0, sub, 0), (1, 1, sub + width, cfg.hidden_size))
-                    pieces.append(
-                        self.all_reduce(
-                            moe.moe_block(
-                                part, self.w.blk(layer, "ffn_gate_inp.weight"),
-                                gate_w, up_w,
-                                self.w.blk(layer, "ffn_down_exps.weight"),
-                                cfg.num_experts_per_tok, cfg.num_experts,
-                                cfg.hidden_size, cfg.expert_intermediate,
-                            )
-                        )
+                    w_sub, k_sub = moe.route(
+                        part, self.w.blk(layer, "ffn_gate_inp.weight"),
+                        cfg.num_experts_per_tok,
                     )
-                routed = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=-2)
+                    routes.append(w_sub)
+                    keeps.append(k_sub)
+                weights = routes[0] if len(routes) == 1 else ttnn.concat(routes, dim=-2)
+                keep = keeps[0] if len(keeps) == 1 else ttnn.concat(keeps, dim=-2)
+                routed = self.all_reduce(
+                    moe.apply_experts(
+                        mixed, weights, keep, gate_w, up_w,
+                        self.w.blk(layer, "ffn_down_exps.weight"),
+                        cfg.num_experts, cfg.hidden_size, cfg.expert_intermediate,
+                    )
+                )
                 # The shared expert stays sub-chunked, and it is worth saying why
                 # because the opposite looks obviously right. It has no routing
                 # to broadcast -- four dense linears and a sigmoid gate -- so

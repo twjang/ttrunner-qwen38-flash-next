@@ -228,3 +228,23 @@ def test_prefill_refuses_a_moe_chunk_past_the_cliff() -> None:
     assert "moe_chunk: int = 32" in src.split("\n")[0] or "moe_chunk: int = 32" in src, (
         "the default must sit inside the verified range"
     )
+
+
+def test_prefill_routes_in_groups_but_computes_experts_once() -> None:
+    """The MoE's two halves take different row-group sizes, on purpose.
+
+    Routing at a wider group changes the answer -- bf16 moves the router's
+    probabilities ~0.5 %, reordering experts across the k-th boundary -- so it
+    stays in `moe_chunk`-sized groups. The expert FFN is exactly per-token at
+    any width once `sparse_program_config` gives it a single K block, so it runs
+    once for the whole chunk: 612 fewer dispatches and 1070.5 -> 925.1 ms.
+
+    Collapsing these back into one `moe_block` call per sub-chunk is the
+    regression this guards.
+    """
+    src = inspect.getsource(TTModel.prefill)
+    assert "moe.route(" in src, "routing must stay per sub-chunk"
+    assert "moe.apply_experts(" in src, "the expert FFN must run once for the chunk"
+    assert "moe.moe_block(" not in src, (
+        "moe_block fuses routing and expert compute at one group size"
+    )
