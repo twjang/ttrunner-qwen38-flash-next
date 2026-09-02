@@ -1,8 +1,10 @@
 """Prompt-lookup drafting and greedy acceptance.
 
-Speculation is only worth having if its output is *identical* to not
-speculating, so the accept rule is the load-bearing part: stop at the first
-disagreement, keep the prefix, and take the model's own token at the boundary.
+The accept rule is the load-bearing part: stop at the first disagreement, keep
+the prefix, and take the model's own token at the boundary. That makes every
+emitted token the argmax of the verifier's own logits -- though *not* the same
+stream as stepping one token at a time, because the verifier batches k rows
+where the stepper runs one and bf16 rounding differs in the last bits.
 
 Measured with the rollback and the replay of the accepted prefix both paid for
 (`scripts/dev/ngram_accept_rate.py`): 1.70-2.14x on prompts that quote their
@@ -60,6 +62,20 @@ def test_a_draft_never_overlaps_its_own_key() -> None:
     assert got == [5, 5]  # a real earlier occurrence, not the tail
 
 
+def test_the_engine_does_not_promise_identical_output() -> None:
+    """Greedy acceptance is exact only if the verifier and the stepper agree bit
+    for bit. `step_n` batches k rows where `step` runs one, bf16 rounding
+    differs, and argmax amplifies it -- measured divergence at token 29 and 39.
+    Every emitted token is still the argmax of the verifier's own logits."""
+    import inspect
+
+    from twtest.tt.engine import TTEngine
+
+    src = inspect.getsource(TTEngine.__init__)
+    assert "**Not** identical to decoding one token at a time" in src
+    assert "speculation is experimental" in src
+
+
 def test_acceptance_stops_at_the_first_disagreement() -> None:
     assert accepted_prefix([1, 2, 3, 4], [1, 2, 9, 4]) == 2
     assert accepted_prefix([1, 2, 3, 4], [9, 2, 3, 4]) == 0
@@ -83,37 +99,34 @@ def test_the_engine_refuses_speculation_it_cannot_serve() -> None:
     assert "step_n does not carry the QSA selection yet" in src
 
 
-def test_speculation_refuses_rather_than_wedging_the_device() -> None:
-    """Capturing the step_n graph inside the engine hangs the device thread, and
-    the boards come back only after `tt-smi -r` -- four times so far. A flag that
-    bricks the accelerators is worse than no flag, so it raises rather than
-    tries. The same capture standalone is fine, so it is the context."""
+def test_speculate_counts_tokens_fed_not_tokens_drafted() -> None:
+    """It drafts `speculate - 1`. Reading it the other way put the engine in its
+    worst configuration: at speculate=2 the draft is one token, the drafter fires
+    on nearly every round, and each failure pays a verify plus a replay -- 492 ms
+    a token against a 240 ms baseline."""
     import inspect
 
     from twtest.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
-    assert "hangs the device thread" in src
-    assert "raise NotImplementedError" in src
-    # and the decode trace is not silently left on alongside it
-    assert "and not self._speculate" in src
+    assert "drafts\n        # `speculate - 1`" in src or "speculate - 1" in src
+    assert "2 <= speculate <= 17" in src
+    # the decode trace stays on: ordinary rounds want it
+    assert "and not self._speculate" not in src
 
 
-def test_there_is_exactly_one_capture() -> None:
-    """Capturing a second `step_n` graph allocates its intermediates while the
-    first trace is live, which tt-metal warns corrupts them."""
+def test_the_replay_widths_are_a_ladder() -> None:
+    """The verify needs `speculate`; a partial acceptance replays 1..speculate-1.
+    Powers of two plus the verify width cover any prefix by composition, and a
+    second live capture was measured not to slow the first one's replay."""
     import inspect
 
     from twtest.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
-    assert "self._widths = [speculate] if speculate else []" in src
-    # and the region is deliberately *not* enlarged: one capture wants ~63 MB,
-    # which fits the 128 MB default, and enlarging it was the last difference
-    # between this engine and the harness that captures the same graph fine
-    assert "(len(self._widths) + 1)" not in src
+    assert "sorted({w for w in (2, 4, 8, 16) if w < speculate}" in src
+    assert "(len(self._widths) + 1) * (128 << 20)" in src
     loop = inspect.getsource(TTEngine._device_loop)
-    # the replay still composes, from whatever widths exist plus single steps
     assert "max((w for w in verifiers if w <= remaining), default=1)" in loop
 
 
@@ -126,5 +139,24 @@ def test_speculation_snapshots_before_it_verifies() -> None:
 
     src = inspect.getsource(TTEngine._device_loop)
     block = src[src.index("def speculate_round("):]
-    assert block.index("self.model.snapshot(state)") < block.index("step_n(feed)")
+    assert block.index("self.model.snapshot(state") < block.index("step_n(feed)")
     assert "self.model.restore(state, snap)" in block
+    # and the buffers are reused, not reallocated every round: ~200 allocations
+    # per round is slow, and allocating while a trace is live is the hazard
+    assert "into=snap_buf.get(" in block
+
+
+def test_close_releases_every_capture_before_closing_the_mesh() -> None:
+    """Closing the mesh with a trace still registered does not fail there -- it
+    fails in whatever opens the devices next, and as a hang rather than an error.
+    Two engines in one process is enough to hit it."""
+    import inspect
+
+    from twtest.tt.engine import TTEngine
+
+    src = inspect.getsource(TTEngine.close)
+    assert "trace.release()" in src
+    assert src.index("trace.release()") < src.index("close_mesh_device")
+    assert "self._verifiers" in src
+    # and the engine keeps hold of them so close can find them
+    assert "self._verifiers = verifiers" in inspect.getsource(TTEngine._device_loop)

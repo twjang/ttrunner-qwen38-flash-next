@@ -103,17 +103,52 @@ A capture also wants far more trace region than the 128 MB default -- four asked
 for over 253 MB -- and the region is fixed when the mesh opens, so it is sized
 from k there.
 
-## Observation 6 — and the engine integration hangs the device
+## Observation 6 — greedy acceptance is not exact here
 
-`TTEngine(speculate=k)` raises. Not as a performance caveat: capturing the
-`step_n` graph inside the engine's device thread hangs it, and the boards come
-back only after `tt-smi -r`. That happened three times -- with the decoder's
-trace live and with it off -- always preceded by the warning in Observation 5.
+The claim that greedy acceptance makes speculation identical to token-by-token
+decoding is standard, and it is wrong on this stack. Two separate single-engine
+runs, one speculating and one not, diverge at token **29** on the copy-heavy
+prompt and **39** on the open-prose one.
+
+Greedy acceptance is exact only if the verifier and the stepper agree bit for
+bit. They do not: `step_n` computes row i's logits inside a k-row batch where
+`step` computes them in a 1-row batch, and bf16 rounding differs in the last
+bits. `step_n_check.py` reports 0.00 % on the hidden state, but that is a
+*rounded* maximum, and argmax amplifies whatever is left.
+
+Every emitted token is still the argmax of the verifier's own logits, so what
+comes out is *a* greedy decode -- just not the same one. On a model where two
+correct implementations already disagree on half their greedy tokens (`014`),
+that is a caveat rather than a defect. But it is not what "exact" promises, so
+the flag is off by default and the constructor says so.
+
+This is also the more useful lesson than any of the timings: the claim was
+checked only because it was cheap to check, and it failed. The check needed two
+separate processes, because two engines in one still hang (Observation 7).
+
+## Observation 7 — the hang was two engines, not speculation
+
+Capturing the `step_n` graph inside the engine hung it, and the boards came back
+only after `tt-smi -r` -- five times over the session. The cause turned out not
+to be speculation at all: a **second `TTEngine` constructed in the same process
+after closing the first** hangs on its own capture. With one engine per process
+speculation runs to completion.
+
+The warning that accompanies it is a red herring. It appears exactly once in
+every *successful* capture too; the hanging runs simply emit it twice, which is
+what pointed at the two-engine sequence. Counting the warnings in the logs was
+free and decided in one command what six device experiments had not.
+
+Part of it is a real engine bug, now fixed: `TTEngine.close` closed the mesh
+without releasing its captured traces, so the devices were left with a trace
+registered. That alone does not account for the hang -- it still reproduces with
+the fix -- but closing a mesh under a live trace is wrong regardless, and any
+program that builds two engines was hitting it.
 
 Standalone the same capture is fine: `scripts/dev/traced_step_n_check.py` builds
 a `TracedStepN`, replays it, and measures 255 ms at k=2 with the tokens matching
-eager. So it is the engine's context, not the capture. Six candidate causes were
-each tested and excluded:
+eager. Eight candidate causes were tested; the eliminations are the useful part,
+because each cost a device cycle:
 
 | candidate | test | result |
 |---|---|---|
@@ -123,21 +158,43 @@ each tested and excluded:
 | Capturing off the main thread | `traced_step_n_thread.py` captures and replays on a worker thread | 253.7 ms, works — **not it** |
 | The enlarged trace region (384 MB) starving DRAM | left at the 128 MB default | still hangs — **not it** |
 | The single-token step graph allocating *after* the capture, on the engine's first eager step | `TracedStepN` now warms `model.step` and the LM head before capturing | still hangs — **not it** |
+| Captured traces leaking past `close` | `TTEngine.close` now releases them | still hangs — **not it**, but a real bug |
+| A second live capture slowing the first one's replay | timed a traced step with a `step_n` capture also live | 236.1 vs 236.3 ms — **not it** |
+| **Two engines in one process** | ran a single engine | **completes — this was it** |
 
-The warmup from the last row was kept regardless: a caller that speculates still
-takes ordinary steps, and letting them allocate the 48-layer graph after a
-capture is the hazard this module's docstring opens with. It is correct whether
-or not it was the cause.
+Two of those fixes were kept regardless of the verdict. Warming the single-token
+step before capture is right because a caller that speculates still takes
+ordinary steps, and letting them allocate the 48-layer graph after a capture is
+the hazard this module's docstring opens with. Releasing traces in `close` is
+right because closing a mesh under a live trace is simply wrong.
 
-What is left to try, in rough order of promise: capture with `cq_id` other than
-0, since the engine and the harness may differ in which command queue is idle;
-bisect the engine's construction by building a `TTEngine`, then capturing from a
-script rather than from `_device_loop`; and instrument which allocation triggers
-the warning, since it names no tensor.
+What is still open is *why* a second engine hangs. It is an engine-lifecycle
+question rather than a speculation one, and it deserves its own investigation:
+anything that opens and closes a mesh twice in one process is affected.
 
-A flag that bricks the accelerators is worse than no flag, so the constructor
-refuses with a pointer here rather than trying. Four board resets went into
-narrowing this down.
+## Observation 8 — and it is not yet faster
+
+With one engine per process, both traces live, and the snapshot buffers reused,
+generation-only rates against a 240.0 / 240.4 ms baseline:
+
+| `speculate` | drafted per verify | copy-heavy | open prose |
+|---|---|---|---|
+| 2 | 1 | 414.6 ms/tok | 492.3 ms/tok |
+| 9 | 8 | **253.9 ms/tok** | 507.9 ms/tok |
+
+`speculate` counts the tokens a verify *feeds*, so it drafts `speculate - 1`.
+Reading it as the drafted count put the engine in its worst configuration: at
+`speculate=2` the draft is a single token, one following token is easy to find,
+so the drafter fires on nearly every round and every failure pays a verify plus
+a replay. The offline pricing's k is the drafted count, so its k=8 is
+`speculate=9`.
+
+Even at `speculate=9` the best case is 0.95x, and open prose is 2.1x *worse*
+than baseline while drafting less often than copy-heavy -- which is backwards
+from any drafting-cost model and means the overhead is not in the drafting. That
+is unexplained, and it is where the next attempt should start: instrument the
+engine to count drafted versus plain rounds and time each, rather than inferring
+from end-to-end rates.
 
 ## Where it leaves us
 
@@ -150,14 +207,24 @@ Everything the scheme needs is built and verified on its own:
 | `snapshot` / `restore` | a discarded draft rolls back token-for-identically |
 | `prompt_lookup_draft`, `accepted_prefix` | unit-tested, including the search bug |
 | offline pricing | 1.70-2.14x on prompts that quote their context |
+| end to end in the engine | runs, one engine per process; best 0.95x, not yet faster |
 
-What is missing is one thing: a capture that survives inside the engine's device
-thread. After that, in order -- make allocating during a second capture safe
-(which unlocks the width ladder and larger k), carry the QSA selection through
-`step_n`, and only then look at MTP, whose value is precisely that it drafts on
-*every* position rather than only where the context repeats, which is the
-limitation Observation 4 measures.
+Two things stand between that and a feature worth switching on, and neither is
+about drafting:
 
-One process note, since it cost three board resets: `kill -9` on a process that
-is mid-capture leaves the cards needing `tt-smi -r`. Check `pgrep` and let device
-jobs finish.
+1. **Where the per-round overhead goes.** Instrument drafted versus plain rounds
+   and time each. The end-to-end rates say the cost is not in the drafter, and
+   inferring further from them is guessing.
+2. **Why a second engine in one process hangs.** An engine-lifecycle bug that
+   happens to block this, and blocks anything else that opens a mesh twice.
+
+Then, in order: carry the QSA selection through `step_n` (`_attention_step_n`
+reads per row, so there is room for a per-row mask), and only then MTP, whose
+value is precisely that it drafts on *every* position rather than only where the
+context repeats -- the limitation Observation 4 measures.
+
+Two process notes, since between them they cost five board resets. `kill -9` on
+a process that is mid-capture leaves the cards needing `tt-smi -r`; check `ps`
+and let device jobs finish. And `pgrep -f <pattern>` matches the shell running
+it, so it kills the caller -- match on the executable instead:
+`ps -eo pid,comm,args | awk '$2 ~ /^python/ && /script_name/'`.

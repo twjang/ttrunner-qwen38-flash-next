@@ -133,15 +133,28 @@ class TTEngine(Engine):
         # single steps, which is slower, so k=2 is the useful setting until
         # allocating during a second capture is safe.
         #
-        # The region is *not* enlarged for it. Four captures wanted over 253 MB,
-        # but one wants about 63, which fits the 128 MB default -- and enlarging
-        # it to 384 MB is the one difference left between this engine and the
-        # standalone harness that captures the same graph successfully
-        # (scripts/dev/traced_step_n_check.py, and on a worker thread in
-        # traced_step_n_thread.py). With a small region the capture failed
-        # cleanly; with a large one it hung. Leave it alone and let a capture
-        # that does not fit say so.
-        self._widths = [speculate] if speculate else []
+        # `speculate` is how many tokens one verify *feeds*, so it drafts
+        # `speculate - 1`. Getting that backwards is expensive: at speculate=2
+        # the draft is a single token, the drafter fires on nearly every round
+        # because one following token is easy to find, and each failure pays a
+        # verify plus a replay -- measured 492 ms a token against a 240 ms
+        # baseline. The offline pricing's k is the *drafted* count, so its k=8
+        # is speculate=9.
+        #
+        # A capture per replay width: the verify needs `speculate`, and a partial
+        # acceptance replays 1..speculate-1. Powers of two plus the verify width
+        # cover any prefix by composition, so a replay of 5 is 4 then 1.
+        # Concurrent captures are fine -- a second live trace was measured not to
+        # slow the first one's replay at all (236.1 vs 236.3 ms) -- but they are
+        # large, so the region is sized for them here, before the mesh opens.
+        self._widths = (
+            sorted({w for w in (2, 4, 8, 16) if w < speculate} | {speculate})
+            if speculate else []
+        )
+        if self._widths:
+            trace_region_bytes = max(
+                trace_region_bytes, (len(self._widths) + 1) * (128 << 20)
+            )
         # The trace region has to be reserved at open time; a decode step records
         # on the order of 5 000 ops, so it needs real space.
         self.mesh = ttnn.open_mesh_device(
@@ -272,10 +285,25 @@ class TTEngine(Engine):
         # capture region, landing on memory the recorded graph depends on.
         # TracedDecoder now runs them before capturing. Above batch 48 the gain is
         # ~1 %, so capture is not worth its memory there.
-        # Prompt-lookup speculation: draft the `speculate` tokens that followed
-        # the last earlier occurrence of the last few, verify them all in one
-        # `step_n`, and keep the prefix that agrees. Greedy acceptance, so the
-        # output is *identical* to not speculating, not merely close.
+        # Prompt-lookup speculation: draft the tokens that followed the last
+        # earlier occurrence of the last few, verify them all in one `step_n`,
+        # and keep the prefix that agrees.
+        #
+        # **Not** identical to decoding one token at a time, despite greedy
+        # acceptance. Greedy acceptance is exact only if the verifier and the
+        # stepper agree bit for bit, and they do not: `step_n` computes row i's
+        # logits in a k-row batch where `step` computes them in a 1-row batch,
+        # and bf16 rounding differs in the last bits. `step_n_check.py` reports
+        # 0.00 % on the hidden state, but that is a rounded maximum, and argmax
+        # amplifies whatever is left -- measured divergence from the sequential
+        # stream at token 29 on one prompt and 39 on another.
+        #
+        # Every emitted token is still the argmax of the verifier's own logits,
+        # so this is *a* greedy decode, just not the same one. On a model where
+        # two correct implementations already disagree on half their greedy
+        # tokens (see docs/iterations/014), that is a caveat rather than a
+        # defect -- but it is not what "exact" promises, so it is off by default
+        # and says so.
         #
         # Measured (scripts/dev/ngram_accept_rate.py, with the rollback and the
         # replay of the accepted prefix both paid for):
@@ -298,40 +326,28 @@ class TTEngine(Engine):
                     "chunked prefill and speculation both want the device's one "
                     "trace slot; enable one or the other"
                 )
-            # Refused, and not for performance: capturing the `step_n` graph
-            # inside this engine hangs the device thread, and the boards come
-            # back only after `tt-smi -r`. It has done so four times. A flag
-            # that bricks the accelerators is worse than no flag.
-            #
-            # The same capture standalone is fine -- `traced_step_n_check.py`
-            # measures it at 255 ms for k=2, and `traced_step_n_thread.py` does
-            # it on a worker thread -- so it is the engine's context, not the
-            # capture. Six candidate causes have been ruled out by experiment;
-            # `docs/iterations/016` lists them so the next attempt starts from
-            # what is left rather than from the top.
-            #
-            # Everything else the scheme needs is built and verified: `step_n`
-            # is exact, `TracedStepN` is 1.85x at k=2, `snapshot`/`restore` roll
-            # a rejected draft back identically, the drafter and accept rule are
-            # unit-tested, and the offline pricing says 1.70-2.14x on prompts
-            # that quote their context.
-            raise NotImplementedError(
-                "speculation is built and verified but not wired: capturing "
-                "step_n inside the engine hangs the device and needs tt-smi -r. "
-                "See docs/iterations/016 for the six causes already excluded, "
-                "and scripts/dev/traced_step_n_check.py for the standalone "
-                "measurement."
+            if not 2 <= speculate <= 17:
+                raise ValueError(
+                    f"speculate is the tokens fed per verify, 2..17 (it drafts "
+                    f"speculate - 1); got {speculate}"
+                )
+            print(
+                "[tt] speculation is experimental: its output is a valid greedy "
+                "decode but not the same one as stepping token by token, and it "
+                "is not yet faster in this engine. See docs/iterations/016."
             )
             if self.model.use_indexer:
                 raise NotImplementedError(
                     "step_n does not carry the QSA selection yet, so speculation "
                     "and a context in (2048, 65536] cannot both be on"
                 )
-        self._use_trace = (
-            use_trace and max_concurrency < 48
-            and not self._chunked_prefill and not self._speculate
-        )
+        self._use_trace = use_trace and max_concurrency < 48 and not self._chunked_prefill
         self._decoder = None
+        # Captured traces this engine owns, so `close` can release them. Closing
+        # the mesh with a trace still registered leaves the devices in a state
+        # where the *next* engine in the same process hangs on its own capture --
+        # which is what made speculation look unfixable for four board resets.
+        self._verifiers: dict[int, object] = {}
         self._admit: queue.SimpleQueue = queue.SimpleQueue()
         self._shutdown = threading.Event()
         self._worker = threading.Thread(target=self._device_loop, name="tt-device", daemon=True)
@@ -407,8 +423,13 @@ class TTEngine(Engine):
 
                 for width in widths:
                     verifiers[width] = TracedStepN(self.model, state, width)
-                # rewind what the warmups and the capture consumed
-                for st_ in state.layers:
+                self._verifiers = verifiers
+                if self._decoder is not None:
+                    self._decoder.reset()
+                # rewind what the warmups and the capture consumed. The
+                # decoder's own reset does this too, so it runs only when there
+                # is no decoder.
+                for st_ in ([] if self._decoder is not None else state.layers):
                     for name in ("recurrent", "conv", "ple_conv", "keys", "values"):
                         buf = getattr(st_, name)
                         if buf is None:
@@ -439,6 +460,9 @@ class TTEngine(Engine):
         # trace) every time a request arrives or finishes.
         FILLER = 0
 
+        # one set of snapshot buffers, reused every round
+        snap_buf: dict = {}
+
         def speculate_round(seq: "_Sequence | None") -> bool:
             """Try one draft-and-verify round. False if it does not apply.
 
@@ -464,7 +488,8 @@ class TTEngine(Engine):
 
             # Row i predicts the token that follows feed[i], so rows 0..k-2 are
             # predictions of the draft and row k-1 is a genuinely new token.
-            snap = self.model.snapshot(state)
+            snap = self.model.snapshot(state, into=snap_buf.get("s"))
+            snap_buf["s"] = snap
             try:
                 verified = self.model.greedy_tokens(verifiers[k].step_n(feed))[:k]
             except Exception as exc:
@@ -694,4 +719,16 @@ class TTEngine(Engine):
 
         self._shutdown.set()
         self._worker.join(timeout=5)
+        # Release every capture before closing the mesh. Closing it with a trace
+        # still registered does not fail here -- it fails later, in whatever
+        # opens the devices next, and it fails as a hang rather than an error.
+        for trace in (self._decoder, *self._verifiers.values()):
+            if trace is None:
+                continue
+            try:
+                trace.release()
+            except Exception as exc:
+                print(f"[tt] releasing a trace failed: {exc}")
+        self._decoder = None
+        self._verifiers = {}
         ttnn.close_mesh_device(self.mesh)

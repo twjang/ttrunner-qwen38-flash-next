@@ -52,18 +52,30 @@ PROMPTS = {
 async def run(engine, text):
     ids = engine.encode(text)
     t0 = time.perf_counter()
+    first = None
     out = []
     async for ev in engine.generate(
         GenerationRequest(prompt_token_ids=ids, max_tokens=N, temperature=0.0)
     ):
         if ev.token_id >= 0:
+            if first is None:
+                first = time.perf_counter()
             out.append(ev.token_id)
-    return out, time.perf_counter() - t0
+    total = time.perf_counter() - t0
+    # Generation rate, excluding prompt ingestion -- which dominates the total
+    # and is not what speculation changes.
+    gen = (time.perf_counter() - first) / max(len(out) - 1, 1) if first else 0.0
+    return out, total, gen
 
 
 async def main():
     results = {}
-    for spec in (0, K):
+    # ONLY=2 runs just the speculating engine, so a single engine exists in the
+    # process. Two engines in one process was a confound worth removing: the
+    # first one's captures used to leak (TTEngine.close now releases them).
+    only = os.environ.get("TWTEST_SPEC_ONLY")
+    specs = (int(only),) if only else (0, K)
+    for spec in specs:
         engine = TTEngine(
             cache_dir=CACHE, gguf_dir=GGUF, tokenizer_path=TOKENIZER,
             max_concurrency=1, max_seq_len=2048,
@@ -73,22 +85,28 @@ async def main():
         )
         try:
             for label, text in PROMPTS.items():
-                toks, dt = await run(engine, text)
-                results[(spec, label)] = (toks, dt)
+                toks, dt, gen = await run(engine, text)
+                results[(spec, label)] = (toks, dt, gen)
                 print(
-                    f"RESULT speculate={spec} [{label}] {len(toks)} tokens in {dt:6.2f}s "
-                    f"({1000 * dt / max(len(toks), 1):6.1f} ms/token)",
+                    f"RESULT speculate={spec} [{label}] {len(toks)} tokens, "
+                    f"total {dt:6.2f}s, generation {1000 * gen:6.1f} ms/token",
                     flush=True,
                 )
+                # printed so two *separate* processes can be compared: two
+                # engines in one process still hang, so exactness is checked
+                # across runs
+                print(f"RESULT TOKENS {spec} {label} {toks}", flush=True)
         finally:
             await engine.close()
 
+    if len(specs) < 2:
+        return
     for label in PROMPTS:
-        base, base_t = results[(0, label)]
-        spec, spec_t = results[(K, label)]
+        base, base_t, base_g = results[(0, label)]
+        spec, spec_t, spec_g = results[(K, label)]
         print(
             f"RESULT [{label}] identical: {'YES' if base == spec else 'NO'}   "
-            f"speedup {base_t / spec_t:5.2f}x",
+            f"generation {base_g / spec_g:5.2f}x   total {base_t / spec_t:5.2f}x",
             flush=True,
         )
         if base != spec:

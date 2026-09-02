@@ -1372,7 +1372,7 @@ class TTModel:
     def new_state(self, batch: int = 1) -> TTState:
         return TTState(self.cfg.num_layers, batch)
 
-    def snapshot(self, state: TTState) -> dict:
+    def snapshot(self, state: TTState, into: dict | None = None) -> dict:
         """Copy everything a single-sequence state carries, for a later rewind.
 
         Speculation needs this and a transformer does not: verifying k drafts
@@ -1390,22 +1390,33 @@ class TTModel:
         if state.batch != 1:
             raise NotImplementedError("snapshot is single-sequence")
 
-        def copy(t):
-            out = ttnn.zeros(list(t.shape), dtype=t.dtype, layout=t.layout, device=self.mesh)
-            ttnn.copy(t, out)
-            return out
+        # Pass a previous snapshot back as `into` to reuse its buffers. A
+        # speculative round snapshots every time, and allocating ~200 tensors
+        # per round is both slow and an allocation while a trace is live, which
+        # is the thing this file keeps warning about.
+        reuse = into is not None
+
+        def take(t, dst):
+            if dst is None:
+                dst = ttnn.zeros(list(t.shape), dtype=t.dtype, layout=t.layout, device=self.mesh)
+            ttnn.copy(t, dst)
+            return dst
 
         layers = []
-        for st in state.layers:
-            layers.append(
-                {
-                    "recurrent": None if st.recurrent is None else copy(st.recurrent),
-                    "conv": None if st.conv is None else [copy(c) for c in st.conv],
-                    "ple_conv": None if st.ple_conv is None else [copy(c) for c in st.ple_conv],
-                    "conv_step": st.conv_step,
-                    "ple_step": st.ple_step,
-                }
+        for i, st in enumerate(state.layers):
+            prev = into["layers"][i] if reuse else {}
+            entry = {"conv_step": st.conv_step, "ple_step": st.ple_step}
+            entry["recurrent"] = (
+                None if st.recurrent is None else take(st.recurrent, prev.get("recurrent"))
             )
+            for name in ("conv", "ple_conv"):
+                src = getattr(st, name)
+                if src is None:
+                    entry[name] = None
+                    continue
+                held = prev.get(name) or [None] * len(src)
+                entry[name] = [take(c, held[j]) for j, c in enumerate(src)]
+            layers.append(entry)
         return {
             "layers": layers,
             "positions": list(state.positions),

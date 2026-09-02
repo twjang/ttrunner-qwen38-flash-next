@@ -294,51 +294,45 @@ prefix of the k tokens needs a state snapshot -- or a replay, which the numbers
 above make affordable.
 
 
-### 5.6 Speculation — built and verified, one step from working
+### 5.6 Speculation — runs, but neither exact nor faster yet
 
-Everything the scheme needs exists and is verified on its own
-(`docs/iterations/016`):
+Built end to end and opt-in via `TTEngine(speculate=k)`, where k is the tokens a
+verify *feeds* and it drafts `k - 1`. `docs/iterations/016` has the whole
+iteration. Two findings there matter more than the code:
 
-| piece | state |
-|---|---|
-| `TTModel.step_n` | reproduces k sequential steps **exactly** (0.00 %) |
-| `TracedStepN` | 255 ms at k=2 against 472 for two traced steps; matches eager |
-| `snapshot` / `restore` | a discarded draft rolls back token-for-identically |
-| `prompt_lookup_draft`, `accepted_prefix` | unit-tested |
-| the accept loop in `_device_loop` | written, greedy, exact by construction |
-| offline pricing | **1.70-2.14x** on prompts that quote their context; 0.95-1.00x on open prose |
+**It is not identical to token-by-token decoding**, despite greedy acceptance.
+The verifier batches k rows where the stepper runs one, bf16 rounding differs in
+the last bits, and argmax amplifies it -- measured divergence at token 29 and 39.
+Every emitted token is still the argmax of the verifier's own logits, so it is
+*a* greedy decode, not the same one. Do not repeat the "exact by construction"
+claim; it is standard and it is wrong here.
 
-`TTEngine(speculate=k)` **raises**, and not for performance: capturing the
-`step_n` graph inside the engine's device thread hangs it, and the boards come
-back only after `tt-smi -r`. Three times. The same capture standalone is fine --
-`scripts/dev/traced_step_n_check.py` -- so it is the capture *in that context*,
-not the capture.
+**It is not yet faster.** Generation-only, against a 240 ms baseline:
 
-**Start here, and start from what is already excluded.** `docs/iterations/016`
-has a table of six candidate causes, each tested and ruled out: the post-capture
-rewind, two live captures, a ladder of captures, capturing off the main thread,
-the enlarged trace region, and the single-token graph allocating after the
-capture. Do not re-run those.
+| `speculate` | drafted | copy-heavy | open prose |
+|---|---|---|---|
+| 2 | 1 | 414.6 ms/tok | 492.3 ms/tok |
+| 9 | 8 | 253.9 ms/tok | 507.9 ms/tok |
 
-What is left to try: a different `cq_id` for the capture, since the engine and
-the harness may differ in which command queue is idle; bisecting the engine's
-construction by building a `TTEngine` and then capturing from a script rather
-than from inside `_device_loop`; and instrumenting which allocation raises the
-warning, which names no tensor today.
+Open prose is 2.1x worse than baseline while drafting *less* often than
+copy-heavy, which is backwards from any drafting-cost model -- so the overhead is
+not in the drafter, and where it is remains unknown.
 
-Four board resets went into the eliminations. Expect to need `tt-smi -r`, check
-`ps` for a python holding the cards first, and never `kill -9` a process
-mid-capture -- that wedges them on its own.
+**Start with instrumentation, not another design.** Count drafted versus plain
+rounds in `_device_loop` and time each. Everything so far has been inferred from
+end-to-end rates, which is how the `speculate` semantics went unnoticed for a
+whole measurement cycle.
 
-Then, in order: make allocating during a second capture safe (which unlocks the
-width ladder, and with it partial acceptance and larger k), carry the QSA
-selection through `step_n` (`_attention_step_n` reads per row, so there is room
-for a per-row mask), and only then MTP -- whose value is that it drafts on *every*
-position rather than only where the context repeats, which is exactly what
-limits prompt-lookup on open prose.
+Verified independently and worth keeping: `step_n` reproduces k sequential steps
+(0.00 % on the hidden), `TracedStepN` replays at 255 ms for k=2 against 472 for
+two traced steps, `snapshot`/`restore` roll a discarded draft back identically,
+and the drafter and accept rule are unit-tested. Offline pricing says
+1.70-2.14x on prompts that quote their context, so the ceiling is real.
 
-Done when: `speculation_check.py` reports identical output *and* a speedup on the
-copy-heavy prompt.
+**One engine per process.** A second `TTEngine` built after closing the first
+hangs on its own capture -- an engine-lifecycle bug, not a speculation one, and
+it blocks anything that opens a mesh twice. `close` now releases its captured
+traces, which was part of it but not all.
 
 
 ### 5.7 Fewer launches — and what it is actually worth

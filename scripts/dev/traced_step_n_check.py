@@ -42,9 +42,27 @@ for _ in range(10):
     runs.append(time.perf_counter() - t0)
 runs.sort()
 step_ms = 1000 * runs[len(runs) // 2]
-print(f"RESULT traced step {step_ms:.1f} ms", flush=True)
+print(f"RESULT traced step {step_ms:.1f} ms (only trace live)", flush=True)
+
+# Does a second live capture slow the first one's replay? The engine keeps both
+# -- a decoder for ordinary rounds and a step_n for verification -- and its
+# ordinary rounds measured about twice the baseline even on a workload where the
+# drafter almost never fires.
+tr2 = TracedStepN(m, st, KS[0])
+ttnn.synchronize_device(mesh)
+runs = []
+for _ in range(10):
+    t0 = time.perf_counter()
+    dec.step([1000])
+    ttnn.synchronize_device(mesh)
+    runs.append(time.perf_counter() - t0)
+runs.sort()
+both_ms = 1000 * runs[len(runs) // 2]
+print(f"RESULT traced step {both_ms:.1f} ms (step_n capture also live)  "
+      f"ratio {both_ms / step_ms:.2f}x", flush=True)
+tr2.release()
 dec.release()
-del st, dec
+del st, dec, tr2
 
 for k in KS:
     draft = prompt[PRE : PRE + k]
