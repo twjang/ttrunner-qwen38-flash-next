@@ -308,10 +308,10 @@ as the fallback. And a misaligned start is *silent*, not an error: at
 q_chunk_size=128 a start of 32 returns 257 % nonsense.
 
 **What is left is step 5 alone: the capture -- and it is blocked by 5.6's
-defect, which is the same defect.** Replaying two traces of *different program
-counts* alternately hangs this ttnn build; see 5.6 for the mechanism in
-tt-metal's own source. A prefill chunk and a decode step differ in program count
-by construction, so this is not something the graph can be shaped around. A traced prefill would alternate
+defect, which is the same defect.** Alternating two distinct model-scale traces
+hangs this ttnn build, and a traced prefill would alternate with the traced
+decode step exactly as a traced verifier does. See 5.6; the mechanism is *not*
+settled, so do not design around a particular one. A traced prefill would alternate
 with the traced decode step exactly as a traced verifier does, so it cannot work
 until that is fixed upstream.
 
@@ -486,46 +486,39 @@ stops blocking, returning `[201058, 0]` where the eager `step_n` returns
 tokens with a 9.6 ms verify. It was briefly committed as the fix on the evidence
 that the hang stopped; do not repeat that.
 
-**The mechanism, from tt-metal's own source and confirmed by experiment.**
-`FDMeshCommandQueue::enqueue_trace` ends with
-`trace_dispatch::update_worker_state_post_trace_execution`, which **sets** --
-not increments -- the host launch-message write pointer to *that trace's*
-program count:
+**A mechanism that looked established and is not.** `FDMeshCommandQueue::enqueue_trace`
+ends with `trace_dispatch::update_worker_state_post_trace_execution`, which
+**sets** -- not increments -- the host launch-message write pointer to *that
+trace's* program count, while capture (`record_begin` ->
+`reset_host_dispatch_state_for_trace`) zeroes it. That reads like an exact
+explanation: each trace is recorded against a zeroed pointer and leaves it at
+its own count, so alternating two traces of different sizes desynchronises host
+and workers and the dispatcher waits forever.
 
-    worker_launch_message_buffer_state[index].set_mcast_wptr(
-        desc.num_traced_programs_needing_go_signal_multicast);
+It predicted correctly once -- `spec_capture_ladder.py two_same` captures one
+graph twice, identical counts, and alternates A/B/A cleanly where `two_stepn`
+(k=2 against k=4) hangs -- **and that control is confounded**: two captures of
+the same graph share their program count *and* their kernel binaries, so it
+cannot separate the two. `scripts/dev/repro_trace_program_count.py` then
+alternates tiny traces of 2 and 5 programs with no trouble at all. Program count
+alone is therefore not the trigger, and binary residency is the obvious
+untested alternative.
 
-while capture (`record_begin` -> `reset_host_dispatch_state_for_trace`) resets it
-to 0, on the stated assumption that "every time trace runs on device, it will
-ensure that the workers reset their rptr to be in sync with device". Alternate
-two traces whose program counts differ and host and worker pointers end up
-desynchronised, so the dispatcher waits for a go signal that never matches.
+**What is actually established**, and all of it at model scale:
 
-The falsifiable prediction that follows -- two traces with the *same* program
-count should alternate fine -- holds: `spec_capture_ladder.py two_same` captures
-one graph twice and replays A, B, A cleanly, where `two_stepn` (k=2 and k=4)
-hangs. So it is not "two traces"; it is **two traces of different sizes**.
+* replaying one trace repeatedly is fine, however many times;
+* replaying a second trace *alone* after capturing both is fine;
+* alternating two *distinct* model-scale traces hangs in `ttnn.execute_trace`;
+* alternating two captures of the *same* model-scale graph does not;
+* tiny traces do not reproduce any of it, so the defect needs scale.
 
-That also says it cannot be worked around by construction here. A decode step, a
-`step_n` verifier and a prefill chunk have inherently different program counts,
-and padding them to match is neither possible nor sane.
-
-**Three workarounds excluded by experiment, so they are not re-tried:**
-
-1. `ttnn.synchronize_device` between the replays -- no effect. Both
-   `execute_trace` calls already pass `blocking=True`, and with no `cq_id` the
-   sync waits on every queue.
-2. A second command queue -- stops the hang and is *worse*: the replay does not
-   execute, it merely stops blocking, returning `[201058, 0]` where the eager
-   `step_n` returns `[75, 220]`.
-3. An ordinary (non-trace) program between the replays, on the theory that
-   normal dispatch maintains the pointers the trace path leaves stale -- still
-   hangs (`TWTEST_EAGER_BETWEEN=1` on the ladder).
-
-**Next step is upstream, and the report is now specific**: the two functions
-above, in `tt_metal/impl/trace/dispatch.cpp`, with a sixty-line reproduction and
-a control that isolates the variable. It is worth more than one item -- the same
-fix lands 5.2's traced prefill, since that alternates a prefill replay with the
+**Next step is upstream.** The report must carry the model-scale harness
+(`spec_capture_ladder.py`, stages `both_replay` and `two_stepn`, with `two_same`
+and `stepn_only` as controls) rather than a tidy standalone script, because the
+standalone one does not reproduce it. Point at
+`update_worker_state_post_trace_execution` as a *suspect*, with the caveat above
+-- do not present it as the cause. It is worth more than one item: the same fix
+lands 5.2's traced prefill, since that alternates a prefill replay with the
 decode step's. Until then the flag stays refused, because it takes the boards
 with it.
 

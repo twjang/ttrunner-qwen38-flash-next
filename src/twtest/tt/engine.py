@@ -356,8 +356,11 @@ class TTEngine(Engine):
             # A second command queue therefore trades the hang for silent
             # corruption, which is worse, and is not taken. Nor is it a missing
             # sync: `synchronize_device` with no cq_id already waits on every
-            # queue, and inserting one changes nothing. See
-            # docs/iterations/018.
+            # queue, and inserting one changes nothing. Nor an intervening eager
+            # program. The mechanism is *not* settled -- a program-count
+            # mismatch fits the model-scale evidence but tiny traces of
+            # differing counts alternate fine, so binary residency is as likely.
+            # See docs/iterations/018.
             #
             # Everything else the scheme needs is built and verified on its own.
             # It is also *not* identical to stepping token by token -- the

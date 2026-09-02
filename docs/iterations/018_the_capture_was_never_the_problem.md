@@ -94,7 +94,7 @@ returning whatever the buffers last held -- the same signature the
 second-command-queue experiment produced above. Two items that looked like
 separate mysteries are one defect, and one upstream fix closes both.
 
-## Observation 5 — the mechanism, in tt-metal's source
+## Observation 5 — a mechanism from the source, and how it failed
 
 Reading the vendor's code beat guessing at it, which the earlier rungs had been
 doing. `FDMeshCommandQueue::enqueue_trace` finishes with
@@ -105,27 +105,49 @@ program count rather than advancing it:
     worker_launch_message_buffer_state[index].set_mcast_wptr(
         desc.num_traced_programs_needing_go_signal_multicast);
 
-Capture does the mirror of it: `record_begin` calls
+Capture does the mirror: `record_begin` calls
 `reset_host_dispatch_state_for_trace`, which zeroes the same pointer, commenting
 that "every time trace runs on device, it will ensure that the workers reset
 their rptr to be in sync with device".
 
 So each trace is recorded against a zeroed pointer and leaves it at its own
-program count. Alternate two traces of different sizes and the host's pointer
-and the workers' read pointer disagree; the dispatcher waits on a go signal that
-never matches. A hang, with no error, exactly where the stack dump pointed.
+count. Alternate two traces of different sizes and the host's pointer and the
+workers' read pointer disagree; the dispatcher waits on a go signal that never
+matches. It explains the hang exactly, in the right place, with no error.
 
-**The prediction, and the test.** If size is the variable, two traces with
-*equal* program counts should alternate happily. `spec_capture_ladder.py
-two_same` captures the same graph twice -- two distinct trace ids, identical
-counts -- and replays A, B, A cleanly, where `two_stepn` at k=2 and k=4 hangs.
-Confirmed.
+**And it is not established.** The prediction -- equal program counts should
+alternate happily -- came back true at model scale: `spec_capture_ladder.py
+two_same` captures one graph twice and replays A, B, A cleanly where `two_stepn`
+at k=2 and k=4 hangs. That was written up as confirmation. It is not:
+two captures of the *same* graph share their program count **and** their kernel
+binaries, so the control cannot separate those. Building the tidy standalone
+reproduction settled it the other way --
+`scripts/dev/repro_trace_program_count.py` alternates tiny traces of 2 and 5
+programs without trouble.
 
-It is therefore not "two traces". It is **two traces of different sizes**, and
-no arrangement of this model's graphs avoids that: a decode step, a `step_n`
-verifier and a prefill chunk differ in program count by construction.
+So program count alone is not the trigger; binary residency is the obvious
+untested alternative; and the defect needs scale, since nothing small
+reproduces it at all.
 
-## Where it leaves 5.6
+## What is actually established
+
+* Replaying one trace repeatedly is fine, however many times.
+* Replaying a second trace *alone*, after capturing both, is fine.
+* Alternating two **distinct model-scale** traces hangs in `ttnn.execute_trace`.
+* Alternating two captures of the **same** model-scale graph does not.
+* Tiny traces do not reproduce any of it.
+
+Three workarounds are excluded: a device sync, a second command queue (which
+trades the hang for a silently wrong replay), and an intervening eager program.
+
+## The second lesson, which is the same as the first
+
+Observation 3 says "it stopped failing" is not "it works". This section is the
+same error one level up: a mechanism that explains the symptom, plus one
+confirming test, was written up as established -- and the test had a confound
+sitting in plain view. A prediction is only worth what its control isolates.
+
+## Where it leaves 5.6## Where it leaves 5.6
 
 Still refused, but for a stated and reproducible reason instead of a mystery, and
 the reproduction is sixty lines with no engine, no asyncio and no admission loop
