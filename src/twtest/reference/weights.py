@@ -146,6 +146,8 @@ class WeightStore:
                        + np.arange(row_bytes, dtype=np.int64)[None, :])
             gathered = np.frombuffer(raw, dtype=np.uint8)[offsets].reshape(-1)
             flat = dequantize(memoryview(gathered.tobytes()), info.ggml_type, unique.size * row_elems)
+            if self.quant_sim is not None:
+                flat = self.quant_sim(name, flat)
             block = self._to_torch(flat, (unique.size, *tail))
             return block.index_select(0, torch.from_numpy(inverse.astype(np.int64)))
 
@@ -162,9 +164,16 @@ class WeightStore:
                 continue
             self.row_misses += 1
             start = int(r) * row_bytes
-            row = self._to_torch(
-                dequantize(raw[start : start + row_bytes], info.ggml_type, row_elems), tail
-            )
+            flat = dequantize(raw[start : start + row_bytes], info.ggml_type, row_elems)
+            # The row path has to honour quant_sim too. It did not, and this is
+            # the path the MoE experts come down -- one row per selected expert
+            # -- so a simulation of the device's numerics left the only
+            # bfloat4_b tensors in the model exact. Block-float quantises in
+            # 16-element blocks along the flattened row, and rows are
+            # contiguous, so doing it per row matches doing it whole.
+            if self.quant_sim is not None:
+                flat = self.quant_sim(name, flat)
+            row = self._to_torch(flat, tail)
             self._remember_row(key, row)
             pieces.append(row)
         return torch.stack(pieces, dim=0)
