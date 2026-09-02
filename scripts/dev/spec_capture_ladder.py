@@ -28,6 +28,14 @@ Stages:
                  traces? If general, the traced chunked prefill in 5.2 is
                  blocked by the same thing, since it would alternate a prefill
                  replay with the decoder's.
+    two_same     two captures of the *same* graph (step_n at the same k), so the
+                 two traces have identical program counts, replayed alternately.
+                 Tests the mechanism the tt-metal source implies: `enqueue_trace`
+                 ends in `update_worker_state_post_trace_execution`, which *sets*
+                 the host launch-message wptr to that trace's program count,
+                 while `record_begin` reset it to 0 for the capture. Two traces
+                 with different counts therefore leave host and worker pointers
+                 desynchronised -- a hang. Equal counts should not.
     verify_cq    the whole point: with both traces live and the decoder replayed
                  in between, does the step_n replay produce the *right tokens*,
                  and how long does it take? "It did not hang" is not a fix -- a
@@ -69,7 +77,7 @@ from twtest.tt.traced import TracedDecoder, TracedStepN
 STAGE = sys.argv[1] if len(sys.argv) > 1 else "snapshot"
 K = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 BUDGET = 420.0
-STAGES = ("baseline", "snapshot", "thread", "no_replay", "both_replay", "stepn_only", "verify_cq", "two_stepn")
+STAGES = ("baseline", "snapshot", "thread", "no_replay", "both_replay", "stepn_only", "verify_cq", "two_stepn", "two_same")
 if STAGE not in STAGES:
     raise SystemExit(f"stage must be one of {STAGES}, got {STAGE}")
 
@@ -196,6 +204,29 @@ def two_stepn():
     b.release()
 
 
+def two_same():
+    """Two captures of one graph: distinct traces, identical program counts."""
+    toks = synthetic_prompt(32)
+    st = m.new_state(batch=1)
+    for t in toks[:8]:
+        m.step([t], st)
+    print(f"RESULT capturing step_n k={K} (first)", flush=True)
+    a = TracedStepN(m, st, K)
+    print(f"RESULT capturing step_n k={K} (second, same graph)", flush=True)
+    b = TracedStepN(m, st, K)
+    print("RESULT both captured; replaying the first", flush=True)
+    a.step_n(toks[8 : 8 + K])
+    print("RESULT replaying the second  <-- the alternation, equal program counts",
+          flush=True)
+    b.step_n(toks[8 + K : 8 + 2 * K])
+    print("RESULT back to the first", flush=True)
+    a.step_n(toks[8 + 2 * K : 8 + 3 * K])
+    print("RESULT alternated cleanly -- equal program counts do NOT hang, so the "
+          "defect is the count mismatch", flush=True)
+    a.release()
+    b.release()
+
+
 def work():
     try:
         if STAGE == "verify_cq":
@@ -204,6 +235,10 @@ def work():
             return
         if STAGE == "two_stepn":
             two_stepn()
+            out["ok"] = True
+            return
+        if STAGE == "two_same":
+            two_same()
             out["ok"] = True
             return
         st = m.new_state(batch=1)

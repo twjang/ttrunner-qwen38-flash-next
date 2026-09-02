@@ -94,6 +94,37 @@ returning whatever the buffers last held -- the same signature the
 second-command-queue experiment produced above. Two items that looked like
 separate mysteries are one defect, and one upstream fix closes both.
 
+## Observation 5 — the mechanism, in tt-metal's source
+
+Reading the vendor's code beat guessing at it, which the earlier rungs had been
+doing. `FDMeshCommandQueue::enqueue_trace` finishes with
+`trace_dispatch::update_worker_state_post_trace_execution`, and that function
+**sets** the host launch-message write pointer to the executed trace's own
+program count rather than advancing it:
+
+    worker_launch_message_buffer_state[index].set_mcast_wptr(
+        desc.num_traced_programs_needing_go_signal_multicast);
+
+Capture does the mirror of it: `record_begin` calls
+`reset_host_dispatch_state_for_trace`, which zeroes the same pointer, commenting
+that "every time trace runs on device, it will ensure that the workers reset
+their rptr to be in sync with device".
+
+So each trace is recorded against a zeroed pointer and leaves it at its own
+program count. Alternate two traces of different sizes and the host's pointer
+and the workers' read pointer disagree; the dispatcher waits on a go signal that
+never matches. A hang, with no error, exactly where the stack dump pointed.
+
+**The prediction, and the test.** If size is the variable, two traces with
+*equal* program counts should alternate happily. `spec_capture_ladder.py
+two_same` captures the same graph twice -- two distinct trace ids, identical
+counts -- and replays A, B, A cleanly, where `two_stepn` at k=2 and k=4 hangs.
+Confirmed.
+
+It is therefore not "two traces". It is **two traces of different sizes**, and
+no arrangement of this model's graphs avoids that: a decode step, a `step_n`
+verifier and a prefill chunk differ in program count by construction.
+
 ## Where it leaves 5.6
 
 Still refused, but for a stated and reproducible reason instead of a mystery, and

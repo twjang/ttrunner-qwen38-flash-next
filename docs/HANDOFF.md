@@ -308,9 +308,10 @@ as the fallback. And a misaligned start is *silent*, not an error: at
 q_chunk_size=128 a start of 32 returns 257 % nonsense.
 
 **What is left is step 5 alone: the capture -- and it is blocked by 5.6's
-defect, which is the same defect.** Replaying two traces *alternately* hangs
-this ttnn build, whichever two: `spec_capture_ladder.py two_stepn` reproduces it
-with two `step_n` graphs and no decoder anywhere. A traced prefill would alternate
+defect, which is the same defect.** Replaying two traces of *different program
+counts* alternately hangs this ttnn build; see 5.6 for the mechanism in
+tt-metal's own source. A prefill chunk and a decode step differ in program count
+by construction, so this is not something the graph can be shaped around. A traced prefill would alternate
 with the traced decode step exactly as a traced verifier does, so it cannot work
 until that is fixed upstream.
 
@@ -485,9 +486,34 @@ stops blocking, returning `[201058, 0]` where the eager `step_n` returns
 tokens with a 9.6 ms verify. It was briefly committed as the fix on the evidence
 that the hang stopped; do not repeat that.
 
-**Next step is upstream, not another workaround.** The reproduction is small
-enough to hand to tt-metal, and it is worth more than one item: the same fix
-lands 5.2's traced prefill, since that alternates a prefill replay with the
+**The mechanism, from tt-metal's own source and confirmed by experiment.**
+`FDMeshCommandQueue::enqueue_trace` ends with
+`trace_dispatch::update_worker_state_post_trace_execution`, which **sets** --
+not increments -- the host launch-message write pointer to *that trace's*
+program count:
+
+    worker_launch_message_buffer_state[index].set_mcast_wptr(
+        desc.num_traced_programs_needing_go_signal_multicast);
+
+while capture (`record_begin` -> `reset_host_dispatch_state_for_trace`) resets it
+to 0, on the stated assumption that "every time trace runs on device, it will
+ensure that the workers reset their rptr to be in sync with device". Alternate
+two traces whose program counts differ and host and worker pointers end up
+desynchronised, so the dispatcher waits for a go signal that never matches.
+
+The falsifiable prediction that follows -- two traces with the *same* program
+count should alternate fine -- holds: `spec_capture_ladder.py two_same` captures
+one graph twice and replays A, B, A cleanly, where `two_stepn` (k=2 and k=4)
+hangs. So it is not "two traces"; it is **two traces of different sizes**.
+
+That also says it cannot be worked around by construction here. A decode step, a
+`step_n` verifier and a prefill chunk have inherently different program counts,
+and padding them to match is neither possible nor sane.
+
+**Next step is upstream, and the report is now specific**: the two functions
+above, in `tt_metal/impl/trace/dispatch.cpp`, with a sixty-line reproduction and
+a control that isolates the variable. It is worth more than one item -- the same
+fix lands 5.2's traced prefill, since that alternates a prefill replay with the
 decode step's. Until then the flag stays refused, because it takes the boards
 with it.
 
