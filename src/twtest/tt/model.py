@@ -939,7 +939,8 @@ class TTModel:
             row = ttnn.slice(hidden, (0, 0, i, 0), (1, 1, i + 1, cfg.hc_hidden_size))
             outs.append(
                 self._ple_step(
-                    row, layer, st, None, histories=[hist], ngram_name=f"ngram_n{i}"
+                    row, layer, st, None, histories=[hist],
+                    ngram_name=f"ngram_n{len(histories)}_{i}",
                 )
             )
         return outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=-2)
@@ -949,12 +950,19 @@ class TTModel:
     ) -> ttnn.Tensor:
         """QSA over `k` consecutive tokens of one sequence.
 
-        The K/V writes go through `paged_update_cache`, one row at a time, so the
-        index stays a tensor and the step stays traceable -- `_attention_chunk`
-        writes with `fill_cache`, which asserts a tile-aligned index and so
-        cannot start at an arbitrary position. The read is the chunk path's:
-        slice the cache to a whole tile and let an explicit additive mask carry
-        both causality among the k rows and the tile padding.
+        The projections and the output gate are per-token and run over all k
+        rows. The attention itself is k `sdpa_decode` calls: all k rows are
+        written to the cache first, then row i reads with `cur_pos = start + i`,
+        which is exactly its causal window and already contains the rows before
+        it.
+
+        Deliberately not the chunk path's single masked
+        `scaled_dot_product_attention`: that slices the cache to `start + k`
+        rounded up to a tile, so its shapes grow with position and a captured
+        trace would only be valid inside the tile it was captured in.
+        `sdpa_decode` takes the position as a tensor, so the graph is fixed --
+        and it is flash-decode rather than a dense read. It also leaves room for
+        the sparse selection, which is per-row and per-position.
         """
         cfg = self.cfg
         hd, n_q, n_kv = cfg.head_dim, cfg.num_attention_heads, cfg.num_kv_heads
@@ -980,21 +988,28 @@ class TTModel:
 
         positions = list(range(start, start + k))
         cos_t, sin_t = self.rope(positions)
-        cos = ttnn.permute(self._input("stepn_cos", cos_t, ttnn.float32), (0, 2, 1, 3))
-        sin = ttnn.permute(self._input("stepn_sin", sin_t, ttnn.float32), (0, 2, 1, 3))
-        q = self._apply_rope_dev(ttnn.permute(q, (0, 2, 1, 3)), cos, sin)
-        kr = self._apply_rope_dev(ttnn.permute(kt, (0, 2, 1, 3)), cos, sin)
+        # Names carry k: one capture per k, and their bound buffers differ in
+        # shape, so sharing a name would hand a k=4 host tensor to a k=2 buffer.
+        cos = self._input(f"stepn{k}_cos", cos_t, ttnn.float32)
+        sin = self._input(f"stepn{k}_sin", sin_t, ttnn.float32)
+        q = self._apply_rope_dev(q, cos, sin)
+        kr = self._apply_rope_dev(kt, cos, sin)
 
         if st.keys is None:
             shape = (1, n_kv, self.max_seq_len, hd)
             st.keys = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
             st.values = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
+
+        # every row is written before any is read, so row i's window already
+        # contains rows 0..i
+        idxs = []
         for i, pos in enumerate(positions):
             idx = self._input(
-                f"stepn_pos{i}", torch.tensor([pos], dtype=torch.int32), ttnn.int32,
+                f"stepn{k}_pos{i}", torch.tensor([pos], dtype=torch.int32), ttnn.int32,
                 layout=ttnn.ROW_MAJOR_LAYOUT,
             )
-            k_row = ttnn.reshape(ttnn.slice(kr, (0, 0, i, 0), (1, n_kv, i + 1, hd)), (1, 1, n_kv, hd))
+            idxs.append(idx)
+            k_row = ttnn.reshape(ttnn.slice(kr, (0, i, 0, 0), (1, i + 1, n_kv, hd)), (1, 1, n_kv, hd))
             v_row = ttnn.reshape(ttnn.slice(vt, (0, i, 0, 0), (1, i + 1, n_kv, hd)), (1, 1, n_kv, hd))
             ttnn.experimental.paged_update_cache(
                 st.keys, self._l1_height_sharded(ttnn.typecast(k_row, ttnn.bfloat16), hd),
@@ -1005,28 +1020,25 @@ class TTModel:
                 update_idxs_tensor=idx,
             )
 
-        total = start + k
-        kv_len = min(-(-total // ttnn.TILE_SIZE) * ttnn.TILE_SIZE, self.max_seq_len)
-        groups = n_q // n_kv
-        keys = ttnn.repeat_interleave(
-            ttnn.slice(st.keys, (0, 0, 0, 0), (1, n_kv, kv_len, hd)), groups, dim=1
-        )
-        values = ttnn.repeat_interleave(
-            ttnn.slice(st.values, (0, 0, 0, 0), (1, n_kv, kv_len, hd)), groups, dim=1
-        )
-        qpos = torch.arange(k).unsqueeze(-1) + start
-        kpos = torch.arange(kv_len).unsqueeze(0)
-        mask = torch.where(kpos <= qpos, 0.0, float("-inf")).reshape(1, 1, k, kv_len)
-        out = ttnn.transformer.scaled_dot_product_attention(
-            q, keys, values, attn_mask=self._input("stepn_mask", mask, ttnn.bfloat16),
-            is_causal=False, scale=hd**-0.5, compute_kernel_config=HIFI4,
-        )
-        out = ttnn.reshape(ttnn.permute(out, (0, 2, 1, 3)), (1, 1, k, n_q * hd))
+        outs = []
+        for i in range(k):
+            q_row = ttnn.reshape(ttnn.slice(q, (0, i, 0, 0), (1, i + 1, n_q, hd)), (1, 1, n_q, hd))
+            outs.append(
+                ttnn.transformer.scaled_dot_product_attention_decode(
+                    q_row, st.keys, st.values, is_causal=True, cur_pos_tensor=idxs[i],
+                    scale=hd**-0.5, program_config=self.sdpa_program_config,
+                    compute_kernel_config=HIFI4,
+                )
+            )
+        out = outs[0] if k == 1 else ttnn.concat(outs, dim=1)
+
+        out = ttnn.reshape(out, (1, 1, k, n_q * hd))
         gate = ttnn.reshape(gate, (1, 1, k, n_q * hd))
         return ttnn.linear(
             ttnn.multiply(out, ttnn.sigmoid(gate)),
             self.w.blk(layer, "attn_output.weight"), compute_kernel_config=HIFI4,
         )
+
 
     def _ple_step(
         self, hidden: ttnn.Tensor, layer: int, st: LayerState, state: TTState | None,
@@ -1254,6 +1266,15 @@ class TTModel:
             raise NotImplementedError("step_n advances one sequence at a time")
         if not 0 < k <= 64:
             raise ValueError(f"k must be in 1..64 (the batch cliff), got {k}")
+        if self.use_indexer:
+            # `_attention_step_n` reads with `sdpa_decode` per row, which leaves
+            # room for a per-row selection mask, but the selection is not wired
+            # in yet -- and running dense here while `step` runs sparse would make
+            # the two disagree beyond the budget, silently.
+            raise NotImplementedError(
+                "step_n does not carry the QSA selection yet; construct the model "
+                f"with max_seq_len <= {self.cfg.indexer_budget} to use it"
+            )
         start = state.positions[0]
 
         # Each row's PLE n-gram hash reads that row's own history, so the
@@ -1265,7 +1286,7 @@ class TTModel:
             histories.append(list(base))
         state.histories[0] = base
 
-        emb = self._input("embed_n", self.embed(tokens), ttnn.bfloat16)
+        emb = self._input(f"embed_n{k}", self.embed(tokens), ttnn.bfloat16)
         hidden = ttnn.repeat(emb, (1, 1, 1, cfg.hc_count))
 
         for layer in range(cfg.num_layers):

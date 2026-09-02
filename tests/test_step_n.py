@@ -52,11 +52,26 @@ def test_attention_writes_the_cache_one_row_at_a_time() -> None:
     assert "for i, pos in enumerate(positions):" in src
 
 
-def test_attention_masks_causally_among_the_k_rows() -> None:
-    """Row i may see rows 0..i and everything before the chunk, nothing after."""
+def test_attention_reads_per_row_with_a_tensor_position() -> None:
+    """Row i reads with `cur_pos = start + i`, which is its causal window and
+    already contains the rows before it -- every row is written first.
+
+    Not the chunk path's masked `scaled_dot_product_attention`: that slices the
+    cache to `start + k` rounded up to a tile, so its shapes grow with position
+    and a captured trace would only be valid inside one tile."""
     src = inspect.getsource(TTModel._attention_step_n)
-    assert "kpos <= qpos" in src
-    assert "ttnn.TILE_SIZE" in src, "the K/V slice has to be a whole tile"
+    assert "scaled_dot_product_attention_decode" in src
+    assert "cur_pos_tensor=idxs[i]" in src
+    assert "kpos <= qpos" not in src, "no growing mask"
+    assert src.index("paged_update_cache") < src.index("for i in range(k):")
+
+
+def test_step_n_refuses_while_it_lacks_the_sparse_selection() -> None:
+    """Dense here while `step` runs sparse would make the two disagree beyond
+    the budget, silently."""
+    src = inspect.getsource(TTModel.step_n)
+    assert "if self.use_indexer:" in src
+    assert "does not carry the QSA selection yet" in src
 
 
 def test_step_n_is_single_sequence_and_bounded_by_the_batch_cliff() -> None:

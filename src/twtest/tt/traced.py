@@ -34,6 +34,96 @@ import ttnn
 from .model import TTModel, TTState
 
 
+class TracedStepN:
+    """A captured `step_n`: k tokens of one sequence, replayable at any position.
+
+    The single-token trace is what makes decoding fast; this is what makes a
+    speculative *verifier* fast. Without it there is nothing to gain: `step_n`
+    at k=4 costs 864 ms eager against 2071 for four eager steps, but four
+    **traced** steps are 944 ms, so an untraced verifier is already beaten by
+    the thing it is supposed to replace.
+
+    One capture per k -- the graph has k unrolled convolution and recurrence
+    steps in it, so k is a shape, not data. The position is not: rope, the cache
+    indices and the n-gram rows are all bound buffers refreshed before replay,
+    exactly as for the single-token step.
+    """
+
+    def __init__(self, model: TTModel, state: TTState, k: int, warmup_token: int = 1000,
+                 cq_id: int = 0):
+        if state.batch != 1:
+            raise ValueError("step_n is single-sequence, so its trace is too")
+        self.model = model
+        self.state = state
+        self.k = k
+        self.cq_id = cq_id
+
+        if model.bound is None:
+            model.bound = {}
+        model.trace_safe_rings = True
+        warm = [warmup_token] * k
+        # Two real calls first: the buffers and every kernel have to exist
+        # before capture, and the LM head has to be warmed for the same reason
+        # `TracedDecoder` warms it -- a caller reads the logits of the k rows.
+        model.step_n(warm, state)
+        ttnn.synchronize_device(model.mesh)
+        warm_hidden = model.step_n(warm, state)
+        model.logits(warm_hidden)
+        model.greedy_tokens(warm_hidden)
+        ttnn.synchronize_device(model.mesh)
+
+        model._skip_copy = True
+        try:
+            self.trace_id = ttnn.begin_trace_capture(model.mesh, cq_id=cq_id)
+            self.output = model.step_n(warm, state)
+            ttnn.end_trace_capture(model.mesh, self.trace_id, cq_id=cq_id)
+        finally:
+            model._skip_copy = False
+        ttnn.synchronize_device(model.mesh)
+
+    def _fill_inputs(self, tokens: list[int]) -> None:
+        model, state = self.model, self.state
+        bound = model.bound
+        start = state.positions[0]
+
+        def write(name, host, dtype, layout=ttnn.TILE_LAYOUT):
+            buf = bound.get(name)
+            if buf is None:
+                return
+            ttnn.copy_host_to_device_tensor(
+                ttnn.from_torch(host, dtype=dtype, layout=layout, mesh_mapper=model.replicate), buf
+            )
+
+        k = self.k
+        write(f"embed_n{k}", model.embed(tokens), ttnn.bfloat16)
+        positions = list(range(start, start + k))
+        cos, sin = model.rope(positions)
+        write(f"stepn{k}_cos", cos, ttnn.float32)
+        write(f"stepn{k}_sin", sin, ttnn.float32)
+        for i, pos in enumerate(positions):
+            write(f"stepn{k}_pos{i}", torch.tensor([pos], dtype=torch.int32),
+                  ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        # each row's n-gram hash reads the history up to and including its token
+        base = list(state.histories[0])
+        for i, tok in enumerate(tokens):
+            base.append(tok)
+            write(f"ngram_n{k}_{i}", model.ngram_embed([list(base)]), ttnn.bfloat16)
+
+    def step_n(self, tokens: list[int]) -> ttnn.Tensor:
+        """Replay the capture for these k tokens. Returns [1, 1, k, hidden]."""
+        if len(tokens) != self.k:
+            raise ValueError(f"this trace was captured for k={self.k}, got {len(tokens)}")
+        state = self.state
+        self._fill_inputs(tokens)
+        state.histories[0].extend(tokens)
+        ttnn.execute_trace(self.model.mesh, self.trace_id, cq_id=self.cq_id, blocking=True)
+        state.positions = [state.positions[0] + self.k]
+        return self.output
+
+    def release(self) -> None:
+        ttnn.release_trace(self.model.mesh, self.trace_id)
+
+
 class TracedDecoder:
     """A captured decode step, replayable at any position."""
 
