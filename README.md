@@ -79,7 +79,9 @@ directly and the engine checks them against the DRAM budget at construction.
 
 (229 ms before `docs/iterations/014`; the model was wrong then. Fixing the
 DeltaNet head pairing cost 3 ms, and only because `attn_qkv` now carries twelve
-q/k heads per device instead of four.)
+q/k heads per device instead of four. With QSA's sparse selection on -- contexts
+in `(2048, 65536]` -- a step is 297.5 ms at 8192 tokens against 236.1 dense; the
+extra is almost all `ttnn.topk` at k=512, see `docs/iterations/015`.)
 
 For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
 ~45 ms/token instead of ~500, at the cost of the trace (each generated token
@@ -167,7 +169,16 @@ itself rather than against another implementation
 |---|---|---|---|---|
 | device, decode | **83.0 %** | 97.9 % | 0.682 | 1.98 |
 | device, chunked prefill | 87.5 % | 100 % | 0.335 | 1.40 |
+| device, QSA selection on | 83.0 % | 97.9 % | 0.682 | 1.98 |
 | float32 CPU reference | 80.9 % | 97.9 % | 0.703 | 2.00 |
+
+QSA attends to 2048 *selected* tokens, not to the whole context. The selection
+runs on device and was verified against the reference past the budget --
+exact at a block boundary, one block out mid-block at a score gap of 8.2e-4 --
+and below the budget it is numerically identical to dense, which is what the
+third row shows. It is on for contexts in `(2048, 65536]`; outside that the
+device attends densely, and `TTEngine` prints a notice when that is a fidelity
+caveat rather than an exact simplification. See `docs/iterations/015`.
 
 Agreement *between* implementations is deliberately not the headline: with 512
 experts and top-10 routing any perturbation flips a selection somewhere, so two

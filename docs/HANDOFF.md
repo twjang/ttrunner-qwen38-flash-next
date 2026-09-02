@@ -156,10 +156,12 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
    Compare the mixed hidden or the token. And an additive attention mask in
    TILE_LAYOUT pads with *zeros*, which means "attend to me": slice to a whole
    tile and let the causal condition mask the pad.
-11. **The QSA indexer is not on the device path.** Attention is dense causal in
-   both `step` and `prefill`. Exact below 2048 tokens, *different from the
-   model* beyond. See roadmap A5. Do not claim long-context correctness until
-   this exists.
+11. **QSA attends to selected tokens, not to everything.** The selection is on
+    for `budget < max_seq_len <= 65536` and off outside that -- below the budget
+    dense is exactly right, above 65536 the selection cannot address the cache.
+    Off *and* over the budget means the device is running a different model, and
+    `TTEngine` prints a notice; do not quote a long-context result without
+    checking which regime it came from.
 12. **Verification standard.** A change to the model is done when (a) unit
     tests pass, (b) `device_quality.py` is run and next-token accuracy does not
     regress from 83 %, (c) the number it claims to move is measured with the
@@ -214,76 +216,29 @@ eager result token for token over
 `scripts/dev/prefix_reuse_check.py --chunked --trace`.
 
 
-### 5.3 QSA indexer on device (2-3 days; correctness beyond 2048 tokens)
+### 5.3 QSA indexer on device — **done**
 
-Attention is dense causal in both paths, so the device is exact only below 2048
-tokens -- below the budget QSA retains every complete block, and dense is then
-the same thing. Beyond it the device attends to everything where the model would
-attend to 2048 selected tokens: a different model, and one nobody has measured.
+Attention was dense causal, so the device was exact only below the 2048-token
+budget. The selection now runs on device -- pooled block cache written
+unconditionally, scores relu(q . block) summed over the four indexer heads,
+`topk` over eligible blocks, the trailing partial block appended, and the result
+scattered into an additive mask for `sdpa_decode`. `docs/iterations/015` has the
+design and the three approaches that measurement killed.
 
-**The design is settled and every op it needs was probed on hardware
-(2026-09-02).** Build it as a compact gather, not as a mask:
+Verified against the reference's `_indexer_mask` past the budget: exact at a
+block boundary (2048/2048), and one block out mid-block, at rank 511 against
+rank 512 with a score gap of 8.2e-4 -- below what bf16 resolves. Below the budget
+it is numerically identical to dense. Traced matches eager token for token.
 
-1. Keep the pooled block cache, not the raw keys. Block j's value is
-   `rms_norm(mean(raw_k[4j..4j+4]), k_norm)` roped at position `4j`, and it never
-   changes once complete -- so compute it incrementally and store it already
-   normed and roped: `(batch, 1, max_seq/4, 128)`, 16 MB a layer at full context.
-2. Write it unconditionally, which is what tracing needs: keep the last four raw
-   keys in a shift ring (the mean is order-independent), and every step write
-   `pooled[p // 4] = mean(ring)` roped at `4 * (p // 4)`. At `p % 4 == 3` all
-   four slots belong to block `p // 4`; at other p the value is wrong and the
-   block is ineligible, and it is overwritten before it becomes eligible.
-3. Score with a plain matmul: q is `[1, 4, 1, 128]` after `q_norm` and rope at p,
-   pooled is `[1, 1, 128, n_blocks]`; relu, sum over the four heads, scale by
-   `1/sqrt(128)`. `indexer_score_dsa` also exists but takes its causality offset
-   as a Python int, which a trace bakes in -- see below.
-4. Mask ineligible blocks (`4j + 3 > p`) with an additive tensor built on the
-   host, one per step shared by all twelve layers, then `ttnn.topk(scores, 512)`.
-5. Expand the 512 block indices to 2048 token indices and **gather the K/V**:
-   `ttnn.gather(cache, dim=-2, index=idx)` with `idx` uint32 in TILE_LAYOUT and
-   the output's shape `[b, n_kv, 2048, hd]`. Then `sdpa_decode` over that compact
-   cache with `is_causal=False`. Attention becomes constant-cost in position,
-   which is a bonus.
-6. The tail -- positions `4 * ((p + 1) // 4)` to p -- is always visible; fold it
-   into the selected set before the gather.
+Cost at 8192 context: 297.5 ms traced against 236.1 dense.
 
-Probed on hardware, so do not re-derive:
-
-* `ttnn.topk(x, 512, dim=-1)` works at n = 2048, 8192 **and 65536** (full
-  context). ✓
-* `ttnn.gather(cache, dim=-2, index=...)` needs the index **uint32 in
-  TILE_LAYOUT** and shaped like the output; int32 and ROW_MAJOR both assert. ✓
-* `sdpa_decode`'s `attn_mask` is a dead end. It must carry Q's head count
-  (`Expect same number of heads in mask as in Q`), so at full context that is a
-  12.6 MB mask per layer per step, and `[b, 1, 24, S]` throws at program build
-  anyway.
-* `ttnn.scatter` rejects int32 and uint32 indices and accepts **uint16** -- worth
-  knowing, though the gather design does not need it.
-* `_apply_rope_dev` rotates the leading `rope_dim`=64 dims and passes the rest,
-  so it handles the indexer's 128-wide vectors unchanged.
-* `indexer_score_dsa` computes
-  `sum_h relu(q[b,h,s,:] . k[b,t,:]) * weights[b,h,s]` -- pass
-  `weights = 1/sqrt(128)`, since this model has no learned per-head gate. It
-  scores per-token keys, so feed it the pooled cache with `T = n_blocks`, and its
-  causality is `t <= chunk_start_idx + s`, needing
-  `chunk_start_idx = (p + 1) // 4 - 1`: a Python int, therefore baked into a
-  capture. Either keep the indexer out of the traced region or use the matmul
-  form in (3).
-* Config: `indexer_heads` 4, `indexer_head_dim` 128, `indexer_budget` 2048,
-  `indexer_compress_ratio` 4 -- so 512 blocks of 4, and 65536 blocks at full
-  context.
-
-Read `_indexer_mask` in `reference/model.py` as it is *now*: its tail is
-per-query (`docs/iterations/013`, observation 4).
-
-**Verify it without a full reference forward.** A 3000-token reference forward is
-hours; do not attempt it. Instead: (a) compare the device's selected block set
-against `ref._indexer_mask` on the same inputs at a handful of positions past
-2048 -- the selection is the whole feature; (b) check `device_quality.py` is
-unchanged below 2048, where selection must be a no-op; (c) run
-`device_quality.py` on a >2048-token text and confirm it does not regress.
-
-Done when: (a), (b) and (c) hold and the traced step is within 5 % of 236 ms.
+Two kernel limits, both recorded in 015: `ttnn.scatter` takes uint16 indices, so
+the selection reaches 65536 cache positions; and `ttnn.topk` at k=512 costs
+4.5 ms at 2048 blocks but 157 ms at 65536, so past ~16384 tokens it is
+expensive. It runs for `budget < max_seq_len <= 65536`, and `TTEngine` prints a
+notice when a longer context puts it out of reach -- dense beyond the budget is a
+different model. Lifting either limit is an upstream kernel request: a `topk`
+that scales with k, or a `scatter` that takes a wider index.
 
 
 ### 5.4 Prefix reuse across turns — **done**
