@@ -109,11 +109,16 @@ indexes them.
 Berlin'` — the output `004` validated against llama.cpp — on both paths.
 
 Cost: 239.1 ms traced against 236.3, **+1.2 %**, for 36 all-gathers and 72 small
-matmuls. Fixing the shard layout at conversion time instead would cost nothing
-at runtime and about 200 MB per device: give device d the twelve k/q heads its v
-heads need rather than a contiguous four, and the expansion disappears
-altogether. That is a change to `split_qkv_channels` and to everything keyed to
-v-head order.
+matmuls — and then none, because the shard layout was fixed too. Giving device d
+the twelve k/q heads its v heads pair with, rather than a contiguous four, makes
+the pairing local: v-head i reads k-head i, no expansion, no collective, no
+selection matrix. Same 83.0 % quality, 236.1 ms traced, ~200 MB more per device
+for `attn_qkv`. `convert()` gained a `force` flag for the re-conversion, which
+took under a minute for the 72 affected tensors.
+
+The gather is worth remembering anyway: it is the general answer when a shard
+layout cannot express a pairing, and it took an hour where a re-conversion needs
+a plan change and a rebuild.
 
 ## Observation 5 — chunked prefill was ready as soon as the model was
 

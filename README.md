@@ -73,9 +73,20 @@ directly and the engine checks them against the DRAM budget at construction.
 
 | slots | context | ms/token | ms/step |
 |---|---|---|---|
-| 1 | **262144** | 300.5 | **229** |
+| 1 | **262144** | 300.5 | **236** |
 | 2 | 131072 | 319.0 | — |
 | 3 | 65536 | 323.7 | — |
+
+(229 ms before `docs/iterations/014`; the model was wrong then. Fixing the
+DeltaNet head pairing cost 3 ms, and only because `attn_qkv` now carries twelve
+q/k heads per device instead of four.)
+
+For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
+~45 ms/token instead of ~500, at the cost of the trace (each generated token
+then costs ~513 ms). A 2000-token prompt with 200 output tokens is ~194 s that
+way against ~1047 s traced-and-stepped; short prompts invert it. Prefix reuse
+across chat turns is on unconditionally — a follow-up turn re-feeds only what it
+added, measured 7.49 s to first token cold against 2.07 s warm.
 
 Throughput-oriented configurations (more slots, shorter context):
 

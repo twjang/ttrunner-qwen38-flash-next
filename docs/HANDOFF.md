@@ -178,25 +178,17 @@ remaining correctness gap (long context), and the rest is speed.
 Each has an entry point, a first command, and what "done" means. Estimates are
 for an agent that already has this file loaded.
 
-### 5.1 Fold the head selection into the shard layout (1 day, pure win)
+### 5.1 Fold the head selection into the shard layout — **done**
 
-The decode step all-gathers the sixteen K/Q heads and selects its twelve with a
-fixed matrix, because device d holds k-heads `[4d, 4d+4)` while its v-heads need
-`(12d+i) % 16` (`docs/iterations/014`, observation 4). That costs 36 collectives
-and 72 small matmuls a step, +1.2 %.
+`split_qkv_channels` now gives device d exactly the twelve q/k heads its twelve
+v heads pair with, `(12d + i) % 16`, instead of chunking q/k four ways. The
+pairing is local, so the decode step needs no expansion, no all-gather and no
+selection matrix. Quality unchanged at 83.0 % next-token top-1; the traced step
+is back to 236.1 ms from 239.1; attn_qkv costs ~200 MB more per device.
 
-It is avoidable. Give device d the twelve k/q heads its v heads actually need,
-rather than a contiguous four: change `split_qkv_channels` in `tt/convert.py` so
-the q and k parts are selected by `(n_v_local * d + i) % n_k_global`, and change
-everything keyed to that channel layout with it — `ssm_conv1d`'s q/k channels
-(same Shard.HEAD_QKV_ROW split), and `TTModel.key_dim_local`. The expansion then
-disappears from the step entirely and `head_select` can go.
+`convert(..., force=True)` re-writes tensors already in the manifest, which is
+what any change to the plan or the shard layout needs.
 
-Cost: attn_qkv per device grows from 2560 to 4608 channels, about +200 MB per
-device across 36 layers. Needs a re-conversion of those tensors only.
-
-Done when: `device_quality.py` is unchanged (83 %), `head_select` is gone, and
-the traced step is back to ~236 ms.
 
 ### 5.2 Chunked prefill inside the trace (2-3 days)
 
