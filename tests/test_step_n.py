@@ -96,3 +96,18 @@ def test_the_moe_block_is_shared_with_the_single_token_step() -> None:
     drifted between them is exactly the sort of thing that stays hidden."""
     assert "self._moe_block(mixed, layer)" in inspect.getsource(TTModel._layer)
     assert "self._moe_block(mixed, layer)" in inspect.getsource(TTModel.step_n)
+
+
+def test_the_capture_warms_the_single_token_step_too() -> None:
+    """A caller that speculates still takes ordinary steps -- for a round with no
+    draft, and to replay a rejected one. Those would otherwise allocate the whole
+    48-layer step graph after the capture, which is the trace hazard: the engine
+    hung on its first eager step and the boards needed `tt-smi -r`."""
+    import inspect
+
+    from twtest.tt.traced import TracedStepN
+
+    src = inspect.getsource(TracedStepN.__init__)
+    warm = src[: src.index("begin_trace_capture")]
+    assert "model.step([warmup_token] * state.batch, state)" in warm
+    assert "model.logits(" in warm

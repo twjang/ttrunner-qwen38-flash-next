@@ -133,12 +133,15 @@ class TTEngine(Engine):
         # single steps, which is slower, so k=2 is the useful setting until
         # allocating during a second capture is safe.
         #
-        # The capture is also large -- four of them wanted over 253 MB where the
-        # default region is 128 -- and the region is fixed when the mesh opens,
-        # so it is sized here.
+        # The region is *not* enlarged for it. Four captures wanted over 253 MB,
+        # but one wants about 63, which fits the 128 MB default -- and enlarging
+        # it to 384 MB is the one difference left between this engine and the
+        # standalone harness that captures the same graph successfully
+        # (scripts/dev/traced_step_n_check.py, and on a worker thread in
+        # traced_step_n_thread.py). With a small region the capture failed
+        # cleanly; with a large one it hung. Leave it alone and let a capture
+        # that does not fit say so.
         self._widths = [speculate] if speculate else []
-        if self._widths:
-            trace_region_bytes = max(trace_region_bytes, (len(self._widths) + 1) * (192 << 20))
         # The trace region has to be reserved at open time; a decode step records
         # on the order of 5 000 ops, so it needs real space.
         self.mesh = ttnn.open_mesh_device(
@@ -295,33 +298,29 @@ class TTEngine(Engine):
                     "chunked prefill and speculation both want the device's one "
                     "trace slot; enable one or the other"
                 )
-            # Refused outright, and not for performance: capturing the
-            # `step_n` graph inside this engine hangs the device thread and the
-            # boards come back only after `tt-smi -r`. It happened three times,
-            # with the decoder's trace live and without it, and the warning that
-            # precedes it is
+            # Refused, and not for performance: capturing the `step_n` graph
+            # inside this engine hangs the device thread, and the boards come
+            # back only after `tt-smi -r`. It has done so four times. A flag
+            # that bricks the accelerators is worse than no flag.
             #
-            #   Allocating device buffers is unsafe due to the existence of an
-            #   active trace. These buffers may be corrupted once ...
+            # The same capture standalone is fine -- `traced_step_n_check.py`
+            # measures it at 255 ms for k=2, and `traced_step_n_thread.py` does
+            # it on a worker thread -- so it is the engine's context, not the
+            # capture. Six candidate causes have been ruled out by experiment;
+            # `docs/iterations/016` lists them so the next attempt starts from
+            # what is left rather than from the top.
             #
-            # A flag that bricks the accelerators is worse than no flag, so this
-            # raises rather than tries.
-            #
-            # Everything the scheme needs is built and verified on its own:
-            # `TTModel.step_n` reproduces k sequential steps exactly,
-            # `TracedStepN` replays it at 255 ms for k=2 against 472 for two
-            # traced steps, `snapshot`/`restore` roll a rejected draft back
-            # token-for-identically, and `prompt_lookup_draft` /
-            # `accepted_prefix` are unit-tested. The offline pricing says
-            # 1.70-2.14x on prompts that quote their context. What is missing is
-            # a capture that survives inside the engine's device thread -- see
-            # docs/iterations/016 and HANDOFF 5.6.
+            # Everything else the scheme needs is built and verified: `step_n`
+            # is exact, `TracedStepN` is 1.85x at k=2, `snapshot`/`restore` roll
+            # a rejected draft back identically, the drafter and accept rule are
+            # unit-tested, and the offline pricing says 1.70-2.14x on prompts
+            # that quote their context.
             raise NotImplementedError(
-                "speculation is built but not wired: capturing step_n inside the "
-                "engine hangs the device and needs tt-smi -r to recover. The "
-                "pieces are verified individually -- see docs/iterations/016 for "
-                "what is left and scripts/dev/traced_step_n_check.py for the "
-                "standalone measurement."
+                "speculation is built and verified but not wired: capturing "
+                "step_n inside the engine hangs the device and needs tt-smi -r. "
+                "See docs/iterations/016 for the six causes already excluded, "
+                "and scripts/dev/traced_step_n_check.py for the standalone "
+                "measurement."
             )
             if self.model.use_indexer:
                 raise NotImplementedError(

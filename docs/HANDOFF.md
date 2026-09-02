@@ -314,12 +314,21 @@ back only after `tt-smi -r`. Three times. The same capture standalone is fine --
 `scripts/dev/traced_step_n_check.py` -- so it is the capture *in that context*,
 not the capture.
 
-**Start here.** Reproduce the hang with the smallest possible engine (one slot,
-`max_seq_len=2048`, `speculate=2`) and bisect the three suspects 016 lists: the
-post-capture state rewind that allocates a zeros buffer per ring; two live
-captures; and capturing on the device thread rather than the main one. Try
-capturing `TracedStepN` *before* `TracedDecoder`, and try hoisting the rewind's
-zero buffers to before the capture.
+**Start here, and start from what is already excluded.** `docs/iterations/016`
+has a table of six candidate causes, each tested and ruled out: the post-capture
+rewind, two live captures, a ladder of captures, capturing off the main thread,
+the enlarged trace region, and the single-token graph allocating after the
+capture. Do not re-run those.
+
+What is left to try: a different `cq_id` for the capture, since the engine and
+the harness may differ in which command queue is idle; bisecting the engine's
+construction by building a `TTEngine` and then capturing from a script rather
+than from inside `_device_loop`; and instrumenting which allocation raises the
+warning, which names no tensor today.
+
+Four board resets went into the eliminations. Expect to need `tt-smi -r`, check
+`ps` for a python holding the cards first, and never `kill -9` a process
+mid-capture -- that wedges them on its own.
 
 Then, in order: make allocating during a second capture safe (which unlocks the
 width ladder, and with it partial acceptance and larger k), carry the QSA

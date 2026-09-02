@@ -111,20 +111,33 @@ back only after `tt-smi -r`. That happened three times -- with the decoder's
 trace live and with it off -- always preceded by the warning in Observation 5.
 
 Standalone the same capture is fine: `scripts/dev/traced_step_n_check.py` builds
-a `TracedStepN`, replays it, and measures 255 ms at k=2, with the tokens matching
-eager. So it is something about capturing inside the engine, not about the
-capture itself. The obvious suspects, none yet confirmed:
+a `TracedStepN`, replays it, and measures 255 ms at k=2 with the tokens matching
+eager. So it is the engine's context, not the capture. Six candidate causes were
+each tested and excluded:
 
-* the state rewind after the capture allocates a zeros buffer per ring, which is
-  allocation-after-capture -- though `TracedDecoder.reset` does exactly the same
-  and works;
-* two captures live at once (decoder + step_n), which the warning names -- but
-  the hang reproduced with `use_trace=False`, so that is not sufficient;
-* something in the device thread specifically, since the standalone harness
-  captures on the main thread.
+| candidate | test | result |
+|---|---|---|
+| The post-capture state rewind allocates a zeros buffer per ring | the standalone harness does exactly this | works — **not it** |
+| Two captures live at once (decoder + step_n) | engine forces `use_trace=False` when speculating | still hangs — **not it** |
+| A ladder of captures, several live traces | reduced to one capture | still hangs — **not it** |
+| Capturing off the main thread | `traced_step_n_thread.py` captures and replays on a worker thread | 253.7 ms, works — **not it** |
+| The enlarged trace region (384 MB) starving DRAM | left at the 128 MB default | still hangs — **not it** |
+| The single-token step graph allocating *after* the capture, on the engine's first eager step | `TracedStepN` now warms `model.step` and the LM head before capturing | still hangs — **not it** |
+
+The warmup from the last row was kept regardless: a caller that speculates still
+takes ordinary steps, and letting them allocate the 48-layer graph after a
+capture is the hazard this module's docstring opens with. It is correct whether
+or not it was the cause.
+
+What is left to try, in rough order of promise: capture with `cq_id` other than
+0, since the engine and the harness may differ in which command queue is idle;
+bisect the engine's construction by building a `TTEngine`, then capturing from a
+script rather than from `_device_loop`; and instrument which allocation triggers
+the warning, since it names no tensor.
 
 A flag that bricks the accelerators is worse than no flag, so the constructor
-refuses with a pointer here rather than trying.
+refuses with a pointer here rather than trying. Four board resets went into
+narrowing this down.
 
 ## Where it leaves us
 

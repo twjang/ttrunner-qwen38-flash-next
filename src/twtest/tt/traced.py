@@ -62,7 +62,18 @@ class TracedStepN:
             model.bound = {}
         model.trace_safe_rings = True
         warm = [warmup_token] * k
-        # Two real calls first: the buffers and every kernel have to exist
+        # The *single-token* step first, even though this capture never uses it.
+        # A caller that speculates still falls back to ordinary steps -- for a
+        # round with no draft, and to replay a rejected one -- and those would
+        # otherwise allocate the whole 48-layer step graph *after* this capture,
+        # which is the hazard the module docstring opens with. Left out, the
+        # engine hung on its first eager step and the boards needed `tt-smi -r`;
+        # the standalone harness never noticed because it happens to run plenty
+        # of ordinary steps before capturing.
+        model.step([warmup_token] * state.batch, state)
+        model.logits(model.step([warmup_token] * state.batch, state))
+        ttnn.synchronize_device(model.mesh)
+        # Then two real `step_n` calls: its buffers and kernels have to exist
         # before capture, and the LM head has to be warmed for the same reason
         # `TracedDecoder` warms it -- a caller reads the logits of the k rows.
         model.step_n(warm, state)

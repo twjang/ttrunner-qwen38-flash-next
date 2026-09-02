@@ -10,6 +10,7 @@ one against both.
 Correctness first, as always: the tokens a replay produces must be the tokens
 the eager path produces from the same state.
 """
+import os
 import sys
 import time
 
@@ -21,7 +22,9 @@ from twtest.tt.traced import TracedDecoder, TracedStepN
 
 KS = [int(x) for x in sys.argv[1:]] or [2, 4, 8]
 PRE = 8
-mesh, cfg, m = open_model(max_seq_len=512)
+SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "512"))
+mesh, cfg, m = open_model(max_seq_len=SEQ)
+print(f"RESULT max_seq_len {SEQ}", flush=True)
 prompt = synthetic_prompt(PRE + max(KS) + 4)
 
 # the baseline: a traced single-token step

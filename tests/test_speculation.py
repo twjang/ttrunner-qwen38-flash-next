@@ -84,17 +84,18 @@ def test_the_engine_refuses_speculation_it_cannot_serve() -> None:
 
 
 def test_speculation_refuses_rather_than_wedging_the_device() -> None:
-    """Capturing the step_n graph inside the engine hangs the device thread and
-    the boards come back only after `tt-smi -r`. A flag that bricks the
-    accelerators is worse than no flag, so it raises rather than tries."""
+    """Capturing the step_n graph inside the engine hangs the device thread, and
+    the boards come back only after `tt-smi -r` -- four times so far. A flag that
+    bricks the accelerators is worse than no flag, so it raises rather than
+    tries. The same capture standalone is fine, so it is the context."""
     import inspect
 
     from twtest.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
-    assert "hangs the device" in src
+    assert "hangs the device thread" in src
     assert "raise NotImplementedError" in src
-    # and the trace is not silently left on either way
+    # and the decode trace is not silently left on alongside it
     assert "and not self._speculate" in src
 
 
@@ -107,7 +108,10 @@ def test_there_is_exactly_one_capture() -> None:
 
     src = inspect.getsource(TTEngine.__init__)
     assert "self._widths = [speculate] if speculate else []" in src
-    assert "(len(self._widths) + 1) * (192 << 20)" in src, "the region is sized for it"
+    # and the region is deliberately *not* enlarged: one capture wants ~63 MB,
+    # which fits the 128 MB default, and enlarging it was the last difference
+    # between this engine and the harness that captures the same graph fine
+    assert "(len(self._widths) + 1)" not in src
     loop = inspect.getsource(TTEngine._device_loop)
     # the replay still composes, from whatever widths exist plus single steps
     assert "max((w for w in verifiers if w <= remaining), default=1)" in loop
