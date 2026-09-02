@@ -671,10 +671,22 @@ at this price. The lesson generalises: on this path a dispatch saving that
 changes any group size is buying speed with bf16 accuracy, and 7 % is not a good
 price. Look for savings that leave every group width alone.
 
+**A second worked example, also rejected, and it failed both ways.** The
+DeltaNet chunk builds q, k and v with three separate reshape/permute/pad/cast
+passes; they sit back to back on the channel axis with equal widths, so one pass
+over `3 * n_v` heads plus three slices should replace them. It removed 360
+dispatches (11681 -> 11321) exactly as predicted, and ran **30 % slower**
+(925.1 -> 1205.2 ms): the single permute is over a tensor three times the size,
+and permute cost is not linear in it. It also did not come out bit-identical the
+way pure data movement should (top-1 25.2 % -> 21.5 %, NLL 5.823 -> 6.345),
+which was never chased down because the wall clock had already disqualified it.
+Reverted.
+
 Three warnings for whatever is next. Op count is a poor proxy for cost -- the
 `reinject` docstring records a three-op form running **9.5x slower** than the
 nine-op one it replaced, because `repeat_interleave` is pathological on those
-shapes. Accuracy on this path is not repeatable at 32 scored positions, so use
+shapes, and the q/k/v permute above is the same lesson a second time. Measure
+wall clock, never the call count alone. Accuracy on this path is not repeatable at 32 scored positions, so use
 107+ and quote NLL (invariant 8). And every PR here needs the same A/B:
 `device_quality.py` unchanged, `op_count.py` before and after, and
 `bench_step.py` at one configuration for both paths.
