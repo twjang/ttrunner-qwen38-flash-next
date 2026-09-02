@@ -148,20 +148,23 @@ PYTHONPATH=src .venv/bin/python -m pytest tests/ -q
 
 ## Correctness
 
-**Read `docs/iterations/013` before trusting any number in this section.** The
-device engine agrees with the float32 CPU reference on 40 % of greedy tokens of
-real text (64 % where the reference is confident), measured teacher-forced over
-47 positions with `scripts/dev/three_way_agreement.py`. Chunked prefill is worse
-again at 27 %, and stays disabled. Earlier claims of "verified token-for-token"
-in this file and in the iteration log rested on a single 5-token prompt
-producing plausible text; they were not verification, and the model they were
-checking had the wrong DeltaNet head pairing.
+The metric is next-token accuracy on real prose, measured against the text
+itself rather than against another implementation
+(`scripts/dev/device_quality.py`, 47 positions):
 
-Every individual piece now sits at its dtype floor -- each branch of each layer
-kind within 0.2-4 % of the reference, weights round-tripping at theirs, state
-carried between steps not drifting -- so the gap is 48 layers of accumulated
-precision rather than a defect anyone has found. Closing it is the current
-priority; see `docs/HANDOFF.md`.
+| | top-1 | top-5 | mean NLL | perplexity |
+|---|---|---|---|---|
+| device, decode | **83.0 %** | 97.9 % | 0.682 | 1.98 |
+| device, chunked prefill | 87.5 % | 100 % | 0.335 | 1.40 |
+| float32 CPU reference | 80.9 % | 97.9 % | 0.703 | 2.00 |
+
+Agreement *between* implementations is deliberately not the headline: with 512
+experts and top-10 routing any perturbation flips a selection somewhere, so two
+correct implementations of the same weights still disagree on a good fraction of
+greedy tokens, and every precision configuration measured lands in the same
+30-47 % band. `docs/iterations/014` has that table, and the story of how a wrong
+head pairing survived being eyeballed for several iterations because a damaged
+model still writes fluent English.
 
 The reference engine reproduces llama.cpp's greedy output on the same GGUF,
 token for token:
@@ -177,11 +180,12 @@ the upstream HF model, none of which change any tensor's shape:
 1. **Norm weights carry a folded `+1`** (all except `linear_attn.norm.weight`).
 2. **`ssm_a` stores `A = -exp(A_log)`**, not `A_log` — so the decay is
    `ssm_a * softplus(...)`, with no second `exp`.
-3. ~~**DeltaNet V heads are stored tiled**, not grouped~~ — **wrong**, and it
-   cost 41 % in the first DeltaNet layer until `docs/iterations/013` caught it.
-   V heads are *grouped*: v-head j reads k-head `j // reps`, expanded with
-   `repeat_interleave`, exactly as upstream does it. Tiling also cannot be
-   head-sharded, which is why the device was a third thing again.
+3. **DeltaNet V heads are stored tiled**, not grouped — Q/K expand with
+   `repeat`, not `repeat_interleave`. Upstream's HF code interleaves
+   (`modeling_qwen4_exp.py:594`) because the converter permutes the head order;
+   following it instead of measuring cost a day (`docs/iterations/014`). The
+   arbiter is next-token accuracy on real text: 80.9 % tiled, 12.8 % grouped.
+   Both read as fluent English, which is why a greedy sample cannot settle it.
 
 Plus two of our own: the DeltaNet output gate is **sigmoid** (`output_gate_type`
 is set in `config.json` but never written to the GGUF), and the chunked delta

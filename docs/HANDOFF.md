@@ -55,33 +55,36 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 
 | configuration | result |
 |---|---|
-| single user, 1 slot, 262144 ctx, traced, fused experts | **229 ms/step** |
+| single user, 1 slot, 262144 ctx, traced, fused experts | **239 ms/step** (236 before the head-select gather) |
+| same, eager, chunked prefill on | ~551 ms/step, prompt at ~45 ms/token |
 | same, eager | 496 ms/step |
 | batch 64, eager, fused experts | 97.4 tok/s aggregate |
 | server, 32 concurrent | 37.84 tok/s |
 | prefill, 128 tokens | 5.77 s (11.3× the step path) — **not correct yet**, see §5 |
-| unit tests | `uv run pytest -q tests` → 123 passed, ~3 s, no hardware needed |
-| **agreement with the float32 oracle** | **decode 40.4 % of greedy tokens on real text (64 % where the oracle is confident); chunked prefill 27.3 %** |
+| unit tests | `uv run pytest -q tests` → 130 passed, ~3 s, no hardware needed |
+| **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; chunked prefill 87.5 %; float32 reference 80.9 % / 2.00** |
 
 Step time is flat in position (496 ms at pos 4, 501 ms at pos 65536) and flat
 in batch up to 64 rows. It is **op-count bound**: 6355 device ops × ~36 µs
 traced. Any change is judged by ops removed or useful rows added per step.
 
-**The accuracy row is the one that matters right now.** Read
-`docs/iterations/013` before anything else: the "verified token-for-token"
-claim that this file and the README used to carry rested on one 5-token prompt
-producing plausible text, and the model it was checking had the wrong DeltaNet
-head pairing. Four correctness bugs came out of testing it properly (two in
-chunked prefill, one in the CPU reference, one in the head expansion shared by
-every path). What is left is a precision gap, not a defect anyone has located:
-every branch of every layer kind is within 0.2-4 % of the float32 reference, the
-weights round-trip at their dtype floor, and nothing drifts across steps.
+**Read `docs/iterations/014` before anything else.** It is the story of how a
+wrong head pairing survived five iterations of review, and its lesson is a rule:
 
-Never quote a "matches the reference" claim that is not backed by
-`scripts/dev/three_way_agreement.py` on real text. A single prompt that looks
-plausible is not a measurement, and synthetic token ids are worse than nothing:
-they are out of distribution, so the argmax sits on near-ties and *every* path
-disagrees with the oracle on them.
+> Judge the model against the **text**, never against another implementation.
+
+`scripts/dev/device_quality.py` is that measurement — next-token top-1 and NLL
+on real prose, one forward, no oracle. Run it after any change to the model and
+put the number in the iteration note.
+
+Everything relative failed to catch the bug. Device-versus-reference agreement
+cannot: with 512 experts and top-10 routing, any perturbation flips a selection,
+so two *correct* implementations still disagree on half the greedy tokens, and
+every precision configuration measured landed in the same 30-47 % band (014 has
+the table). Greedy samples cannot either — a model with the wrong head pairing
+still writes fluent English, which is exactly why it survived. And synthetic
+token ids are worse than nothing: out of distribution, every path disagrees with
+every other on them.
 
 ## 3. Environment and how long things take
 
@@ -141,86 +144,79 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
    position, set `state.positions` directly — generating to 65536 is 9 hours.
 8. **Instrumented profiles are inflated ~40 %** by per-section syncs; read the
    shares, not the totals.
-9. **A per-layer distance is a weak metric.** The tensor between layers is the
+9. **V heads are tiled over K heads** -- v-head j reads k-head `j % n_k`, so
+   Q/K expand with `repeat`. Upstream interleaves; the GGUF converter permutes
+   the head order, so upstream is not authoritative here and the measurement is
+   (`reference_quality.py`: 80.9 % tiled, 12.8 % grouped). The device cannot
+   serve that pairing from its shard -- it all-gathers the sixteen heads and
+   selects twelve (`TTModel.head_select`).
+10. **A per-layer distance is a weak metric.** The tensor between layers is the
    hyper-connection stream -- four redundant copies the output mixer averages --
    so a stream can wander far while the mixed result the LM head sees does not.
    Compare the mixed hidden or the token. And an additive attention mask in
    TILE_LAYOUT pads with *zeros*, which means "attend to me": slice to a whole
    tile and let the causal condition mask the pad.
-10. **The QSA indexer is not on the device path.** Attention is dense causal in
+11. **The QSA indexer is not on the device path.** Attention is dense causal in
    both `step` and `prefill`. Exact below 2048 tokens, *different from the
    model* beyond. See roadmap A5. Do not claim long-context correctness until
    this exists.
-11. **Verification standard.** A change to the model is done when (a) unit
-    tests pass, (b) `three_way_agreement.py` is run and its agreement with the
-    oracle does not regress, (c) the number it claims to move is measured with
-    the hygiene in (7), and (d) if it touches prefill, `prefill_state_check.py`
-    is run too -- an output can be right while the state left behind is not.
-    Paste the output into the iteration note. Reproducing one prompt's text is
-    not (b); that standard is exactly what let a wrong head pairing stand.
+12. **Verification standard.** A change to the model is done when (a) unit
+    tests pass, (b) `device_quality.py` is run and next-token accuracy does not
+    regress from 83 %, (c) the number it claims to move is measured with the
+    hygiene in (7), and (d) if it touches prefill, `device_quality.py --prefill`
+    and `prefill_state_check.py` are run too -- an output can be right while the
+    state left behind is not. Paste the output into the iteration note.
+    Reproducing one prompt's text is not (b), and neither is agreement with the
+    reference; both of those stood while the head pairing was wrong.
 
 ## 5. Open work, with definition of done
 
-Reordered by `docs/iterations/013`: accuracy first. Speed work below 5.4 is
-not wrong, but it optimises a model that does not yet agree with its own
-reference, and speculation (5.6) is only *exact* if the verifier is the model
-you meant to run -- so 5.1 gates the ones that follow it.
+The model is correct as of `docs/iterations/014`, so this is no longer gated on
+accuracy: 5.1 and 5.2 pay back work that iteration left on the table, 5.3 is the
+remaining correctness gap (long context), and the rest is speed.
 
 Each has an entry point, a first command, and what "done" means. Estimates are
 for an agent that already has this file loaded.
 
-### 5.1 Close the precision gap (the current priority; open-ended)
+### 5.1 Fold the head selection into the shard layout (1 day, pure win)
 
-State: 40.4 % agreement with the float32 oracle on real text, 64 % where the
-oracle is confident. No structural defect is left at the level the harnesses
-reach -- see `docs/iterations/013` for what was ruled out and how.
+The decode step all-gathers the sixteen K/Q heads and selects its twelve with a
+fixed matrix, because device d holds k-heads `[4d, 4d+4)` while its v-heads need
+`(12d+i) % 16` (`docs/iterations/014`, observation 4). That costs 36 collectives
+and 72 small matmuls a step, +1.2 %.
 
-The gap is 48 layers of a few percent each. The largest single contributor is
-the MoE (3-4 % against the reference, versus 0.2-1.7 % for every other branch),
-which is the only place a weight is quantised twice: the checkpoint is already
-UD-IQ4_XS and the converter re-quantises the experts to `bfloat4_b`.
+It is avoidable. Give device d the twelve k/q heads its v heads actually need,
+rather than a contiguous four: change `split_qkv_channels` in `tt/convert.py` so
+the q and k parts are selected by `(n_v_local * d + i) % n_k_global`, and change
+everything keyed to that channel layout with it — `ssm_conv1d`'s q/k channels
+(same Shard.HEAD_QKV_ROW split), and `TTModel.key_dim_local`. The expansion then
+disappears from the step entirely and `head_select` can go.
 
-Do, in this order, measuring with `three_way_agreement.py` after each:
+Cost: attn_qkv per device grows from 2560 to 4608 channels, about +200 MB per
+device across 36 layers. Needs a re-conversion of those tensors only.
 
-1. Convert one layer's experts at `bfloat8_b` instead and re-measure that
-   layer's MoE against the reference with `layer_decode_bisect.py`. If 3-4 %
-   becomes < 1 %, the policy is the answer and the question becomes how many
-   layers fit -- experts dominate the 24.94 GB, so this is a memory trade, not a
-   free win. `docs/iterations/008` records how the current policy was chosen
-   (by simulating block-float arithmetic in the CPU reference); redo that
-   simulation with the corrected head expansion, because it was calibrated
-   against the wrong model.
-2. Check the accumulation shape: run `layer_decode_bisect.py` across many
-   layers and see whether error per layer is flat or grows. Flat means
-   independent rounding and the fix is per-block precision; growing means
-   something amplifies, and the hyper-connection gates are the place to look.
-3. Only then consider activation precision (bf16 throughout today).
+Done when: `device_quality.py` is unchanged (83 %), `head_select` is gone, and
+the traced step is back to ~236 ms.
 
-Done when: agreement on confident tokens is ≥ 95 %, or the session ends with a
-written argument for why a given number is the floor for this quantisation.
+### 5.2 Chunked prefill inside the trace (2-3 days)
 
-### 5.2 Chunked prefill: close its own remaining gap (1-2 days)
+Chunked prefill works and is on for one-slot engines, but it turns the trace
+off: it runs eagerly and allocates gigabytes of temporaries per call, and after
+a few of them the trace replay came back as token 0 repeated. Eager prefill is
+correct — warm and cold turns agree token for token — so this is about getting
+both at once, not about correctness.
 
-State: 27.3 % against the oracle where decode gets 40.4 %, so prefill is still
-worse than the path it has to replace -- but both are now made of blocks that
-agree with the reference, and the three structural bugs are fixed
-(`docs/iterations/013`, observations 2 and 3).
+A 2000-token prompt with 200 output tokens is ~194 s eager-and-prefilled against
+~1047 s traced-and-stepped, so today the flag is the right choice for
+prompt-heavy work and wrong for generation-heavy work. Fixing it means either
+confining prefill's allocations away from the captured buffers, or capturing a
+second trace for the prefill graph (its shapes are static once `chunk` is
+fixed).
 
-The blocks are clean in isolation: `_attention_chunk` matches `_attention_step`
-bit-for-bit, `_linear_attention_chunk` is within ~1 %. What is not clean is the
-state a prompt leaves: `prefill_state_check.py` still shows the DeltaNet
-recurrent matrices and conv rings drifting with depth. Start there -- it is the
-only thing generation after a prefill depends on, and the harness prints it per
-layer.
+Done when: `use_trace=True` and `chunked_prefill=True` together reproduce the
+eager result token for token over the three-turn check in
+`scripts/dev/prefix_reuse_check.py --chunked --trace`.
 
-Watch the chunked delta rule specifically: it is a different algorithm from the
-recurrent form, its error accumulates along the sequence as well as through the
-layers, and `prepare()` runs on the host in float32 while decode stays on
-device.
-
-Done when: prefill's agreement with the oracle is within a couple of points of
-decode's, then enable `chunked_prefill` in `TTEngine` and delete
-`test_engine_refuses_chunked_prefill_while_it_is_wrong`.
 
 ### 5.3 QSA indexer on device (2-3 days; correctness for > 2048 tokens)
 
@@ -313,12 +309,16 @@ time with hygiene, single-user text unchanged.
 
 ## 6. Recipes
 
-**Judge a change to the model** — `scripts/dev/three_way_agreement.py 48 16`:
-teacher-forced greedy agreement with the float32 oracle over 47 positions of
-real text, split by how confident the oracle was. One reference forward gives a
-prediction at every position, which is what makes the baseline affordable. Use
-real text: synthetic token ids are out of distribution and every path disagrees
-with the oracle on them.
+**Judge a change to the model** — `scripts/dev/device_quality.py 48`
+(add `--prefill 32` for the chunked path, `--score-from N` for a matched
+control). Next-token top-1 and NLL against the text itself: absolute, one
+forward, no oracle. `reference_quality.py` is the same thing on the CPU
+reference, for changes to the model rather than to the device.
+
+`three_way_agreement.py 48 16` still exists and reports agreement with the
+float32 oracle, split by the oracle's confidence, plus both paths' perplexity.
+Treat its agreement figure as a weak signal -- it cannot exceed ~50 % even for
+correct code -- and its NLL comparison as the useful part.
 
 **Isolate a block instead of bisecting the model** — `attn_block_check.py`
 (chunk vs step), `attn_pos0_oracle.py` (both vs a closed form),
@@ -330,6 +330,9 @@ a ring, cache or recurrent-state fault), `deltanet_step_trace.py` and
 `weight_fidelity.py` (device weights vs GGUF -- note ttnn stores linear weights
 transposed, and an rms of ~141 % means the comparison is misaligned, not the
 weight), `routing_overlap.py` (does the router pick the same experts),
+`simulated_precision.py` (price a precision-policy change on CPU, with
+`--group`/`--experts`/`--dense`/`--all-dtype`), `bench_step.py`,
+`prefix_reuse_check.py` (the engine's chat-turn behaviour end to end),
 `prefill_state_check.py` (what a prompt leaves behind),
 `reference_prefill_vs_decode.py` and `reference_greedy.py` (the oracle against
 itself, CPU only).
@@ -384,12 +387,15 @@ tests `pytest.importorskip("ttnn")`.
 * When something fails, ask "is it per-step or one-time?" before "what is
   different about my setup?" — the former halved the trace search space after
   thirteen null results from the latter.
-* Every claim about the model is measured against the float32 reference, not
-  against the other device path. Two paths agreeing says nothing when both are
-  built from the same wrong assumption, which is exactly what happened with the
-  head expansion — and the one thing that could have caught it earlier was
-  asking the *oracle*, not the neighbour.
-* When a control comes back implausible — a verified path 52 % from float32 at
-  layer 0 — suspect the measurement before the code. Two of 013's findings came
-  from taking that seriously; the tiling bug came from not dismissing the
-  strange number it produced.
+* Every claim about the model is measured against the **text**. Two paths
+  agreeing says nothing when both are built from the same wrong assumption, and
+  neither does agreeing with the reference when the reference was given the same
+  assumption in the same change — which is exactly what happened with the head
+  pairing (`docs/iterations/014`).
+* When a control comes back implausible — a "verified" path 52 % from float32 at
+  layer 0, or an oracle with perplexity 4445 — chase it. Every real defect this
+  project has found announced itself as a number someone was tempted to explain
+  away.
+* Upstream's HF source is evidence, not authority: the GGUF converter permutes
+  and folds things (the head order, a `+1` in the norm weights, `A = -exp(A_log)`).
+  Where they disagree, measure.

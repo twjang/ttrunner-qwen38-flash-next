@@ -90,7 +90,13 @@ reference paths now agree to 1e-4 % at every layer and emit the same token,
 which is what makes the reference usable as an oracle at all. Locked by
 `tests/test_indexer_mask.py`, which needs neither a checkpoint nor a device.
 
-## Observation 5 — V heads are grouped over K heads, not tiled
+## Observation 5 — V heads are tiled over K heads, and the shard layout was wrong
+
+> **Corrected in `014`.** This section originally concluded that V heads are
+> *grouped* and that the fix was `repeat_interleave`. That was wrong: it
+> followed upstream's HF code without measuring, and it made both engines
+> worse. The observation below is the part that held — the DeltaNet branch was
+> 41 % out and the expansion was the cause — with the conclusion replaced.
 
 With a trustworthy oracle the decode path could be measured, and it agreed with
 it on 25 % of tokens of real text. Bisecting layer 0 — sub-block by sub-block
@@ -102,28 +108,30 @@ narrowed it to `q` and `k`, the two tensors expanded from K heads to V heads.
 
 `README` recorded, as a property of this checkpoint, that "DeltaNet V heads are
 stored tiled, not grouped — Q/K expand with `repeat`, not `repeat_interleave`."
-Upstream does the opposite (`modeling_qwen4_exp.py:594`:
-`query.repeat_interleave(num_v_heads // num_k_heads, dim=2)`), and tiling has a
-second problem: it cannot be head-sharded. Device d holds k-heads `[4d, 4d+4)`
-and v-heads `[12d, 12d+12)`; tiling sends v-head j to k-head `j % 16`, spread
-over every device, while grouping sends v-head `12d+i` to k-head `4d + i//reps`,
-always the device's own. So the device had been expanding its *local* four k
-heads — a third pairing, agreeing with neither convention.
+Upstream does the opposite (`modeling_qwen4_exp.py:594`), and that looked
+decisive. It was not: the GGUF converter permutes the head order, so the two are
+different models here, and the README was right. What settled it was
+`reference_quality.py` — next-token accuracy on real text, 80.9 % tiled against
+12.8 % grouped — a measurement that did not exist yet when this section was
+written. See `014`.
 
-The arbiter is the float32 reference's own output. With grouping it still
-produces coherent text for the README's prompt:
+The part of the diagnosis that survives: tiling **cannot** be served from the
+device's shard layout. Device d holds k-heads `[4d, 4d+4)` and v-heads
+`[12d, 12d+12)`; tiling sends v-head `12d+i` to k-head `(12d+i) % 16`, so
+device 0's twelve v heads need k-heads 0-11, which live on three devices. The
+device had been tiling its own four, a third pairing agreeing with neither
+convention. Fixing it is a sharding problem, not an expansion one, and `014`
+does that.
 
-```
-'The capital of France is' -> ' Paris.\nThe French capital, Paris, is located,'
-```
-
-**Remedy.** `repeat_interleave` in both the reference and both device paths.
-Every sub-step of the DeltaNet block moved from 112-168 % to 0.7-1.5 %, and
-every branch of every layer kind — DeltaNet, PLE, QSA, MoE — is now within
-0.2-4 % of the reference at a single token, and flat or mildly growing across
-eight steps (`branch_sequence_check.py`).
 
 ## Where it leaves us
+
+> **Superseded by `014`.** The numbers below were measured with the wrong head
+> pairing in both engines. They are kept because the *method* they introduced —
+> judge a path against the float32 oracle, not against the other device path —
+> is what made 014 possible, and because the conclusion they led to ("nothing
+> structural is left, it is all precision") was itself wrong and worth not
+> repeating.
 
 Teacher-forced against the float32 oracle over 47 positions of real text:
 
@@ -132,36 +140,19 @@ Teacher-forced against the float32 oracle over 47 positions of real text:
 | decode | 19/47 = 40.4 % | 7/11 = 64 % | 12/36 = 33 % |
 | prefill (16 prefilled) | 9/33 = 27.3 % | 2/6 = 33 % | 7/27 = 26 % |
 
-Both are far from where they should be, and this is now the project's headline
-number — it replaces "verified token-for-token", which rested on one 5-token
-prompt producing plausible text and which the tiling bug shows was never a
-verification at all.
-
-Nothing structural is left to find at the level these harnesses reach: every
-branch of every layer kind is at its dtype floor, the weights round-trip at
-theirs, and state carried between steps does not drift.
-
-The router turns out not to be the main term. `routing_overlap.py` puts device
-and host on the same input and compares the selected top-10 of 512:
-
-| layer | experts agreeing | margin at the cutoff |
-|---|---|---|
-| 0 | 9.8 / 10 | 0.035 |
-| 3 | 9.9 / 10 | 0.022 |
-| 24 | 10.0 / 10 | 0.017 |
-| 47 | 9.9 / 10 | 0.018 |
-
-so roughly one expert in fifty is swapped — around ten swaps per token across
-48 layers, each perturbing a tenth of that layer's routed output. Real, but
-smaller than the smooth term. What remains is 48 layers of a few percent each,
-which makes precision — not prefill — the next thing to work on, and that is a
-different project from the one 012 handed over.
+The reading at the time was that nothing structural was left to find — every
+branch of every layer kind was at its dtype floor, the weights round-tripped at
+theirs, state carried between steps did not drift, and the router swapped about
+one expert in fifty. All of that was true and none of it was the problem. What
+the harnesses could not see was that both engines agreed on a wrong model, which
+is exactly the failure mode "compare against the oracle" was supposed to catch —
+and would have, had the oracle not been given the same wrong pairing in the same
+change.
 
 ## What to distrust in the earlier log
 
 * "verified token-for-token against the CPU reference" (README, 010, 012) meant
-  one short prompt, and the model it verified had the wrong head pairing.
-* README's third checkpoint quirk (V heads tiled) is wrong; it is grouped, as
-  upstream has it.
+  one short prompt.
 * Prefill's remaining distance from decode was never evidence about prefill on
   its own — decode was the larger error for most of it.
+* This iteration's own Observation 5 conclusion, and the table above. See `014`.
