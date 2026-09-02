@@ -1,10 +1,12 @@
-"""Does speculation change the answer?
+"""Does speculation change the answer, and does it go faster?
 
-Not "does it go faster": it cannot yet. Capturing the `step_n` graph while the
-decoder's trace is live wedges the device (docs/iterations/016), so speculation
-runs with an eager decoder, where a non-drafted round costs 518 ms against a
-traced 236. What can be established now is exactness -- and that is the property
-the whole scheme rests on.
+Both engines run with the trace on. `speculation_report()` breaks a round down
+by phase, which is the only reliable way to read this: inferring from end-to-end
+rates hid a parameter mix-up for one cycle and an eager decoder for another.
+
+Exactness needs two *processes*, not two engines -- a second engine in one
+process still hangs -- so `TWTEST_SPEC_ONLY` runs one configuration and prints
+its tokens for comparison across runs.
 
     uv run python scripts/dev/speculation_check.py [k]            (default 8)
 
@@ -79,9 +81,12 @@ async def main():
         engine = TTEngine(
             cache_dir=CACHE, gguf_dir=GGUF, tokenizer_path=TOKENIZER,
             max_concurrency=1, max_seq_len=2048,
-            # one live trace only: capturing step_n while the decoder's trace is
-            # live wedges the device, so speculation runs with an eager decoder
-            use_trace=not spec, speculate=spec,
+            # The trace stays on for both. It was briefly turned off here on the
+            # theory that a step_n capture could not coexist with the decoder's
+            # -- wrong, and it cost a measurement cycle: plain rounds ran eager
+            # at 487.5 ms against a traced 236, which is the whole of the
+            # overhead the earlier numbers showed.
+            use_trace=True, speculate=spec,
         )
         try:
             for label, text in PROMPTS.items():
@@ -96,6 +101,10 @@ async def main():
                 # engines in one process still hang, so exactness is checked
                 # across runs
                 print(f"RESULT TOKENS {spec} {label} {toks}", flush=True)
+            if spec:
+                print("RESULT --- where a round's time goes ---", flush=True)
+                for line in engine.speculation_report().splitlines():
+                    print(f"RESULT   {line}", flush=True)
         finally:
             await engine.close()
 

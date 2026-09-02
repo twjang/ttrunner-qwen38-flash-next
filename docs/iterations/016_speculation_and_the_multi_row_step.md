@@ -128,11 +128,14 @@ separate processes, because two engines in one still hang (Observation 7).
 
 ## Observation 7 — the hang was two engines, not speculation
 
-Capturing the `step_n` graph inside the engine hung it, and the boards came back
-only after `tt-smi -r` -- five times over the session. The cause turned out not
-to be speculation at all: a **second `TTEngine` constructed in the same process
-after closing the first** hangs on its own capture. With one engine per process
-speculation runs to completion.
+Capturing inside the engine hangs it, and the boards come back only after
+`tt-smi -r` -- seven times over the session. It is still unexplained.
+
+One engine per process with `use_trace=False` completes, which briefly looked
+like the answer; it is not. With the decode trace on -- which speculation needs,
+since ordinary rounds want it -- a single engine hangs too. Both captures
+together on a plain worker thread are fine (253.4 ms), so it is neither the
+thread nor the pair.
 
 The warning that accompanies it is a red herring. It appears exactly once in
 every *successful* capture too; the hanging runs simply emit it twice, which is
@@ -160,22 +163,54 @@ because each cost a device cycle:
 | The single-token step graph allocating *after* the capture, on the engine's first eager step | `TracedStepN` now warms `model.step` and the LM head before capturing | still hangs — **not it** |
 | Captured traces leaking past `close` | `TTEngine.close` now releases them | still hangs — **not it**, but a real bug |
 | A second live capture slowing the first one's replay | timed a traced step with a `step_n` capture also live | 236.1 vs 236.3 ms — **not it** |
-| **Two engines in one process** | ran a single engine | **completes — this was it** |
+| Two engines in one process | ran a single engine | completes — but only with `use_trace=False`, see below |
+| Two captures on a worker thread | `traced_step_n_thread.py` captures a decoder *and* a `step_n` on one | 253.4 ms — **not it** |
+| The first `snapshot` allocating ~200 tensors after a capture | buffers now allocated before any capture | still hangs — **not it**, but right regardless |
 
-Two of those fixes were kept regardless of the verdict. Warming the single-token
+Three of those fixes were kept regardless of the verdict. Warming the single-token
 step before capture is right because a caller that speculates still takes
 ordinary steps, and letting them allocate the 48-layer graph after a capture is
 the hazard this module's docstring opens with. Releasing traces in `close` is
-right because closing a mesh under a live trace is simply wrong.
+right because closing a mesh under a live trace is simply wrong. Allocating the
+snapshot buffers before any capture is right for the reason this module's
+docstring gives.
+
+What is left is narrow and worth stating precisely, because everything cheap has
+been tried: the engine's `_device_loop` does something between its captures and
+its first replay that the harnesses do not, and no candidate for it has survived
+a test. The next attempt should stop guessing and bisect -- take
+`traced_step_n_check.py`, which works, and move it toward the engine one step at
+a time (its own state object, then the admission loop, then the asyncio queue),
+rather than proposing another cause.
 
 What is still open is *why* a second engine hangs. It is an engine-lifecycle
 question rather than a speculation one, and it deserves its own investigation:
 anything that opens and closes a mesh twice in one process is affected.
 
-## Observation 8 — and it is not yet faster
+## Observation 8 — and where a round's time goes
 
-With one engine per process, both traces live, and the snapshot buffers reused,
-generation-only rates against a 240.0 / 240.4 ms baseline:
+Instrumenting each phase, rather than inferring from end-to-end rates, took one
+run to settle what several had not:
+
+```
+rounds 178  drafted 6 (3%)  plain 172
+per plain round   step   487.5 ms
+per drafted round snapshot 14.7 ms  verify 355.1 ms  restore 2.7 ms  replay 246.0 ms
+drafter itself      0.005 ms a round
+```
+
+A *plain* round cost 487.5 ms against a traced 236: ordinary rounds were running
+eager, because the harness still passed `use_trace=False` from the period when
+that was believed necessary. The drafter itself costs five microseconds; it was
+never the overhead. Every earlier rate in this section is contaminated by that,
+and the corrected measurement is what hangs.
+
+The lesson is the same one as Observation 6: the cheap check settles what
+inference does not. `speculation_report()` exists now so the next attempt starts
+with it.
+
+Generation-only rates from the contaminated runs, kept only to show the shape of
+the parameter mistake, against a 240.0 / 240.4 ms baseline:
 
 | `speculate` | drafted per verify | copy-heavy | open prose |
 |---|---|---|---|

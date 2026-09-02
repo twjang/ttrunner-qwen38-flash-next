@@ -318,10 +318,17 @@ Open prose is 2.1x worse than baseline while drafting *less* often than
 copy-heavy, which is backwards from any drafting-cost model -- so the overhead is
 not in the drafter, and where it is remains unknown.
 
-**Start with instrumentation, not another design.** Count drafted versus plain
-rounds in `_device_loop` and time each. Everything so far has been inferred from
-end-to-end rates, which is how the `speculate` semantics went unnoticed for a
-whole measurement cycle.
+**The instrumentation now exists** -- `TTEngine.speculation_report()` breaks a
+round into snapshot / verify / restore / replay and reports the drafter's own
+cost. It took one run to show that a *plain* round was costing 487.5 ms against
+a traced 236, because a harness was still disabling the trace; the drafter
+itself costs five microseconds. Start every measurement with it.
+
+**Do not propose an eleventh cause for the hang; bisect instead.** Ten are
+excluded in `docs/iterations/016`, including everything the standalone harnesses
+do differently. Take `scripts/dev/traced_step_n_check.py`, which works, and move
+it toward the engine one step at a time -- its own state object, then the
+admission loop, then the asyncio queue -- until it breaks.
 
 Verified independently and worth keeping: `step_n` reproduces k sequential steps
 (0.00 % on the hidden), `TracedStepN` replays at 255 ms for k=2 against 472 for

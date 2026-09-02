@@ -23,7 +23,7 @@ import ttnn
 
 from _device_model import open_model, synthetic_prompt
 
-from twtest.tt.traced import TracedStepN
+from twtest.tt.traced import TracedDecoder, TracedStepN
 
 K = int(sys.argv[1]) if len(sys.argv) > 1 else 2
 BUDGET = 240.0
@@ -40,7 +40,16 @@ def worker():
         print("RESULT worker: warming", flush=True)
         for t in prompt[:8]:
             m.step([t], st)
-        print("RESULT worker: capturing", flush=True)
+        # The engine captures *both*: a decoder for ordinary rounds and a step_n
+        # for verification. One capture on this thread is fine and two on the
+        # main thread are fine; this is the combination left untested.
+        print("RESULT worker: capturing decoder", flush=True)
+        dec = TracedDecoder(m, st)
+        dec.reset()
+        print("RESULT worker: decoder captured", flush=True)
+        for t in prompt[:8]:
+            dec.step([t])
+        print("RESULT worker: capturing step_n", flush=True)
         tr = TracedStepN(m, st, K)
         print("RESULT worker: captured", flush=True)
         for layer in st.layers:
@@ -67,6 +76,7 @@ def worker():
         out["ms"] = 1000 * (time.perf_counter() - t0)
         print(f"RESULT worker: replayed in {out['ms']:.1f} ms", flush=True)
         tr.release()
+        dec.release()
     except Exception as exc:
         out["error"] = " ".join(str(exc).split())[:200]
         print(f"RESULT worker: FAILED {out['error']}", flush=True)

@@ -73,7 +73,19 @@ def test_the_engine_does_not_promise_identical_output() -> None:
 
     src = inspect.getsource(TTEngine.__init__)
     assert "**Not** identical to decoding one token at a time" in src
-    assert "speculation is experimental" in src
+
+
+def test_speculation_refuses_rather_than_wedging_the_device() -> None:
+    """Capturing inside the engine hangs the device thread and the boards come
+    back only after `tt-smi -r`. A flag that bricks the accelerators is worse
+    than no flag, so it raises rather than tries."""
+    import inspect
+
+    from twtest.tt.engine import TTEngine
+
+    src = inspect.getsource(TTEngine.__init__)
+    assert "hangs the device thread" in src
+    assert "raise NotImplementedError" in src
 
 
 def test_acceptance_stops_at_the_first_disagreement() -> None:
@@ -160,3 +172,17 @@ def test_close_releases_every_capture_before_closing_the_mesh() -> None:
     assert "self._verifiers" in src
     # and the engine keeps hold of them so close can find them
     assert "self._verifiers = verifiers" in inspect.getsource(TTEngine._device_loop)
+
+
+def test_snapshot_buffers_are_allocated_before_any_capture() -> None:
+    """A round snapshots ~200 tensors. Allocating them for the first time after
+    a trace exists is the hazard `traced.py` opens by describing -- and it is the
+    one thing the standalone harnesses never do, which is why they never hang."""
+    import inspect
+
+    from twtest.tt.engine import TTEngine
+
+    src = inspect.getsource(TTEngine._device_loop)
+    alloc = src.index('snap_buf["s"] = self.model.snapshot(state)')
+    assert alloc < src.index("TracedDecoder"), "must precede the decoder capture"
+    assert alloc < src.index("TracedStepN"), "must precede the step_n capture"

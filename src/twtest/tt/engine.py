@@ -331,10 +331,28 @@ class TTEngine(Engine):
                     f"speculate is the tokens fed per verify, 2..17 (it drafts "
                     f"speculate - 1); got {speculate}"
                 )
-            print(
-                "[tt] speculation is experimental: its output is a valid greedy "
-                "decode but not the same one as stepping token by token, and it "
-                "is not yet faster in this engine. See docs/iterations/016."
+            # Refused, and not for performance. Capturing inside this engine
+            # hangs the device thread, and the boards come back only after
+            # `tt-smi -r`; it has done so seven times. A flag that bricks the
+            # accelerators is worse than no flag.
+            #
+            # Ten candidate causes are excluded by experiment in
+            # docs/iterations/016 -- including everything the standalone
+            # harnesses do differently, which is why they never hang. Two of the
+            # fixes those experiments produced are kept because they are right
+            # regardless: `close` releases its captured traces, and the snapshot
+            # buffers are allocated before any capture.
+            #
+            # Everything else the scheme needs is built and verified on its own.
+            # It is also *not* identical to stepping token by token -- the
+            # verifier batches k rows where the stepper runs one -- so even once
+            # the hang is fixed, "exact" is the wrong word for it.
+            raise NotImplementedError(
+                "speculation is built and verified but not wired: capturing "
+                "inside the engine hangs the device and needs tt-smi -r. See "
+                "docs/iterations/016 for the ten causes already excluded, and "
+                "scripts/dev/traced_step_n_check.py for the standalone "
+                "measurement (255 ms at k=2 against 472 for two traced steps)."
             )
             if self.model.use_indexer:
                 raise NotImplementedError(
@@ -348,6 +366,14 @@ class TTEngine(Engine):
         # where the *next* engine in the same process hangs on its own capture --
         # which is what made speculation look unfixable for four board resets.
         self._verifiers: dict[int, object] = {}
+        # Per-phase accounting for a speculative round. End-to-end rates are how
+        # a parameter mix-up went unnoticed for a whole measurement cycle, so
+        # every phase is timed separately and reported by `speculation_report`.
+        self.spec_stats: dict[str, float] = dict(
+            plain_rounds=0, plain_s=0.0,
+            drafted_rounds=0, accepted_tokens=0, emitted_tokens=0,
+            snapshot_s=0.0, verify_s=0.0, restore_s=0.0, replay_s=0.0, draft_s=0.0,
+        )
         self._admit: queue.SimpleQueue = queue.SimpleQueue()
         self._shutdown = threading.Event()
         self._worker = threading.Thread(target=self._device_loop, name="tt-device", daemon=True)
@@ -379,6 +405,17 @@ class TTEngine(Engine):
         TILE = 32                      # fill_cache asserts a tile-aligned index
         B = self._max_concurrency
         state = self.model.new_state(batch=B)
+        # one set of snapshot buffers, reused every round
+        snap_buf: dict = {}
+        if self._speculate:
+            # Allocate them *before* any capture. A speculative round snapshots
+            # ~200 tensors, and doing that first allocation after a trace exists
+            # is the hazard `traced.py` opens by describing -- it is the one
+            # thing the standalone harnesses never do, and they never hang.
+            # A step first, because the layer state does not exist until one has
+            # run and there is nothing to snapshot.
+            self.model.step([0] * B, state)     # token 0: a harmless warmup
+            snap_buf["s"] = self.model.snapshot(state)
         slots: list[_Sequence | None] = [None] * B
         free: list[int] = list(range(B))
         # The exact token sequence each slot's state has consumed, or None when
@@ -460,9 +497,6 @@ class TTEngine(Engine):
         # trace) every time a request arrives or finishes.
         FILLER = 0
 
-        # one set of snapshot buffers, reused every round
-        snap_buf: dict = {}
-
         def speculate_round(seq: "_Sequence | None") -> bool:
             """Try one draft-and-verify round. False if it does not apply.
 
@@ -476,8 +510,11 @@ class TTEngine(Engine):
                 return False
             if seq.request.temperature > 0:
                 return False
+            st_ = self.spec_stats
+            t_draft = time.perf_counter()
             context = list(state.histories[0]) + [seq.next_token]
             draft = prompt_lookup_draft(context, self._speculate - 1)
+            st_["draft_s"] += time.perf_counter() - t_draft
             if draft is None:
                 return False
 
@@ -488,10 +525,14 @@ class TTEngine(Engine):
 
             # Row i predicts the token that follows feed[i], so rows 0..k-2 are
             # predictions of the draft and row k-1 is a genuinely new token.
+            t0 = time.perf_counter()
             snap = self.model.snapshot(state, into=snap_buf.get("s"))
             snap_buf["s"] = snap
+            st_["snapshot_s"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
             try:
                 verified = self.model.greedy_tokens(verifiers[k].step_n(feed))[:k]
+                st_["verify_s"] += time.perf_counter() - t0
             except Exception as exc:
                 seq.out_queue.put(exc)
                 retire(0, seq)
@@ -502,10 +543,16 @@ class TTEngine(Engine):
             j = accepted_prefix(draft, verified[: k - 1])
             emitted = verified[: j + 1]
 
+            st_["drafted_rounds"] += 1
+            st_["accepted_tokens"] += j
+            st_["emitted_tokens"] += j + 1
             if j < len(draft):
                 # the state ran ahead of what was accepted; a recurrence cannot
                 # be truncated the way a K/V cache can, so rewind and replay
+                t0 = time.perf_counter()
                 self.model.restore(state, snap)
+                st_["restore_s"] += time.perf_counter() - t0
+                t0 = time.perf_counter()
                 # compose the replay from the captured widths, largest first
                 pos, remaining = 0, j + 1
                 while remaining:
@@ -516,6 +563,7 @@ class TTEngine(Engine):
                         verifiers[width].step_n(feed[pos : pos + width])
                     pos += width
                     remaining -= width
+                st_["replay_s"] += time.perf_counter() - t0
             if prefix[0] is not None:
                 prefix[0].extend(feed[: j + 1])
 
@@ -640,7 +688,11 @@ class TTEngine(Engine):
                 slots[i] is not None and slots[i].request.temperature <= 0 for i in sampling
             )
             try:
+                t_plain = time.perf_counter()
                 hidden = advance(tokens)
+                if self._speculate:
+                    self.spec_stats["plain_rounds"] += 1
+                    self.spec_stats["plain_s"] += time.perf_counter() - t_plain
                 logits = None
                 argmax = self.model.greedy_tokens(hidden) if greedy_only else None
                 if argmax is None:             # uneven vocab shard, or sampling needed
@@ -692,6 +744,32 @@ class TTEngine(Engine):
                 except Exception as exc:
                     seq.out_queue.put(exc)
                     retire(i, seq)
+
+    def speculation_report(self) -> str:
+        """Where a speculative round's time actually goes, phase by phase."""
+        d = self.spec_stats
+        drafted, plain = int(d["drafted_rounds"]), int(d["plain_rounds"])
+        rounds = drafted + plain
+        if not rounds:
+            return "speculation: no rounds"
+
+        def ms(key, n):
+            return f"{1000 * d[key] / n:7.1f}" if n else "      -"
+
+        return "\n".join(
+            [
+                f"rounds {rounds}  drafted {drafted} ({100 * drafted / rounds:.0f}%)  "
+                f"plain {plain}",
+                f"accepted {int(d['accepted_tokens'])} of {drafted * (self._speculate - 1)} "
+                f"drafted tokens; emitted {int(d['emitted_tokens'])} from drafted rounds",
+                f"per plain round   step {ms('plain_s', plain)} ms",
+                f"per drafted round snapshot {ms('snapshot_s', drafted)} ms  "
+                f"verify {ms('verify_s', drafted)} ms  "
+                f"restore {ms('restore_s', drafted)} ms  "
+                f"replay {ms('replay_s', drafted)} ms",
+                f"drafter itself   {1000 * d['draft_s'] / rounds:7.3f} ms a round",
+            ]
+        )
 
     # -- request path ---------------------------------------------------------
 
