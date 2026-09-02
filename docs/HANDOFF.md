@@ -289,7 +289,8 @@ and at chunk 256 paged is the closer of the two (6.119 vs 6.456).
 
 **Steps 1-4 are done.** The K/V cache is paged, every position in both paths is
 device data, and the chunk path contains no host->device copy at all. Verified
-bit-identical to the flat path at every gate:
+bit-identical to the flat path at every gate, including through the real serving
+stack rather than only the harnesses:
 
 | | before | after |
 |---|---|---|
@@ -297,6 +298,12 @@ bit-identical to the flat path at every gate:
 | prefill=32, 128 scored | 71.9 %, NLL 1.433 | **identical** |
 | prefill=128, 107 scored | 24.3 %, NLL 5.648 | **identical** |
 | chunk wall clock | 1060.5 ms | 1070.5 ms |
+| `TTEngine`, 48 tokens x 2 prompts | 240.1 / 240.5 ms/token | **239.6 / 240.4, same tokens** |
+
+The engine row is `speculation_check.py` with `TWTEST_SPEC_ONLY=0`, and it
+covers the paged *decode* path end to end. Chunked prefill is off in that
+configuration, so the MoE routing/compute split (5.7) is covered by
+`device_quality --prefill`, not by this.
 
 Two things that took measuring. `chunked_scaled_dot_product_attention`'s two
 chunk sizes buy different things -- `q_chunk_size` is the outer iteration count
