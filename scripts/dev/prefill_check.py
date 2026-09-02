@@ -26,9 +26,10 @@ for L in lengths:
     ref = m.greedy_tokens(hs)[0]
     hs_h = host_row(mesh, hs)
     d = (hp_h - hs_h).abs().max().item()
+    scale = max(hs_h.abs().max().item(), 1e-6)
     del sts, hs
     print(
         f"RESULT len={L:4d} prefill->{got:7d} step->{ref:7d} {'MATCH' if got == ref else 'DIFFER'}"
-        f"   hidden maxdiff {d:8.3f}", flush=True,
+        f"   hidden rel {100 * d / scale:7.2f}%  (maxdiff {d:.3f} of {scale:.3f})", flush=True,
     )
 ttnn.close_mesh_device(mesh)

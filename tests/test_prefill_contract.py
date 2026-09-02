@@ -22,13 +22,39 @@ from twtest.tt.model import TTModel  # noqa: E402
 
 
 def test_chunk_paths_speak_the_ring_representation() -> None:
-    """Decode keeps the conv windows as lists of columns; prefill must too."""
+    """Decode keeps the conv windows as rings of columns; prefill must too.
+
+    Neither decode mode lays a ring out oldest-at-index-0: trace-safe keeps the
+    newest at index 0, and the rotating path leaves the oldest at
+    `step % len(ring)`. A chunk that assumes either one permutes the taps
+    silently, so both chunk paths go through the shared helpers, which honour
+    the counter, and both leave the counter advanced.
+    """
     for fn in (TTModel._causal_conv_chunk, TTModel._ple_chunk):
         src = inspect.getsource(fn)
-        assert "trace_safe_rings" in src, (
-            f"{fn.__name__} must pick the ring order the following decode mode "
-            "reads: trace-safe reads newest-first, the rotating path oldest-first"
-        )
+        assert "_ring_oldest_first(" in src, f"{fn.__name__} must read the ring by its counter"
+        assert "_ring_from_oldest_first(" in src, f"{fn.__name__} must write the ring by its counter"
+
+
+def test_ring_helpers_round_trip_in_both_modes() -> None:
+    """`_ring_from_oldest_first` is the inverse of `_ring_oldest_first`, which
+    is what makes a chunk leave the state a decode step would have left."""
+    model = TTModel.__new__(TTModel)
+    cols = ["a", "b", "c", "d"]                     # oldest .. newest
+    for trace_safe in (False, True):
+        model.trace_safe_rings = trace_safe
+        for step in range(9):
+            ring = model._ring_from_oldest_first(cols, step)
+            assert model._ring_oldest_first(ring, step) == cols, (trace_safe, step)
+
+
+def test_a_chunk_advances_the_ring_counters() -> None:
+    assert "new_step = step + seq" in inspect.getsource(TTModel._causal_conv_chunk)
+    assert "st.ple_step += seq" in inspect.getsource(TTModel._ple_chunk)
+    # and the DeltaNet caller stores it back
+    assert "st.conv_step = self._causal_conv_chunk(" in inspect.getsource(
+        TTModel._linear_attention_chunk
+    ).replace("conv_out, st.conv, ", "")
 
 
 def test_chunked_deltanet_uses_local_head_counts() -> None:

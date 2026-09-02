@@ -877,10 +877,41 @@ class TTModel:
 
     # -- chunked prefill --------------------------------------------------------
 
+    def _ring_oldest_first(self, ring: list, step: int) -> list:
+        """The ring's columns in age order, oldest first.
+
+        The two decode modes lay a ring out differently and neither is simply
+        "oldest at index 0": `trace_safe_rings` keeps the newest at index 0 and
+        shifts on every step, while the rotating path leaves the oldest at
+        `step % len(ring)` and moves that index instead. A chunk consuming a ring
+        a previous chunk (or a decode step) left has to honour whichever is in
+        force -- reading it in the wrong order is silent, and just permutes the
+        convolution's taps.
+        """
+        n = len(ring)
+        if self.trace_safe_rings:
+            return list(reversed(ring))
+        return [ring[(step + i) % n] for i in range(n)]
+
+    def _ring_from_oldest_first(self, cols: list, step: int) -> list:
+        """Lay `cols` (oldest first) out the way a decode step at `step` reads it.
+
+        The inverse of `_ring_oldest_first`, so that a chunk leaves behind
+        exactly the ring the decode path would have left after the same tokens
+        -- which is what makes prefill's state comparable to decode's at all.
+        """
+        n = len(cols)
+        if self.trace_safe_rings:
+            return list(reversed(cols))
+        out = [None] * n
+        for i, col in enumerate(cols):
+            out[(step + i) % n] = col
+        return out
+
     def _causal_conv_chunk(
         self, x: ttnn.Tensor, weight: ttnn.Tensor, state: list | None, channels: int, seq: int,
-        layer: int = 0,
-    ) -> tuple[ttnn.Tensor, list]:
+        layer: int = 0, step: int = 0,
+    ) -> tuple[ttnn.Tensor, list, int]:
         """4-tap depthwise causal conv over `seq` positions at once.
 
         x: [1, 1, channels, seq] (channel-major). Expressed as a sum of four
@@ -902,7 +933,7 @@ class TTModel:
                 for _ in range(depth)
             ]
         # oldest first, then this chunk: [1,1,C,depth+seq]
-        window = ttnn.concat([*state, x], dim=-1)
+        window = ttnn.concat([*self._ring_oldest_first(state, step), x], dim=-1)
         acc = None
         # Keyed by layer, like the decode path. Keyed by channel count alone (as
         # this was), every DeltaNet layer after the first silently reused layer
@@ -912,19 +943,17 @@ class TTModel:
             acc = ttnn.multiply(piece, w_tap) if acc is None else ttnn.add(
                 acc, ttnn.multiply(piece, w_tap)
             )
-        # The ring the next decode step reads: the final `depth` columns. The two
-        # decode modes index it in *opposite* orders, so the one that follows
-        # decides the layout here -- trace_safe_rings reads state[age-1], newest
-        # first, while the rotating path at step 0 reads state[0] as the oldest.
-        # Handing back the wrong order is silent: the conv still runs, with the
-        # window's taps permuted.
+        # The ring the next decode step reads: the final `depth` columns, laid
+        # out for the counter this chunk leaves behind, so that consuming a
+        # prompt by chunks and consuming it token by token leave the *same*
+        # state -- ring and counter both.
         total = depth + seq
         cols = [
             ttnn.slice(window, (0, 0, 0, total - depth + i), (1, 1, channels, total - depth + i + 1))
             for i in range(depth)
         ]                                   # oldest .. newest
-        new_state = list(reversed(cols)) if self.trace_safe_rings else cols
-        return ttnn.silu(acc), new_state
+        new_step = step + seq
+        return ttnn.silu(acc), self._ring_from_oldest_first(cols, new_step), new_step
 
     def _linear_attention_chunk(
         self, mixed: ttnn.Tensor, layer: int, st: LayerState, seq: int
@@ -947,9 +976,9 @@ class TTModel:
 
         qkv = ttnn.linear(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
         z = ttnn.linear(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
-        conv_out, st.conv = self._causal_conv_chunk(
+        conv_out, st.conv, st.conv_step = self._causal_conv_chunk(
             ttnn.transpose(qkv, -2, -1), self.w.blk(layer, "ssm_conv1d.weight"),
-            st.conv, self.conv_dim_local, seq, layer,
+            st.conv, self.conv_dim_local, seq, layer, st.conv_step,
         )
         qkv = ttnn.transpose(conv_out, -2, -1)              # [1,1,seq,conv_dim_local]
 
@@ -1270,9 +1299,9 @@ class TTModel:
                            layout=ttnn.TILE_LAYOUT, device=self.mesh)
                 for _ in range(state_len)
             ]
-        ring = st.ple_conv
-        oldest_first = list(reversed(ring)) if self.trace_safe_rings else list(ring)
-        window = ttnn.concat([*oldest_first, col], dim=-1)      # [1,1,C,state_len+seq]
+        window = ttnn.concat(
+            [*self._ring_oldest_first(st.ple_conv, st.ple_step), col], dim=-1
+        )                                                       # [1,1,C,state_len+seq]
         conv_w = self.w.blk(layer, "ple_conv1d.weight")
         acc = None
         for tap, w_tap in enumerate(
@@ -1287,7 +1316,8 @@ class TTModel:
             ttnn.slice(window, (0, 0, 0, total - state_len + i), (1, 1, c_dim, total - state_len + i + 1))
             for i in range(state_len)
         ]                                                       # oldest .. newest
-        st.ple_conv = list(reversed(cols)) if self.trace_safe_rings else cols
+        st.ple_step += seq
+        st.ple_conv = self._ring_from_oldest_first(cols, st.ple_step)
         # prefill is single-sequence: [1,1,C,seq] -> [1,1,seq,C]
         conv = ttnn.silu(ttnn.transpose(acc, -2, -1))
         return ttnn.add(gated, conv)
