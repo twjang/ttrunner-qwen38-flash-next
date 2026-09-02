@@ -839,10 +839,204 @@ class TTModel:
 
     # -- PLE (n-gram) injection, one token ------------------------------------
 
-    def _ple_step(self, hidden: ttnn.Tensor, layer: int, st: LayerState, state: TTState) -> ttnn.Tensor:
+    # -- k tokens of one sequence, in one step --------------------------------
+
+    def _linear_attention_step_n(
+        self, mixed: ttnn.Tensor, layer: int, st: LayerState, k: int
+    ) -> ttnn.Tensor:
+        """DeltaNet over `k` consecutive tokens of *one* sequence.
+
+        The projections, the output norm and `ssm_out` are per-token, so they
+        run over all k rows at once and cost what one row costs. The convolution
+        and the recurrence are not: row i's window is rows i-3..i and row i's
+        state is row i-1's, so those two are unrolled.
+
+        That is the whole trade. A batched step is flat in batch up to 64 rows,
+        so verifying k drafts costs one step plus k-1 unrollings of the two
+        sequential pieces -- against k full steps for feeding them one at a time.
+        """
+        cfg = self.cfg
+        n_v, hd = self.n_v_local, cfg.linear_head_dim
+        kd, vd = self.key_dim_local, self.value_dim_local
+
+        qkv = ttnn.linear(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
+        z = ttnn.linear(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
+        a = ttnn.linear(mixed, self.w.blk(layer, "ssm_alpha.weight"), compute_kernel_config=HIFI4)
+        b = ttnn.linear(mixed, self.w.blk(layer, "ssm_beta.weight"), compute_kernel_config=HIFI4)
+        g = ttnn.multiply(
+            self.w.blk(layer, "ssm_a"),
+            ttnn.softplus(ttnn.add(a, self.w.blk(layer, "ssm_dt.bias"))),
+        )
+
+        # [1,1,k,conv_dim] -> [1,k,conv_dim,1]; one column per token
+        qkv_col = ttnn.transpose(ttnn.permute(qkv, (0, 2, 1, 3)), -2, -1)
+        conv_w = self.w.blk(layer, "ssm_conv1d.weight")
+        cols = []
+        for i in range(k):
+            col = ttnn.slice(qkv_col, (0, i, 0, 0), (1, i + 1, self.conv_dim_local, 1))
+            out_i, st.conv = self._causal_conv_step(
+                col, conv_w, st.conv, self.conv_dim_local, 1, st.conv_step, layer
+            )
+            st.conv_step += 1
+            cols.append(out_i)
+        conv_out = cols[0] if k == 1 else ttnn.concat(cols, dim=1)
+        qkv = ttnn.permute(ttnn.transpose(conv_out, -2, -1), (0, 2, 1, 3))
+
+        q = ttnn.reshape(self._slice_last(qkv, 0, kd), (k * n_v, 1, 1, hd))
+        kk = ttnn.reshape(self._slice_last(qkv, kd, 2 * kd), (k * n_v, 1, 1, hd))
+        v = ttnn.reshape(self._slice_last(qkv, 2 * kd, 2 * kd + vd), (k * n_v, 1, 1, hd))
+        q = ttnn.multiply(self._l2norm(q), hd**-0.5)
+        kk = self._l2norm(kk)
+        g_exp = ttnn.reshape(ttnn.exp(g), (k * n_v, 1, 1, 1))
+        beta = ttnn.reshape(ttnn.sigmoid(b), (k * n_v, 1, 1, 1))
+
+        if st.recurrent is None:
+            st.recurrent = ttnn.zeros(
+                (n_v, 1, hd, hd), dtype=self.state_dtype,
+                layout=ttnn.TILE_LAYOUT, device=self.mesh,
+            )
+        outs = []
+        for i in range(k):
+            lo, hi = i * n_v, (i + 1) * n_v
+            outs.append(
+                linear_attn.decode_step(
+                    ttnn.slice(q, (lo, 0, 0, 0), (hi, 1, 1, hd)),
+                    ttnn.slice(kk, (lo, 0, 0, 0), (hi, 1, 1, hd)),
+                    ttnn.slice(v, (lo, 0, 0, 0), (hi, 1, 1, hd)),
+                    ttnn.slice(g_exp, (lo, 0, 0, 0), (hi, 1, 1, 1)),
+                    ttnn.slice(beta, (lo, 0, 0, 0), (hi, 1, 1, 1)),
+                    st.recurrent,
+                )
+            )
+        out = outs[0] if k == 1 else ttnn.concat(outs, dim=0)
+
+        out = ttnn.reshape(out, (1, 1, k * n_v, hd))
+        z_heads = ttnn.reshape(z, (1, 1, k * n_v, hd))
+        normed = ttnn.rms_norm(
+            out, epsilon=cfg.rms_norm_eps, weight=self.w.blk(layer, "ssm_norm.weight"),
+            compute_kernel_config=HIFI4,
+        )
+        gated = ttnn.reshape(
+            ttnn.multiply(normed, ttnn.sigmoid(z_heads)), (1, 1, k, vd)
+        )
+        return self.all_reduce(
+            ttnn.linear(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
+        )
+
+    def _ple_step_n(
+        self, hidden: ttnn.Tensor, layer: int, st: LayerState, histories: list[list[int]]
+    ) -> ttnn.Tensor:
+        """PLE injection for `k` rows of one sequence.
+
+        The dilated conv reads a ring that has to advance once per token, and
+        the n-gram hash reads each row's own history, so this is one `_ple_step`
+        per row rather than a batched call. It costs little: PLE runs on one
+        layer of forty-eight.
+        """
+        cfg = self.cfg
+        outs = []
+        for i, hist in enumerate(histories):
+            row = ttnn.slice(hidden, (0, 0, i, 0), (1, 1, i + 1, cfg.hc_hidden_size))
+            outs.append(
+                self._ple_step(
+                    row, layer, st, None, histories=[hist], ngram_name=f"ngram_n{i}"
+                )
+            )
+        return outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=-2)
+
+    def _attention_step_n(
+        self, mixed: ttnn.Tensor, layer: int, st: LayerState, start: int, k: int
+    ) -> ttnn.Tensor:
+        """QSA over `k` consecutive tokens of one sequence.
+
+        The K/V writes go through `paged_update_cache`, one row at a time, so the
+        index stays a tensor and the step stays traceable -- `_attention_chunk`
+        writes with `fill_cache`, which asserts a tile-aligned index and so
+        cannot start at an arbitrary position. The read is the chunk path's:
+        slice the cache to a whole tile and let an explicit additive mask carry
+        both causality among the k rows and the tile padding.
+        """
+        cfg = self.cfg
+        hd, n_q, n_kv = cfg.head_dim, cfg.num_attention_heads, cfg.num_kv_heads
+
+        qg = ttnn.reshape(
+            ttnn.linear(mixed, self.w.blk(layer, "attn_q.weight"), compute_kernel_config=HIFI4),
+            (1, k, n_q, hd * 2),
+        )
+        q = rms_norm(self._slice_last(qg, 0, hd), self.w.blk(layer, "attn_q_norm.weight"),
+                     cfg.rms_norm_eps)
+        gate = self._slice_last(qg, hd, hd * 2)
+        kt = rms_norm(
+            ttnn.reshape(
+                ttnn.linear(mixed, self.w.blk(layer, "attn_k.weight"), compute_kernel_config=HIFI4),
+                (1, k, n_kv, hd),
+            ),
+            self.w.blk(layer, "attn_k_norm.weight"), cfg.rms_norm_eps,
+        )
+        vt = ttnn.reshape(
+            ttnn.linear(mixed, self.w.blk(layer, "attn_v.weight"), compute_kernel_config=HIFI4),
+            (1, k, n_kv, hd),
+        )
+
+        positions = list(range(start, start + k))
+        cos_t, sin_t = self.rope(positions)
+        cos = ttnn.permute(self._input("stepn_cos", cos_t, ttnn.float32), (0, 2, 1, 3))
+        sin = ttnn.permute(self._input("stepn_sin", sin_t, ttnn.float32), (0, 2, 1, 3))
+        q = self._apply_rope_dev(ttnn.permute(q, (0, 2, 1, 3)), cos, sin)
+        kr = self._apply_rope_dev(ttnn.permute(kt, (0, 2, 1, 3)), cos, sin)
+
+        if st.keys is None:
+            shape = (1, n_kv, self.max_seq_len, hd)
+            st.keys = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
+            st.values = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh)
+        for i, pos in enumerate(positions):
+            idx = self._input(
+                f"stepn_pos{i}", torch.tensor([pos], dtype=torch.int32), ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
+            k_row = ttnn.reshape(ttnn.slice(kr, (0, 0, i, 0), (1, n_kv, i + 1, hd)), (1, 1, n_kv, hd))
+            v_row = ttnn.reshape(ttnn.slice(vt, (0, i, 0, 0), (1, i + 1, n_kv, hd)), (1, 1, n_kv, hd))
+            ttnn.experimental.paged_update_cache(
+                st.keys, self._l1_height_sharded(ttnn.typecast(k_row, ttnn.bfloat16), hd),
+                update_idxs_tensor=idx,
+            )
+            ttnn.experimental.paged_update_cache(
+                st.values, self._l1_height_sharded(ttnn.typecast(v_row, ttnn.bfloat16), hd),
+                update_idxs_tensor=idx,
+            )
+
+        total = start + k
+        kv_len = min(-(-total // ttnn.TILE_SIZE) * ttnn.TILE_SIZE, self.max_seq_len)
+        groups = n_q // n_kv
+        keys = ttnn.repeat_interleave(
+            ttnn.slice(st.keys, (0, 0, 0, 0), (1, n_kv, kv_len, hd)), groups, dim=1
+        )
+        values = ttnn.repeat_interleave(
+            ttnn.slice(st.values, (0, 0, 0, 0), (1, n_kv, kv_len, hd)), groups, dim=1
+        )
+        qpos = torch.arange(k).unsqueeze(-1) + start
+        kpos = torch.arange(kv_len).unsqueeze(0)
+        mask = torch.where(kpos <= qpos, 0.0, float("-inf")).reshape(1, 1, k, kv_len)
+        out = ttnn.transformer.scaled_dot_product_attention(
+            q, keys, values, attn_mask=self._input("stepn_mask", mask, ttnn.bfloat16),
+            is_causal=False, scale=hd**-0.5, compute_kernel_config=HIFI4,
+        )
+        out = ttnn.reshape(ttnn.permute(out, (0, 2, 1, 3)), (1, 1, k, n_q * hd))
+        gate = ttnn.reshape(gate, (1, 1, k, n_q * hd))
+        return ttnn.linear(
+            ttnn.multiply(out, ttnn.sigmoid(gate)),
+            self.w.blk(layer, "attn_output.weight"), compute_kernel_config=HIFI4,
+        )
+
+    def _ple_step(
+        self, hidden: ttnn.Tensor, layer: int, st: LayerState, state: TTState | None,
+        histories: list[list[int]] | None = None, ngram_name: str = "ngram",
+    ) -> ttnn.Tensor:
         cfg = self.cfg
         batch = hidden.shape[-2]
-        emb = self._input("ngram", self.ngram_embed(state.histories), ttnn.bfloat16)
+        if histories is None:
+            histories = state.histories
+        emb = self._input(ngram_name, self.ngram_embed(histories), ttnn.bfloat16)
 
         key = grouped_rms_norm(
             ttnn.linear(emb, self.w.blk(layer, "ple_key.weight"), compute_kernel_config=HIFI4),
@@ -966,6 +1160,12 @@ class TTModel:
             self.w.blk(layer, "hc_ffn_inject.weight"),
             cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
         )
+        return reinject(hidden, self._moe_block(mixed, layer), inject, cfg.hc_count)
+
+    def _moe_block(self, mixed: ttnn.Tensor, layer: int) -> ttnn.Tensor:
+        """Routed experts plus the shared one. Per-token, so it is unchanged by
+        how many rows the caller brings."""
+        cfg = self.cfg
         if self.fuse_expert_gate_up:
             gate_w, up_w = self.w.fused_gate_up(layer), None
         else:
@@ -989,7 +1189,7 @@ class TTModel:
             self.w.blk(layer, "ffn_down_shexp.weight"),
             self.w.blk(layer, "ffn_gate_inp_shexp.weight"),
         )
-        return reinject(hidden, ttnn.add(routed, shared), inject, cfg.hc_count)
+        return ttnn.add(routed, shared)
 
     # -- public API ------------------------------------------------------------
 
@@ -1022,6 +1222,85 @@ class TTModel:
             cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
         )
         state.positions = [p + 1 for p in state.positions]
+        return mixed
+
+    def step_n(self, tokens: list[int], state: TTState) -> ttnn.Tensor:
+        """Advance one sequence by `k` tokens in a single step.
+
+        Returns the mixed hidden for all k positions, [1, 1, k, hidden], so a
+        caller can read the logits the sequence would have produced at each --
+        which is what a speculative verifier needs.
+
+        The point is that a step is flat in batch up to 64 rows, so the k tokens
+        ride the batch axis for everything that is per-token, and only the
+        convolution and the DeltaNet recurrence are unrolled. Measured against
+        the alternative of feeding them one at a time
+        (`scripts/dev/short_chunk_bench.py` and `step_n_check.py`).
+
+        Single-sequence: `state` must have `batch == 1`, and its caches and rings
+        stay single-sequence while the activations carry k rows. On return the
+        state has consumed all k tokens -- committing only a prefix means
+        snapshotting first and replaying, which is a caller's problem and the
+        remaining piece of speculative decoding.
+
+        The chunked path is *not* the right verifier, which is why this exists:
+        it has a ~1.3 s fixed cost per call (`deltanet.prepare()` round-trips
+        ~30 MB a layer to the host) and so never beats a 236 ms traced step for
+        small k, and being host-bound it cannot be captured either.
+        """
+        cfg = self.cfg
+        k = len(tokens)
+        if state.batch != 1:
+            raise NotImplementedError("step_n advances one sequence at a time")
+        if not 0 < k <= 64:
+            raise ValueError(f"k must be in 1..64 (the batch cliff), got {k}")
+        start = state.positions[0]
+
+        # Each row's PLE n-gram hash reads that row's own history, so the
+        # histories have to grow as the rows do.
+        base = list(state.histories[0])
+        histories = []
+        for i, tok in enumerate(tokens):
+            base.append(tok)
+            histories.append(list(base))
+        state.histories[0] = base
+
+        emb = self._input("embed_n", self.embed(tokens), ttnn.bfloat16)
+        hidden = ttnn.repeat(emb, (1, 1, 1, cfg.hc_count))
+
+        for layer in range(cfg.num_layers):
+            st = state[layer]
+            if layer in self._ple_layers:
+                hidden = ttnn.add(hidden, self._ple_step_n(hidden, layer, st, histories))
+            mixed, inject = gated_residual_mix(
+                hidden, self.w.blk(layer, "hc_attn_norm.weight"),
+                self.w.blk(layer, "hc_attn_down.weight"), self.w.blk(layer, "hc_attn_up.weight"),
+                self.w.blk(layer, "hc_attn_inject.weight"),
+                cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
+            )
+            branch = (
+                self._attention_step_n(mixed, layer, st, start, k)
+                if cfg.is_full_attention(layer)
+                else self._linear_attention_step_n(mixed, layer, st, k)
+            )
+            hidden = reinject(hidden, branch, inject, cfg.hc_count)
+
+            mixed, inject = gated_residual_mix(
+                hidden, self.w.blk(layer, "hc_ffn_norm.weight"),
+                self.w.blk(layer, "hc_ffn_down.weight"), self.w.blk(layer, "hc_ffn_up.weight"),
+                self.w.blk(layer, "hc_ffn_inject.weight"),
+                cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
+            )
+            hidden = reinject(hidden, self._moe_block(mixed, layer), inject, cfg.hc_count)
+            if self.probe is not None:
+                self.probe(layer, hidden)
+
+        mixed, _ = gated_residual_mix(
+            hidden, self.w.get("output_hc_norm.weight"), self.w.get("output_hc_down.weight"),
+            self.w.get("output_hc_up.weight"), None,
+            cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
+        )
+        state.positions = [start + k]
         return mixed
 
     def logits(self, hidden: ttnn.Tensor) -> torch.Tensor:
