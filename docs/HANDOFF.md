@@ -240,59 +240,79 @@ is back to 236.1 ms from 239.1; attn_qkv costs ~200 MB more per device.
 what any change to the plan or the shard layout needs.
 
 
-### 5.2 Chunked prefill inside the trace — the `prepare()` blocker is gone
+### 5.2 Chunked prefill inside the trace — every unknown resolved, refactor not done
 
 Chunked prefill works and is on for one-slot engines, but it turns the trace off:
-it runs eagerly and allocates gigabytes of temporaries per call, and after a few
-of them the trace replay came back as token 0 repeated. Eager prefill is correct
--- warm and cold turns agree token for token -- so this is about getting both at
-once.
+it runs eagerly, and a captured prefill graph replayed as token 0 repeated.
+Eager prefill is correct -- warm and cold turns agree token for token -- so this
+is about getting both at once.
 
-**The stated prerequisite is done.** `deltanet.prepare_device` builds
-`gated_delta_attn_seq`'s eight inputs on device, in the op's own
+**The blocker this item was filed with is gone.** `deltanet.prepare_device`
+builds `gated_delta_attn_seq`'s eight inputs on device, in the op's own
 `[H, NC, C, D]` layout, so each device prepares the heads it already holds and
-nothing is gathered. The chunk path contains no host round trip at all --
-`tests/test_prefill_contract.py::test_chunked_deltanet_never_leaves_the_device`
-keeps it that way -- and the chunk's fixed cost fell from ~1.3 s to 850 ms.
-Doing it turned up a real bug in *both* engines; see `docs/iterations/017`.
+nothing is gathered. The chunk path has no host round trip at all, and
+`test_chunked_deltanet_never_leaves_the_device` keeps it that way. Doing it
+turned up an unstable inverse in both engines; `docs/iterations/017`.
 
-**What blocks it now, precisely.** Four host dependencies remain, all in
-`_attention_chunk`:
+**What remained: four host dependencies, all in `_attention_chunk`.**
 
-1. `self.rope(range(start, start + seq))` builds cos/sin on the host and copies
-   them in. Needs a pre-allocated device buffer written before replay, exactly
-   as `TracedDecoder._fill_inputs` already does for the decode inputs.
+1. `self.rope(range(start, start + seq))` builds cos/sin on the host.
 2. `ttnn.fill_cache(..., update_idx=start)` takes a Python int, so a capture
-   bakes in one slot and every replay writes it again.
-3. The causal mask is built with `torch.arange` and copied in.
-4. `kv_len` grows with the chunk index, so the shapes are not static and one
-   trace cannot cover every chunk.
+   bakes in one slot.
+3. The causal mask is built with `torch.arange`.
+4. `kv_len` grows with the chunk index, so shapes are not static.
 
-**The route, and it is better than the docstring in `_attention_chunk`
-suggests.** Two ops already do what is needed, both verified present in this
-build (`scripts/dev/` probes):
+**All four have a verified answer.** A paged K/V cache. Every op it needs exists
+in this build and was measured at this model's real shapes -- b=1, 24 q heads,
+2 kv heads, head_dim 256, block 32 -- by
+`scripts/dev/paged_attention_probe.py`:
 
-* `ttnn.experimental.paged_fill_cache(cache, input, page_table, ...)` takes the
-  page table as a *device tensor*, so where a chunk lands is data, killing (2).
-* `ttnn.transformer.chunked_scaled_dot_product_attention` accepts
-  `chunk_start_idx_tensor` (int32, shape `[1]`, on device) and its own docs name
-  the use case: "Trace capture/replay: capture one SDPA call, then replay with
-  different chunk_start_idx by updating the tensor on device (no recompile). One
-  program handles variable prefix lengths by updating the tensor each step."
-  It is causal internally, so it kills (3) and (4) together.
+| op | position comes from | result |
+|---|---|---|
+| `ttnn.experimental.paged_fill_cache` | page table (device tensor) | cache round-trips **exactly** (max abs 0) |
+| `ttnn.transformer.chunked_scaled_dot_product_attention` | `chunk_start_idx_tensor` (device) | **1.0 / 1.5 / 1.9 %** from the dense device path at chunk 0 / 128 / 256 |
+| `ttnn.transformer.paged_scaled_dot_product_attention_decode` | `page_table_tensor` + `cur_pos_tensor` | 3.7 % from a float32 reference |
+| `ttnn.experimental.paged_update_cache` | `update_idxs_tensor` + page table | documented paged mode; already used flat |
 
-The cost is that both want a paged K/V cache -- `[max_num_blocks, 1, block_size,
-head_dim]` plus a page table -- while `st.keys`/`st.values` are flat
-`[1, n_kv, T, head_dim]`. Decode calls
-`ttnn.experimental.paged_update_cache(update_idxs_tensor=)` on that flat cache
-and works; repaging touches decode too, so do it behind a measurement of decode
-quality (`device_quality.py`, 83.0 % top-1 / NLL 0.682) and not in the same
-change as anything else.
+Two things that table settles. The chunked op is **causal internally**, so it
+needs no mask and no growing slice -- (3) and (4) go together, and the
+`repeat_interleave` that expands 2 kv heads to 24 goes with them, since it takes
+`nkv` directly. And *decode has a paged variant too*, so one layout serves both
+paths -- which matters because K/V is 6.4 GB a slot at full context and there is
+no room to keep two.
 
-**Worth it?** Yes, and the number is large: a 128-token chunk issues 19733
-device calls (`op_count.py --prefill 128`) against 6355 for a single-token step,
-and at 936-1101 ms per chunk that is ~0.06 ms a call -- the chunk is
-dispatch-bound, which is precisely what a trace removes.
+On the accuracy column: do not read the float32 numbers as error growth in the
+paged route. The dense path in use today is itself 1.9 / 4.3 / 6.5 % from
+float32 at those chunks -- that is bf16 accumulating over more keys. Paged and
+dense agree with *each other* far more closely than either agrees with float32,
+and at chunk 256 paged is the closer of the two (6.119 vs 6.456).
+
+**So this is now a mechanical refactor, in this order:**
+
+1. Allocate `st.keys`/`st.values` paged, `[T/32, n_kv, 32, head_dim]`, plus a
+   per-slot page table as a device tensor.
+2. Move decode to `paged_update_cache(page_table=...)` and
+   `paged_scaled_dot_product_attention_decode`. **Gate on decode quality
+   (`device_quality.py`, 83.0 % top-1 / NLL 0.682) before touching prefill** --
+   this is the step that can regress a working path, and it is worth its own
+   commit.
+3. Move `_attention_chunk` to `paged_fill_cache` + `chunked_scaled_dot_product_attention`,
+   deleting the host mask, the `kv_len` slice and the `repeat_interleave`.
+4. Make rope's cos/sin a bound buffer written before replay, as
+   `TracedDecoder._fill_inputs` already does for the decode inputs. That is
+   dependency (1) and the only one left after step 3.
+5. Capture. `chunk_start_idx` must be a multiple of both `q_chunk_size` and
+   `k_chunk_size` (an upstream workaround the op documents), so fix the prefill
+   chunk at 128 for the traced path.
+
+**One complication, named so it is not a surprise:** the QSA indexer addresses
+the cache with uint16 `ttnn.scatter` indices over a flat layout, so step 1
+touches it. It is off for `max_seq_len <= 2048`, which is where prefill is
+measured, so it can follow rather than block -- but it must not be forgotten.
+
+**Worth it?** A 128-token chunk issues 12293 device calls
+(`op_count.py --prefill 128`) at ~1060 ms, so it is essentially all dispatch,
+which is exactly what a trace removes. See also 5.7.
 
 Done when: `use_trace=True` and `chunked_prefill=True` together reproduce the
 eager result token for token over
