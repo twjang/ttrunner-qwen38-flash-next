@@ -7,9 +7,11 @@
 > every path. With those fixed the device predicts real text as well as the
 > float32 reference (83.0 % next-token top-1 against 80.9 %), chunked prefill
 > matches the decode path and is enabled for one-slot engines, and prefix reuse
-> across chat turns is in. A1-A4 are therefore done or moot; A5 (the missing QSA
-> indexer) and all of Part B still stand as written. `docs/HANDOFF.md` §5 carries
-> the current ordering.
+> across chat turns is in. A1-A4 are therefore done or moot, and A5 (the QSA
+> indexer) is done too -- `docs/iterations/015`. Part B still stands as written;
+> its speculation items are only *exact* if the verifier is the model you meant
+> to run, which as of 014 it finally is. `docs/HANDOFF.md` §5 carries the
+> current ordering.
 
 Date: 2026-09-02. Status of the code this is written against: branch
 `feat/ttnn-inference-stack`, single user, 1 slot, 262144-token context, traced
