@@ -1,6 +1,12 @@
 """How much of the device's gap is the weights, and how much is everything else?
 
-    uv run python scripts/dev/simulated_precision.py [total]      (default 48)
+    uv run python scripts/dev/simulated_precision.py [total] [--experts DTYPE]
+                                                     (default 48, plan dtype)
+
+`--experts` overrides the dtype used for the MoE expert stacks, which is how to
+price a change to the precision policy before spending a 40 GB conversion on
+it: they are the only bfloat4_b tensors in the model and they dominate the
+24.94 GB, so raising them is a memory trade.
 
 The device agrees with the float32 oracle on 40 % of greedy tokens. Every block
 is at its dtype floor and nothing structural is left, so the gap is precision --
@@ -33,7 +39,13 @@ from twtest.reference.weights import WeightStore
 from twtest.tt.blockfloat import round_trip
 from twtest.tt.plan import Residency, plan_for
 
-TOTAL = int(sys.argv[1]) if len(sys.argv) > 1 else 48
+argv = sys.argv[1:]
+EXPERTS = None
+if "--experts" in argv:
+    i = argv.index("--experts")
+    EXPERTS = argv[i + 1]
+    argv = argv[:i]
+TOTAL = int(argv[0]) if argv else 48
 torch.set_num_threads(8)
 
 TEXT = (
@@ -62,12 +74,15 @@ def quantise(name: str, flat: np.ndarray) -> np.ndarray:
         return flat
     if plan.residency is not Residency.DEVICE:
         return flat                       # stays on the host, dequantised
+    dtype = plan.dtype
+    if EXPERTS is not None and "_exps." in name:
+        dtype = EXPERTS
     try:
-        out = round_trip(flat, plan.dtype)
+        out = round_trip(flat, dtype)
     except Exception as exc:              # a size that is not a whole number of blocks
-        skipped[name] = f"{plan.dtype}: {exc}"
+        skipped[name] = f"{dtype}: {exc}"
         return flat
-    seen[name] = plan.dtype
+    seen[name] = dtype
     return out
 
 

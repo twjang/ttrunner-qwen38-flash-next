@@ -429,6 +429,10 @@ class TTModel:
         # The expansion has to happen *inside* each sequence: flattening batch
         # and head together first would wrap across sequences and pair sequence
         # b's query with sequence b-1's value.
+        # `repeat` along a new axis -- reshape to (batch*n_k, 1, 1, hd), copy
+        # `reps` times, flatten -- expresses the same grouping and was measured
+        # to cost the same (237.2 vs 236.4 ms traced, inside the noise), so the
+        # clearer form stays.
         q = ttnn.repeat_interleave(ttnn.reshape(q, (batch, 1, n_k, hd)), reps, dim=2)
         k = ttnn.repeat_interleave(ttnn.reshape(k, (batch, 1, n_k, hd)), reps, dim=2)
         q = ttnn.reshape(q, (batch * n_v, 1, 1, hd))
