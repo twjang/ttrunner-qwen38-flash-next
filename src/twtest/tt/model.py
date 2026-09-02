@@ -1081,15 +1081,25 @@ class TTModel:
         ttnn.fill_cache(st.values, ttnn.permute(v, (0, 2, 1, 3)), 0, update_idx=start)
 
         total = start + seq
-        keys = ttnn.slice(st.keys, (0, 0, 0, 0), (1, n_kv, total, hd))
-        values = ttnn.slice(st.values, (0, 0, 0, 0), (1, n_kv, total, hd))
+        # Slice to a whole number of tiles. Both the K/V slice and the mask are
+        # TILE_LAYOUT, so a key length that is not a multiple of 32 gets padded
+        # -- and an additive mask pads with *zeros*, which means "attend to me".
+        # The softmax then spread over up to 31 all-zero key positions and
+        # diluted the real ones: at one token this block returned roughly v/32
+        # instead of v (99.7 % wrong against a float32 host computation), and
+        # the error decayed as real positions crowded the padding out. Padding
+        # explicitly and letting the causal condition run over the padded width
+        # masks it, because every query position is < total by construction.
+        kv_len = min(-(-total // ttnn.TILE_SIZE) * ttnn.TILE_SIZE, self.max_seq_len)
+        keys = ttnn.slice(st.keys, (0, 0, 0, 0), (1, n_kv, kv_len, hd))
+        values = ttnn.slice(st.values, (0, 0, 0, 0), (1, n_kv, kv_len, hd))
         groups = n_q // n_kv
         keys = ttnn.repeat_interleave(keys, groups, dim=1)
         values = ttnn.repeat_interleave(values, groups, dim=1)
 
         qpos = torch.arange(seq).unsqueeze(-1) + start
-        kpos = torch.arange(total).unsqueeze(0)
-        mask = torch.where(kpos <= qpos, 0.0, float("-inf")).reshape(1, 1, seq, total)
+        kpos = torch.arange(kv_len).unsqueeze(0)
+        mask = torch.where(kpos <= qpos, 0.0, float("-inf")).reshape(1, 1, seq, kv_len)
         out = ttnn.transformer.scaled_dot_product_attention(
             q, keys, values, attn_mask=self.to_dev(mask, ttnn.bfloat16), is_causal=False,
             scale=hd**-0.5, compute_kernel_config=HIFI4,

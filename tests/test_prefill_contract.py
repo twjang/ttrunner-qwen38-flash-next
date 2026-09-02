@@ -67,3 +67,15 @@ def test_chunked_conv_taps_are_keyed_by_layer() -> None:
     src = inspect.getsource(TTModel._causal_conv_chunk)
     assert '("ssm_chunk", layer)' in src
     assert '("ssm_chunk", channels)' not in src
+
+
+def test_chunked_attention_masks_the_tile_padding() -> None:
+    """The K/V slice and the additive mask are TILE_LAYOUT, so a key length that
+    is not a multiple of 32 is padded -- with zeros, which an additive mask reads
+    as "attend to me". Slicing to a whole tile and running the causal condition
+    over that width is what masks the pad; a slice to `total` does not."""
+    src = inspect.getsource(TTModel._attention_chunk)
+    assert "ttnn.TILE_SIZE" in src
+    assert "(1, n_kv, kv_len, hd)" in src
+    assert "torch.arange(kv_len)" in src
+    assert "(1, n_kv, total, hd)" not in src
