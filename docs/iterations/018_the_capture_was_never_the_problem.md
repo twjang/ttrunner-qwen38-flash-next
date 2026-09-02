@@ -76,6 +76,24 @@ The control that makes those readings trustworthy: the same harness on cq 0
 *without* the decoder replay returns `[75, 220]` in 265.0 ms. The fixture is
 sound; the interleaving is not.
 
+## Observation 4 — it is not about *which* two traces
+
+Found later, while starting 5.2's step 5. A traced chunked prefill would
+alternate with the traced decode step exactly as a traced verifier does, so the
+question "is this defect specific to decoder-vs-step_n?" stopped being academic.
+
+It is not. Two `step_n` captures at k=2 and k=4, replayed alternately with no
+decoder anywhere in the process, hang identically
+(`spec_capture_ladder.py two_stepn`). **Any two traces replayed alternately hang
+this build.**
+
+Which retroactively explains a symptom recorded in 5.2 long before anyone knew
+the cause: capturing the prefill graph made the trace replay "come back as token
+0 repeated". That is a trace that is not executing and not blocking either,
+returning whatever the buffers last held -- the same signature the
+second-command-queue experiment produced above. Two items that looked like
+separate mysteries are one defect, and one upstream fix closes both.
+
 ## Where it leaves 5.6
 
 Still refused, but for a stated and reproducible reason instead of a mystery, and

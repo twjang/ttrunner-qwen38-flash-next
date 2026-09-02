@@ -23,6 +23,11 @@ Stages:
     both_replay  capture both, replay the decoder, then replay step_n  -- HANGS
     stepn_only   capture both, replay *only* step_n: is the trigger the second
                  live trace, or the interleaving?
+    two_stepn    two step_n captures (k=2 and k=4), replayed alternately. Is the
+                 defect specific to decoder-vs-step_n, or general to any two
+                 traces? If general, the traced chunked prefill in 5.2 is
+                 blocked by the same thing, since it would alternate a prefill
+                 replay with the decoder's.
     verify_cq    the whole point: with both traces live and the decoder replayed
                  in between, does the step_n replay produce the *right tokens*,
                  and how long does it take? "It did not hang" is not a fix -- a
@@ -64,7 +69,7 @@ from twtest.tt.traced import TracedDecoder, TracedStepN
 STAGE = sys.argv[1] if len(sys.argv) > 1 else "snapshot"
 K = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 BUDGET = 420.0
-STAGES = ("baseline", "snapshot", "thread", "no_replay", "both_replay", "stepn_only", "verify_cq")
+STAGES = ("baseline", "snapshot", "thread", "no_replay", "both_replay", "stepn_only", "verify_cq", "two_stepn")
 if STAGE not in STAGES:
     raise SystemExit(f"stage must be one of {STAGES}, got {STAGE}")
 
@@ -169,10 +174,36 @@ def verify_cq():
     dec.release()
 
 
+def two_stepn():
+    """Two distinct step_n graphs, replayed alternately. No decoder involved."""
+    toks = synthetic_prompt(32)          # long enough for 8 warm + 2 + 4 + 2
+    st = m.new_state(batch=1)
+    for t in toks[:8]:
+        m.step([t], st)
+    print("RESULT capturing step_n k=2", flush=True)
+    a = TracedStepN(m, st, 2)
+    print("RESULT capturing step_n k=4", flush=True)
+    b = TracedStepN(m, st, 4)
+    print("RESULT both captured; replaying k=2", flush=True)
+    a.step_n(toks[8:10])
+    print("RESULT k=2 replayed; replaying k=4  <-- the alternation", flush=True)
+    b.step_n(toks[10:14])
+    print("RESULT k=4 replayed; replaying k=2 again", flush=True)
+    a.step_n(toks[14:16])
+    print("RESULT alternated cleanly -- the defect is NOT general", flush=True)
+    out["general"] = False
+    a.release()
+    b.release()
+
+
 def work():
     try:
         if STAGE == "verify_cq":
             verify_cq()
+            out["ok"] = True
+            return
+        if STAGE == "two_stepn":
+            two_stepn()
             out["ok"] = True
             return
         st = m.new_state(batch=1)

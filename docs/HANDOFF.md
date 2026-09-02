@@ -307,7 +307,22 @@ only when the chunk is a full 128 at a 128-aligned start, with the all-32 config
 as the fallback. And a misaligned start is *silent*, not an error: at
 q_chunk_size=128 a start of 32 returns 257 % nonsense.
 
-**What is left is step 5 alone: the capture.**
+**What is left is step 5 alone: the capture -- and it is blocked by 5.6's
+defect, which is the same defect.** Replaying two traces *alternately* hangs
+this ttnn build, whichever two: `spec_capture_ladder.py two_stepn` reproduces it
+with two `step_n` graphs and no decoder anywhere. A traced prefill would alternate
+with the traced decode step exactly as a traced verifier does, so it cannot work
+until that is fixed upstream.
+
+That also explains this item's original symptom, recorded long before the cause
+was known: "after a few of them the trace replay came back as token 0 repeated".
+A trace that is not executing but also not blocking returns stale buffers -- the
+same signature the second-command-queue experiment produced in 5.6.
+
+So steps 1-4 stand on their own merits: the cache is paged, both paths take
+their positions from device memory, and the chunk path is free of host work,
+all bit-identical and speed-neutral. Step 5 is one `execute_trace` fix away, and
+that fix lands 5.6 with it.
 
 The original plan, for the record:
 
@@ -444,11 +459,16 @@ is the **first replay of the verifier**, and a stack dump says so directly --
 `ttnn.execute_trace` in `TracedStepN.step_n` (traced.py:130), from
 `speculate_round` (engine.py:565).
 
-**It is the interleaving.** A speculating engine replays the decoder's trace on
-plain rounds and `step_n` on drafted ones. `traced_step_n_check.py` never does
-that -- it releases both captures before replaying `step_n` alone -- which is why
-no harness ever hung. `scripts/dev/spec_capture_ladder.py` is the sixty-line
-reproduction, no engine, no asyncio, no admission loop:
+**It is the interleaving, and it is general.** A speculating engine replays the
+decoder's trace on plain rounds and `step_n` on drafted ones.
+`traced_step_n_check.py` never does that -- it releases both captures before
+replaying `step_n` alone -- which is why no harness ever hung. The defect is not
+about *which* two graphs, either: `spec_capture_ladder.py two_stepn` alternates
+two `step_n` captures (k=2 and k=4) with no decoder involved and hangs the same
+way. **Any two traces replayed alternately hang**, which is also what blocks
+5.2's step 5, and what produced its "token 0 repeated" symptom.
+`scripts/dev/spec_capture_ladder.py` is the sixty-line reproduction, no engine,
+no asyncio, no admission loop:
 
 | configuration | outcome |
 |---|---|
@@ -466,8 +486,10 @@ tokens with a 9.6 ms verify. It was briefly committed as the fix on the evidence
 that the hang stopped; do not repeat that.
 
 **Next step is upstream, not another workaround.** The reproduction is small
-enough to hand to tt-metal. Until then the flag stays refused, because it takes
-the boards with it.
+enough to hand to tt-metal, and it is worth more than one item: the same fix
+lands 5.2's traced prefill, since that alternates a prefill replay with the
+decode step's. Until then the flag stays refused, because it takes the boards
+with it.
 
 **It is also not identical to token-by-token decoding**, despite greedy
 acceptance. The verifier batches k rows where the stepper runs one, bf16 rounding
