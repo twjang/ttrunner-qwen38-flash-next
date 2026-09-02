@@ -235,8 +235,31 @@ validated at 1.0 % in iteration 007; the weights are already on device and
 Keep shapes static so the step stays traceable: always select exactly 512
 blocks, masking the surplus below 2048.
 
+What was checked before writing any of it (2026-09-02), so it need not be
+rediscovered:
+
+* `ttnn.transformer.scaled_dot_product_attention_decode` **does** take
+  `attn_mask` (`[b, 1, s, s]`), so the selection can be applied to the existing
+  decode attention rather than replacing it.
+* `ttnn.experimental.indexer_score_dsa` computes
+  `sum_h relu(q[b,h,s,:] . k[b,t,:]) * weights[b,h,s]`. Our scoring has no
+  learned per-head gate, so pass `weights = 1/sqrt(indexer_head_dim)`. Two
+  catches: it scores against *per-token* keys, and this model scores pooled
+  4-token blocks, so `k` has to be the pooled cache with `T = n_blocks`; and its
+  causality is `t <= chunk_start_idx + s`, which for block scoring needs
+  `chunk_start_idx = (p + 1) // 4 - 1` — a Python int, therefore **baked into a
+  captured trace**. Either keep the indexer out of the traced region or score
+  with matmul + relu + sum and mask from a tensor, which is traceable.
+* The pooled-block cache can be written unconditionally, which is what tracing
+  needs: at position p write `pooled[p // 4] = mean(raw[4*(p//4) .. +4])` every
+  step. A partially filled block holds a wrong value, but a block is only
+  eligible once `4j + 3 <= p`, by which point all four slots are real.
+* Read `_indexer_mask` in `reference/model.py` as it is *now*: its tail is
+  per-query (`docs/iterations/013`, observation 4). The old global-`kv_len`
+  form is what made the reference disagree with itself.
+
 Done when: device and reference agree on the next token after a 3000-token
-prompt, the < 2048 result is unchanged, and step time is within 5 % of 229 ms.
+prompt, the < 2048 result is unchanged, and step time is within 5 % of 236 ms.
 
 ### 5.4 Prefix reuse across turns — **done**
 

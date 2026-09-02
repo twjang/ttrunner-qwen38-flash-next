@@ -7,7 +7,12 @@
 how to price a change to the precision policy before spending a 40 GB conversion
 on it. `--group experts|dense` quantises only one of the two families, which is
 what separates "the 4-bit experts are the problem" from "the bfloat8_b dense
-weights are".
+weights are". `--all-dtype DTYPE` puts every device tensor in one dtype, which
+is how to ask whether the damage is the mantissa width or block float's shared
+exponent -- bfloat16 has more mantissa than bfloat8_b and no shared exponent at
+all. `--dense DTYPE` raises only the non-expert weights, which is the change
+that is actually affordable: they are 1.12 GB/device at bfloat8_b, so bfloat16
+costs about +1 GB where raising the experts costs +10.
 
 The device agrees with the float32 oracle on 40 % of greedy tokens. Every block
 is at its dtype floor and nothing structural is left, so the gap is precision --
@@ -43,11 +48,18 @@ from twtest.tt.plan import Residency, plan_for
 argv = sys.argv[1:]
 EXPERTS = None
 GROUP = "all"
-for flag, setter in (("--experts", "EXPERTS"), ("--group", "GROUP")):
+ALL_DTYPE = None
+DENSE = None
+for flag, setter in (("--experts", "EXPERTS"), ("--group", "GROUP"),
+                     ("--all-dtype", "ALL"), ("--dense", "DENSE")):
     if flag in argv:
         i = argv.index(flag)
         if setter == "EXPERTS":
             EXPERTS = argv[i + 1]
+        elif setter == "ALL":
+            ALL_DTYPE = argv[i + 1]
+        elif setter == "DENSE":
+            DENSE = argv[i + 1]
         else:
             GROUP = argv[i + 1]
         argv = argv[:i] + argv[i + 2:]
@@ -87,9 +99,11 @@ def quantise(name: str, flat: np.ndarray) -> np.ndarray:
         return flat                       # left exact, to isolate the experts
     if GROUP == "dense" and is_expert:
         return flat
-    dtype = plan.dtype
+    dtype = ALL_DTYPE or plan.dtype
     if EXPERTS is not None and is_expert:
         dtype = EXPERTS
+    if DENSE is not None and not is_expert:
+        dtype = DENSE
     try:
         out = round_trip(flat, dtype)
     except Exception as exc:              # a size that is not a whole number of blocks
@@ -108,7 +122,8 @@ def predictions(store: WeightStore):
 exact_store = WeightStore(gguf, cache_bytes=2 << 30, row_cache_bytes=8 << 30)
 exact, h_exact = predictions(exact_store)
 print(f"RESULT exact reference ready, {len(ids)} positions "
-      f"(group={GROUP}, experts={EXPERTS or 'plan'})", flush=True)
+      f"(group={GROUP}, experts={EXPERTS or 'plan'}, dense={DENSE or 'plan'}, "
+      f"all={ALL_DTYPE or 'plan'})", flush=True)
 
 quant_store = WeightStore(
     gguf, cache_bytes=2 << 30, row_cache_bytes=8 << 30, quant_sim=quantise
