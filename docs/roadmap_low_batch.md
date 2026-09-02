@@ -145,7 +145,7 @@ them all). Past 2048 tokens the real model keeps the top-512 blocks by indexer
 score and the device model keeps everything -- different outputs, and the
 divergence grows with the prompt. The indexer weights are loaded
 (`plan.py`, `blk.N.indexer.*`), the scoring op `experimental.indexer_score_dsa`
-was validated at 1.0 % (`README`, op table), `LayerState.indexer_keys` exists,
+was validated at 1.0 % (`README`, op table), `LayerState.indexer_blocks` and `indexer_ring` exist,
 and nothing uses them. The CPU reference (`reference/layers.py`) implements the
 selection and is the oracle.
 

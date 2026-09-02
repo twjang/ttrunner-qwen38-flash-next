@@ -42,5 +42,5 @@ def test_position_property_reports_the_first_sequence() -> None:
 def test_layer_state_starts_empty() -> None:
     """Every buffer is allocated lazily, on first use, at its final size."""
     layer = LayerState()
-    for field in ("conv", "recurrent", "keys", "values", "indexer_keys", "ple_conv"):
+    for field in ("conv", "recurrent", "keys", "values", "indexer_blocks", "indexer_ring", "ple_conv"):
         assert getattr(layer, field) is None, field

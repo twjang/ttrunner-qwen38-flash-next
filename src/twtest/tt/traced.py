@@ -105,6 +105,32 @@ class TracedDecoder:
             "cur_pos", torch.tensor(list(state.positions), dtype=torch.int32),
             ttnn.int32, ttnn.ROW_MAJOR_LAYOUT,
         )
+        if "idx_bias" in bound:
+            # QSA's sparse selection reads five more per-step inputs. They are
+            # all derived from the position, and they have to be written here
+            # like every other one: a host-to-device copy is refused *during*
+            # capture, which is what `TTModel._skip_copy` is for.
+            ratio = model.indexer_ratio
+            starts = [ratio * (p // ratio) for p in state.positions]
+            b_cos, b_sin = model.rope(starts)
+            write("idx_block_cos", b_cos, ttnn.float32)
+            write("idx_block_sin", b_sin, ttnn.float32)
+            write(
+                "idx_block_pos",
+                torch.tensor([p // ratio for p in state.positions], dtype=torch.int32),
+                ttnn.int32, ttnn.ROW_MAJOR_LAYOUT,
+            )
+            write("idx_bias", model._block_bias(list(state.positions)), ttnn.float32)
+            width = model.indexer_topk * ratio
+            write(
+                "idx_cur_pos_f",
+                torch.tensor(list(state.positions), dtype=torch.float32)
+                .reshape(-1, 1, 1, 1).expand(-1, 1, 1, width).contiguous(),
+                ttnn.float32,
+            )
+            tail_idx, tail_vis = model._tail_block(list(state.positions))
+            write("idx_tail", tail_idx, ttnn.float32)
+            write("idx_tail_vis", tail_vis, ttnn.float32)
 
     # -- public API ---------------------------------------------------------
 

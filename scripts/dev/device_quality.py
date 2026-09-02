@@ -19,6 +19,7 @@ which is exactly how a wrong head pairing survived being eyeballed).
 
 The float32 reference scores 80.9 % top-1 / 97.9 % top-5, mean NLL 0.703.
 """
+import os
 import sys
 
 import torch
@@ -48,7 +49,9 @@ TEXT = (
     "hieroglyphs, a writing system that had been unreadable for centuries."
 )
 
-mesh, cfg, m = open_model(max_seq_len=512)
+SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "512"))
+mesh, cfg, m = open_model(max_seq_len=SEQ)
+print(f"RESULT max_seq_len {SEQ}  indexer {'on' if m.use_indexer else 'off'}", flush=True)
 tok = tokenizer(cfg)
 ids = tok.encode(TEXT)[:N]
 

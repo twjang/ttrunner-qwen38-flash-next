@@ -41,7 +41,12 @@ class LayerState:
     recurrent: ttnn.Tensor | None = None       # [BH, 1, Dk, Dv]
     keys: ttnn.Tensor | None = None            # [1, n_kv, T, head_dim]
     values: ttnn.Tensor | None = None
-    indexer_keys: ttnn.Tensor | None = None    # [1, 1, T, indexer_dim] pre-norm/pre-rope
+    # The QSA indexer's compressed keys: one row per `indexer_compress_ratio`
+    # tokens, already mean-pooled, normed and roped, so a block never changes
+    # once complete. `indexer_ring` holds the last `ratio` raw keys the pool is
+    # taken over.
+    indexer_blocks: ttnn.Tensor | None = None  # [batch, 1, T/ratio, indexer_dim]
+    indexer_ring: list | None = None
     ple_conv: list | None = None      # ring of `state_len` single-column tensors
     ple_step: int = 0
 
@@ -132,6 +137,39 @@ class TTModel:
         # overflows Blackhole's 1.5 MB per core for 24 heads at head_dim 256
         # ("circular buffers grow to 1917696 B beyond max L1 size of 1572864 B"),
         # so the chunk is set explicitly rather than left to the default.
+        # -- QSA sparse selection ------------------------------------------
+        # Below the budget QSA keeps every complete block, so dense causal
+        # attention is exactly right and cheaper; the selection only earns its
+        # keep past it. Whether it runs is therefore a property of the *model*,
+        # not of the position -- a captured trace replays one graph, so this
+        # cannot be decided per step.
+        self.indexer_ratio = config.indexer_compress_ratio
+        self.indexer_budget = config.indexer_budget
+        self.indexer_topk = config.indexer_budget // config.indexer_compress_ratio
+        self.max_blocks = max_seq_len // config.indexer_compress_ratio
+        # The compact attention window: the budget, plus one K chunk for the
+        # block the query sits inside. That block is *extra* to the budget, not
+        # one of it -- the reference allows the selected blocks and the trailing
+        # partial one, so spending a selection slot on it keeps 511 blocks where
+        # it should keep 512 (measured: 2047 tokens visible against 2051).
+        #
+        # A whole K chunk rather than a tile, because sdpa_decode asserts
+        # `mask_shape[3] % k_chunk_size == 0`. Only `ratio` of the 128 slots
+        # carry a token; the rest are masked off.
+        self.sdpa_k_chunk = sdpa_k_chunk
+        self.indexer_window = config.indexer_budget + sdpa_k_chunk
+        # `ttnn.scatter` takes uint16 indices -- int32 and uint32 both assert --
+        # so the selection can only address 65536 cache positions. Past that the
+        # path falls back to dense attention, which is *not* the model beyond the
+        # budget; TTEngine says so at construction.
+        self.indexer_max_seq = 1 << 16
+        self._mask_base = None
+        self.use_indexer = (
+            traceable_kv
+            and config.indexer_budget < max_seq_len <= self.indexer_max_seq
+        )
+        self._block_offsets = None
+
         self.sdpa_program_config = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(8, 8),
             q_chunk_size=32,
@@ -473,6 +511,209 @@ class TTModel:
 
     # -- full attention (QSA), one token -------------------------------------
 
+    def _indexer_select(
+        self, mixed: ttnn.Tensor, layer: int, st: LayerState, positions: list[int],
+        q_cos: ttnn.Tensor, q_sin: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        """QSA's sparse selection, as an additive attention mask.
+
+        Returns [B, n_q, max_seq_len] worth of 0 / -1e9 for
+        `scaled_dot_product_attention_decode`, marking the `indexer_budget`
+        tokens this query may attend to.
+
+        Every step is unconditional, because a trace replays one graph:
+
+        * The pooled block for position p is written every step at index
+          `p // ratio`, over the last `ratio` raw keys. For p not at a block
+          boundary that value is wrong -- and the block is not yet eligible, and
+          is overwritten before it becomes so. The pool is a mean, so the ring's
+          order does not matter.
+        * A block is eligible once all `ratio` of its tokens are visible,
+          `ratio*j + ratio - 1 <= p`. Ineligible blocks are pushed to -inf by a
+          host-built bias, and the block p sits inside is forced *in* when it is
+          incomplete -- that is the reference's "the trailing partial block is
+          always visible" rule (`_indexer_mask` in reference/model.py).
+        * Whatever `topk` then returns, the mask keeps exactly the tokens with
+          `index <= p`. That covers the three cases at once: a fully ineligible
+          block lies entirely beyond p, the straddling block keeps its visible
+          prefix, and an eligible block keeps everything. It is also why the
+          path is exact below the budget, where fewer than `topk` blocks exist
+          and the surplus is filled with whatever scored highest among -inf.
+        """
+        cfg = self.cfg
+        d, ratio = cfg.indexer_head_dim, self.indexer_ratio
+        batch = mixed.shape[-2]
+        nb, k = self.max_blocks, self.indexer_topk
+
+        # -- compressed keys ------------------------------------------------
+        k_raw = ttnn.linear(
+            mixed, self.w.blk(layer, "indexer.k_proj.weight"), compute_kernel_config=HIFI4
+        )                                                        # [1,1,B,d]
+        if st.indexer_ring is None:
+            st.indexer_ring = [
+                ttnn.zeros((1, 1, batch, d), dtype=ttnn.bfloat16,
+                           layout=ttnn.TILE_LAYOUT, device=self.mesh)
+                for _ in range(ratio)
+            ]
+        for i in range(ratio - 1, 0, -1):
+            ttnn.copy(st.indexer_ring[i - 1], st.indexer_ring[i])
+        ttnn.copy(k_raw, st.indexer_ring[0])
+        pooled = st.indexer_ring[0]
+        for i in range(1, ratio):
+            pooled = ttnn.add(pooled, st.indexer_ring[i])
+        pooled = ttnn.multiply(pooled, 1.0 / ratio)
+        pooled = rms_norm(pooled, self.w.blk(layer, "indexer.k_norm.weight"), cfg.rms_norm_eps)
+        pooled = ttnn.reshape(pooled, (1, batch, 1, d))
+        # roped at the block's *start*, which is where its first token sat
+        b_cos, b_sin = self.rope([ratio * (p // ratio) for p in positions])
+        pooled = self._apply_rope_dev(
+            pooled,
+            self._input("idx_block_cos", b_cos, ttnn.float32),
+            self._input("idx_block_sin", b_sin, ttnn.float32),
+        )
+        if st.indexer_blocks is None:
+            st.indexer_blocks = ttnn.zeros(
+                (batch, 1, nb, d), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh
+            )
+        ttnn.experimental.paged_update_cache(
+            st.indexer_blocks,
+            self._l1_height_sharded(ttnn.typecast(pooled, ttnn.bfloat16), d),
+            update_idxs_tensor=self._input(
+                "idx_block_pos", torch.tensor([p // ratio for p in positions], dtype=torch.int32),
+                ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            ),
+        )
+
+        # -- scores: sum over heads of relu(q . block), one matmul per head --
+        # Contracting the *block* cache against a single query column keeps the
+        # 65536 x 128 cache where it is; scoring the other way round would
+        # transpose 16 MB a layer a step.
+        q_idx = ttnn.linear(
+            mixed, self.w.blk(layer, "indexer.q_proj.weight"), compute_kernel_config=HIFI4
+        )
+        q_idx = ttnn.reshape(q_idx, (1, batch, cfg.indexer_heads, d))
+        q_idx = rms_norm(q_idx, self.w.blk(layer, "indexer.q_norm.weight"), cfg.rms_norm_eps)
+        # the caller has already bound rope at p for the attention heads
+        q_idx = self._apply_rope_dev(q_idx, q_cos, q_sin)
+        scores = None
+        for h in range(cfg.indexer_heads):
+            qh = ttnn.reshape(
+                ttnn.slice(q_idx, (0, 0, h, 0), (1, batch, h + 1, d)), (batch, 1, d, 1)
+            )
+            part = ttnn.relu(ttnn.matmul(st.indexer_blocks, qh, compute_kernel_config=HIFI4))
+            scores = part if scores is None else ttnn.add(scores, part)
+        scores = ttnn.multiply(ttnn.transpose(scores, -2, -1), d**-0.5)   # [B,1,1,nb]
+        scores = ttnn.add(scores, self._input("idx_bias", self._block_bias(positions), ttnn.float32))
+
+        # -- select, expand to tokens, and build the mask -------------------
+        blocks = ttnn.topk(scores, k, dim=-1)[1]                  # uint16 [B,1,1,k]
+        if self._block_offsets is None:
+            self._block_offsets = self.to_dev(
+                torch.arange(ratio, dtype=torch.float32).reshape(1, 1, 1, ratio), ttnn.float32
+            )
+        tokens = ttnn.add(
+            ttnn.reshape(ttnn.multiply(ttnn.typecast(blocks, ttnn.float32), float(ratio)),
+                         (batch, 1, k, 1)),
+            self._block_offsets,
+        )                                                          # [B,1,k,ratio]
+        tokens = ttnn.reshape(tokens, (batch, 1, 1, k * ratio))
+
+        visible = ttnn.le(
+            tokens,
+            self._input(
+                "idx_cur_pos_f",
+                torch.tensor(positions, dtype=torch.float32).reshape(batch, 1, 1, 1).expand(
+                    batch, 1, 1, k * ratio
+                ).contiguous(),
+                ttnn.float32,
+            ),
+        )
+        # This one comparison covers every case `topk` can hand back: a block
+        # entirely beyond p (which is what the -inf fills are, when fewer than
+        # `topk` blocks are eligible) has all its tokens beyond p, and an
+        # eligible block has none.
+        tail_idx, tail_vis = self._tail_block(positions)
+        tokens = ttnn.concat(
+            [tokens, self._input("idx_tail", tail_idx, ttnn.float32)], dim=-1
+        )
+        visible = ttnn.concat(
+            [visible, self._input("idx_tail_vis", tail_vis, ttnn.float32)], dim=-1
+        )
+
+        # Mark the selection in a full-length row and hand back an additive mask
+        # over the *existing* cache. The alternative -- gathering the selected
+        # K/V into a budget-sized buffer -- reads the whole cache per call in
+        # this ttnn build: `ttnn.gather` is linear in the source, 35 ms at 4096
+        # tokens and 1161 ms at 131072, against 0.3-0.7 ms for this scatter.
+        # The base has to be a *fresh* zero row each step, and it cannot come
+        # from `ttnn.zeros(device=...)`: that is a host-to-device write, which
+        # trace capture refuses ("Writes are not supported during trace
+        # capture"). Scaling a persistent buffer by zero is a device op, so it
+        # is recordable -- and it leaves the persistent one untouched whether or
+        # not `scatter` writes its base in place.
+        if self._mask_base is None:
+            self._mask_base = ttnn.zeros(
+                (batch, 1, 1, self.max_seq_len), dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, device=self.mesh,
+            )
+        row = ttnn.scatter(
+            ttnn.multiply(self._mask_base, 0.0),
+            -1,
+            ttnn.typecast(tokens, ttnn.uint16),
+            ttnn.typecast(visible, ttnn.bfloat16),
+        )
+        mask = ttnn.multiply(ttnn.subtract(row, 1.0), 1e9)
+        return ttnn.repeat(mask, (1, 1, cfg.num_attention_heads, 1))
+
+    def _block_bias(self, positions: list[int]) -> torch.Tensor:
+        """Additive score bias: 0 for blocks this query may select, -inf otherwise.
+
+        Eligibility is `ratio*j + ratio - 1 <= p`. The block p sits inside is
+        pushed *below* the other ineligible ones while it is incomplete, so
+        `topk` can never return it -- it is appended separately as the trailing
+        partial block, which is how the reference treats it, and appending is
+        what keeps it from costing a selection slot.
+
+        Once that block completes (`p % ratio == ratio - 1`) it is eligible like
+        any other and competes normally, and nothing is appended.
+        """
+        ratio, nb = self.indexer_ratio, self.max_blocks
+        ends = torch.arange(nb, dtype=torch.float32) * ratio + (ratio - 1)
+        rows = []
+        for p in positions:
+            row = torch.where(ends <= p, 0.0, -1e9)
+            if p % ratio != ratio - 1:
+                row[p // ratio] = -2e9        # never selectable; appended instead
+            rows.append(row)
+        return torch.stack(rows).reshape(len(positions), 1, 1, nb)
+
+    def _tail_block(self, positions: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """The trailing partial block: cache indices, and which of them are visible.
+
+        A whole K chunk rather than `ratio` entries, because sdpa_decode asserts
+        the mask width is a multiple of `k_chunk_size`. Everything here is
+        derived from the position alone, so it is data a captured trace re-reads,
+        not a branch it would have to record: when the block is already complete
+        the whole chunk is masked off and the block competes in `topk` instead.
+        """
+        ratio, tile = self.indexer_ratio, self.sdpa_k_chunk
+        idx = torch.zeros(len(positions), 1, 1, tile)
+        vis = torch.zeros(len(positions), 1, 1, tile)
+        for b, p in enumerate(positions):
+            # Padding slots point at a position that is never visible, so
+            # scattering a zero there cannot un-select a token some selected
+            # block legitimately contributed. Index 0 would: block 0 may be
+            # selected, and token 0 is visible from the very first step.
+            idx[b, 0, 0, :] = min(p + 1, self.max_seq_len - 1)
+            if p % ratio == ratio - 1:
+                continue                      # complete: it is in the topk pool
+            start = ratio * (p // ratio)
+            for t in range(ratio):
+                idx[b, 0, 0, t] = start + t
+                if start + t <= p:
+                    vis[b, 0, 0, t] = 1.0
+        return idx, vis
+
     def _attention_step(self, mixed: ttnn.Tensor, layer: int, st: LayerState, position: int) -> ttnn.Tensor:
         """One decode step of QSA attention.
 
@@ -543,11 +784,20 @@ class TTModel:
             v_s = self._l1_height_sharded(ttnn.typecast(v, ttnn.bfloat16), hd)
             ttnn.experimental.paged_update_cache(st.keys, k_s, update_idxs_tensor=pos_tensor)
             ttnn.experimental.paged_update_cache(st.values, v_s, update_idxs_tensor=pos_tensor)
-            out = ttnn.transformer.scaled_dot_product_attention_decode(
-                q, st.keys, st.values, is_causal=True, cur_pos_tensor=pos_tensor,
-                scale=hd**-0.5, program_config=self.sdpa_program_config,
-                compute_kernel_config=HIFI4,
-            )
+            if self.use_indexer:
+                out = ttnn.transformer.scaled_dot_product_attention_decode(
+                    q, st.keys, st.values, is_causal=False,
+                    attn_mask=self._indexer_select(mixed, layer, st, positions, cos, sin),
+                    cur_pos_tensor=pos_tensor,
+                    scale=hd**-0.5, program_config=self.sdpa_program_config,
+                    compute_kernel_config=HIFI4,
+                )
+            else:
+                out = ttnn.transformer.scaled_dot_product_attention_decode(
+                    q, st.keys, st.values, is_causal=True, cur_pos_tensor=pos_tensor,
+                    scale=hd**-0.5, program_config=self.sdpa_program_config,
+                    compute_kernel_config=HIFI4,
+                )
         else:
             k_upd = ttnn.typecast(ttnn.permute(k, (0, 2, 1, 3)), ttnn.bfloat16)
             v_upd = ttnn.typecast(ttnn.permute(v, (0, 2, 1, 3)), ttnn.bfloat16)

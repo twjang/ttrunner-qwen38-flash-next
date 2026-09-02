@@ -121,6 +121,20 @@ class TTEngine(Engine):
             self.config, self.weights, self.host_store, self.mesh,
             max_seq_len=seq, traceable_kv=True,
         )
+        # QSA attends to `indexer_budget` selected tokens, not to everything.
+        # Below the budget every complete block is retained, so dense causal
+        # attention is exactly right and cheaper; above it, dense is a different
+        # model. The selection addresses the cache with uint16 indices (the only
+        # dtype `ttnn.scatter` takes), so past 65536 tokens it cannot run and
+        # this is a fidelity caveat the caller should know about rather than
+        # discover.
+        if not self.model.use_indexer and seq > self.config.indexer_budget:
+            print(
+                f"[tt] context {seq} exceeds the QSA budget "
+                f"({self.config.indexer_budget}) and the sparse selection cannot "
+                f"address it (limit {self.model.indexer_max_seq}); attention is "
+                "dense beyond the budget, which is not what the model does."
+            )
         # Fused gate|up experts: one sparse_matmul instead of two, verified
         # token-for-token identical. Two runs per mode, 25 samples each:
         #
