@@ -59,22 +59,46 @@ HEAD_QKV = {Shard.HEAD_QKV_COLUMN, Shard.HEAD_QKV_ROW}
 NEEDS_ALL_REDUCE = {Shard.ROW, Shard.EXPERT_ROW}
 
 
-def split_qkv_channels(t, dim: int, n_dev: int, key_dim: int, value_dim: int):
+def split_qkv_channels(t, dim: int, n_dev: int, key_dim: int, value_dim: int, head_dim: int):
     """Split a 10240-wide q|k|v channel axis by head, not flat.
 
-    The axis is [q(2*key_dim/2) | k | v]; chunking it evenly at 2560 would cut
-    through the q/k boundary and hand each device a mix of one head's queries
-    and another's keys -- correct shapes, silently wrong pairing. Each part is
-    chunked separately and re-concatenated per device, so device i gets
-    q-heads i, k-heads i and v-heads i.
+    The axis is [q | k | v]; chunking it evenly at 2560 would cut through the
+    q/k boundary and hand each device a mix of one head's queries and another's
+    keys -- correct shapes, silently wrong pairing.
+
+    V heads are chunked contiguously, so device d owns v-heads
+    [d*n_v/D, (d+1)*n_v/D). Q and K are *not* chunked: V heads are stored tiled
+    over K heads, so global v-head j reads global k-head `j % n_k`, and the
+    twelve k heads device d needs are `(12d + i) % 16` -- which is not a
+    contiguous block and is not the four it would get from chunking. Give each
+    device exactly the q/k heads its v heads pair with, and the pairing becomes
+    local: v-head i reads k-head i, with no expansion at all.
+
+    Chunking q/k instead cost the device engine everything -- 25.5 % next-token
+    accuracy against the reference's 80.9 % -- because no expansion of four
+    local heads can produce the right pairing (`docs/iterations/014`). The
+    interim fix all-gathered all sixteen heads every step; this removes the need.
     """
     import torch
 
     q, k, v = torch.split(t, [key_dim, key_dim, value_dim], dim=dim)
-    qs = torch.chunk(q, n_dev, dim=dim)
-    ks = torch.chunk(k, n_dev, dim=dim)
+    n_k_global = key_dim // head_dim
+    n_v_local = (value_dim // head_dim) // n_dev
     vs = torch.chunk(v, n_dev, dim=dim)
-    return [torch.cat([qs[i], ks[i], vs[i]], dim=dim).contiguous() for i in range(n_dev)]
+
+    def heads_of(x, idx):
+        pieces = [
+            x.narrow(dim, h * head_dim, head_dim) for h in idx
+        ]
+        return torch.cat(pieces, dim=dim)
+
+    out = []
+    for d in range(n_dev):
+        idx = [(n_v_local * d + i) % n_k_global for i in range(n_v_local)]
+        out.append(
+            torch.cat([heads_of(q, idx), heads_of(k, idx), vs[d]], dim=dim).contiguous()
+        )
+    return out
 
 
 @dataclass(slots=True)
@@ -127,6 +151,7 @@ def convert(
     out_dir: str | Path,
     n_dev: int = 4,
     only: str | None = None,
+    force: bool = False,
     progress=print,
 ) -> ConvertStats:
     import ttnn
@@ -174,7 +199,11 @@ def convert(
             "shard_dim": dim,
             "all_reduce": shard in NEEDS_ALL_REDUCE,
         }
-        if all(p.exists() for p in paths) and name in stats.entries:
+        # Incremental by default: a run that died half way resumes. `force`
+        # re-writes anyway, which is what a change to the plan or to the shard
+        # layout needs -- the files exist and are in the manifest, they are just
+        # no longer right.
+        if not force and all(p.exists() for p in paths) and name in stats.entries:
             continue
 
         info = store.info(name)
@@ -196,7 +225,9 @@ def convert(
         if dim is None:
             pieces = [t]
         elif shard in HEAD_QKV:
-            pieces = split_qkv_channels(t, dim, n_dev, cfg.linear_key_dim, cfg.linear_value_dim)
+            pieces = split_qkv_channels(
+                t, dim, n_dev, cfg.linear_key_dim, cfg.linear_value_dim, cfg.linear_head_dim
+            )
         else:
             pieces = list(torch.chunk(t, n_dev, dim=dim))
         for piece, path in zip(pieces, paths):

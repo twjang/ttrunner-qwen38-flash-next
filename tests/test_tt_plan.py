@@ -108,19 +108,37 @@ def test_sharding_covers_experts_and_the_deltanet() -> None:
         assert plan_for(name).shard is Shard.REPLICATE, name
 
 
-def test_qkv_channel_axis_is_split_by_head() -> None:
-    """A flat split of the 10240 q|k|v axis mispairs heads with correct shapes."""
+def test_qkv_split_gives_each_device_the_heads_its_v_heads_pair_with() -> None:
+    """A flat split of the 10240 q|k|v axis mispairs heads with correct shapes.
+
+    Chunking q and k four ways is not enough either: V heads are tiled over K
+    heads, so global v-head j reads global k-head `j % n_k`, and device d's
+    twelve v heads need `(12d + i) % 16` -- not the contiguous four a chunk
+    gives it. The converter hands each device exactly those twelve, in matching
+    order, so the pairing is local and needs no expansion at all. Chunking cost
+    the engine 25.5 % next-token accuracy against the reference's 80.9 %.
+    """
     from twtest.tt.convert import split_qkv_channels
 
-    key_dim, value_dim, n_dev = 2048, 6144, 4
+    hd, n_k, n_v, n_dev = 128, 16, 48, 4
+    key_dim, value_dim = n_k * hd, n_v * hd
     t = torch.arange(2 * key_dim + value_dim, dtype=torch.float32).reshape(1, 1, 1, -1)
-    pieces = split_qkv_channels(t, -1, n_dev, key_dim, value_dim)
-    per_k, per_v = key_dim // n_dev, value_dim // n_dev
-    assert all(p.shape[-1] == 2 * per_k + per_v for p in pieces)
-    for i, p in enumerate(pieces):
-        assert p[0, 0, 0, 0] == i * per_k, "q head block"
-        assert p[0, 0, 0, per_k] == key_dim + i * per_k, "k head block"
-        assert p[0, 0, 0, 2 * per_k] == 2 * key_dim + i * per_v, "v head block"
+    pieces = split_qkv_channels(t, -1, n_dev, key_dim, value_dim, hd)
+
+    n_v_local = n_v // n_dev
+    per = n_v_local * hd
+    assert all(p.shape[-1] == 3 * per for p in pieces), "q, k and v all hold n_v_local heads"
+
+    for d, p in enumerate(pieces):
+        flat = p[0, 0, 0]
+        q_heads = [int(flat[i * hd]) // hd for i in range(n_v_local)]
+        k_heads = [int(flat[per + i * hd] - key_dim) // hd for i in range(n_v_local)]
+        v_heads = [int(flat[2 * per + i * hd] - 2 * key_dim) // hd for i in range(n_v_local)]
+        assert v_heads == list(range(d * n_v_local, (d + 1) * n_v_local)), "v is chunked"
+        assert q_heads == k_heads, "q and k must follow the same heads"
+        for i, v in enumerate(v_heads):
+            assert q_heads[i] == v % n_k, f"device {d} head {i} pairs wrongly"
+
     # a flat chunk would put k-channels in device 0's slice
     assert torch.chunk(t, n_dev, dim=-1)[0][0, 0, 0, -1] >= key_dim
 
