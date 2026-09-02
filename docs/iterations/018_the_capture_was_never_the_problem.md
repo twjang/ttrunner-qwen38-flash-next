@@ -129,13 +129,15 @@ So program count alone is not the trigger. Binary residency was the obvious
 alternative and it does not survive either: `plus_one` makes the second capture
 one `ttnn.add` longer (counts differ, binaries identical) and, with
 `TWTEST_NEW_KERNEL=1`, one `ttnn.atan` longer (trace B references a kernel trace
-A does not). Both alternate cleanly.
+A does not). Both alternate cleanly. Nor is it the *size* of the difference,
+which was the next thing written down and also wrong: k=2 against k=3 hangs.
 
-What is left is that the two graphs which hang differ *substantially* -- k is
-unrolled into the recurrence and convolution, so shapes and program configs
-differ at every layer -- and that the defect needs scale, since nothing small
-reproduces it at all. `docs/upstream/trace_alternation_hang.md` carries the
-whole control set.
+The line the controls draw is narrower and more interesting. Trace B may be
+trace A *plus appended operations* -- new kernels included -- and the pair
+alternates. If the two traces hold differently-shaped versions of the same
+operations, they hang. Changing k re-shapes every layer rather than appending to
+it. Per-program config-buffer state is the candidate that fits, and is untested;
+`docs/upstream/trace_alternation_hang.md` carries the whole control set.
 
 ## What is actually established
 

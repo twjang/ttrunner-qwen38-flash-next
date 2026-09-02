@@ -30,9 +30,14 @@ The following all work, which is what makes it specific:
 | A and B the same graph, B with one extra op introducing a **new** kernel | works |
 | two *small* traces, any program counts, alternated | works |
 
-The rows below the hang are the controls, and together they say the two graphs
-have to differ *substantially*: a one-program difference does not do it, and
-neither does a distinct kernel binary referenced by only one of them.
+| `step_n` at k=2 and k=**3** — adjacent widths | **hangs** |
+
+The controls draw a sharp line, and it is not about how *different* the graphs
+are. Trace B may be trace A **plus appended operations** — even ones introducing
+a kernel A never uses — and the pair alternates fine. But if the two traces'
+own operations differ in shape or program config, they hang, and k=2 against
+k=3 is enough. `k` is unrolled into the recurrence and convolution, so changing
+it re-shapes every layer rather than adding anything.
 
 ## Reproduction
 
@@ -58,6 +63,10 @@ PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
 # ... and with that op introducing a new kernel binary: also clean
 PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
   TWTEST_NEW_KERNEL=1 uv run python scripts/dev/spec_capture_ladder.py plus_one 2
+
+# adjacent widths, k=2 against k=3: hangs, so magnitude is not the variable
+PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
+  TWTEST_SECOND_K=3 uv run python scripts/dev/spec_capture_ladder.py two_stepn 2
 ```
 
 `two_stepn` captures two `step_n` graphs (k=2 and k=4) over the same model state,
@@ -124,19 +133,24 @@ further controls separate them, and both pass:
   (It is warmed before capture, since a capture cannot load a new binary.)
   Alternates cleanly.
 
-So neither program count nor a single distinct binary is the trigger. The
-standalone script alternating 2- and 5-program traces agrees.
+So neither program count nor a single distinct binary is the trigger, and nor is
+the *size* of the difference: k=2 against k=3 hangs. The standalone script
+alternating 2- and 5-program traces agrees that count is not it.
+
+What separates the passing controls from the failing ones is that in every
+passing case trace B contains trace A's programs unchanged and merely appends to
+them, while in every failing case the two traces hold differently-shaped
+versions of the same operations.
 
 ## What we do not know
 
-What distinguishes "two graphs that differ a lot" from the marginal differences
-above. Program count is out, and so is one differing binary. Candidates we did
-not test: total trace-buffer footprint, the number of *distinct* programs
-resident across both traces, and per-program config-buffer state
-(`update_worker_state_post_trace_execution` also calls
-`config_buffer_mgr[index].mark_completely_full(...)`, carrying a
-`TODO(jbauman): Reuse old state from the trace`).
+Why *re-shaping* an operation across two traces differs from *appending* one.
+Program count is out, a differing kernel binary is out, and magnitude is out
+(k=2 against k=3 hangs). Per-program config-buffer state is the candidate that
+fits the shape of the evidence and that we did not test:
+`update_worker_state_post_trace_execution` calls
+`config_buffer_mgr[index].mark_completely_full(...)` and carries a
+`TODO(jbauman): Reuse old state from the trace`. Total trace-buffer footprint and
+the number of distinct programs resident across both traces are also untested.
 
-The two graphs that do hang, `step_n` at k=2 and k=4, differ structurally
-throughout — k is unrolled into the recurrence and convolution, so tensor shapes
-and matmul program configs differ at every layer, not just the op count.
+We also do not know why nothing small reproduces it.

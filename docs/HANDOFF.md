@@ -502,15 +502,18 @@ the same graph share their program count *and* their kernel binaries, so it
 cannot separate the two. `scripts/dev/repro_trace_program_count.py` then
 alternates tiny traces of 2 and 5 programs with no trouble at all.
 
-Both candidates are now retired by controls that separate them. `plus_one`
-captures the same graph twice with the second one `ttnn.add` longer -- counts
-differ by one, binaries identical -- and it alternates cleanly; the same with
+Both candidates are retired by controls that separate them. `plus_one` captures
+the same graph twice with the second one `ttnn.add` longer -- counts differ by
+one, binaries identical -- and alternates cleanly; the same with
 `TWTEST_NEW_KERNEL=1`, where the extra op is `ttnn.atan` so trace B references a
-kernel trace A does not, also alternates cleanly. Neither program count nor a
-distinct binary is the trigger. What the two graphs that *do* hang have in
-common is that they differ substantially: `step_n` at k=2 and k=4 unrolls k into
-the recurrence and convolution, so shapes and matmul program configs differ at
-every layer.
+kernel trace A does not, also alternates cleanly. And magnitude is not it either:
+k=2 against **k=3** hangs.
+
+The line the controls actually draw: trace B may be trace A *plus appended
+operations* and the pair alternates fine; if the two traces hold
+differently-shaped versions of the same operations, they hang. Changing k
+re-shapes every layer rather than adding anything.
+`docs/upstream/trace_alternation_hang.md` has the full control set.
 
 **What is actually established**, and all of it at model scale:
 
