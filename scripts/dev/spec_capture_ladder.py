@@ -36,6 +36,18 @@ Stages:
                  while `record_begin` reset it to 0 for the capture. Two traces
                  with different counts therefore leave host and worker pointers
                  desynchronised -- a hang. Equal counts should not.
+    plus_one     two captures of the same graph, the second with exactly one
+                 extra elementwise op recorded inside it. Same kernels, same
+                 buffers, program count differing by one. `two_same` (equal
+                 count, identical binaries) alternates cleanly and `two_stepn`
+                 (differing count, differing binaries) hangs, so those two
+                 cannot separate count from binary residency. This can: if it
+                 hangs, program count is implicated; if it does not, the count
+                 is not the trigger on its own. TWTEST_NEW_KERNEL=1 makes the
+                 extra op one the model never uses, so the second trace carries a
+                 kernel binary the first does not -- count moves by one either
+                 way, and only the binary set differs between the two runs. That
+                 is the test that separates count from binary residency.
     verify_cq    the whole point: with both traces live and the decoder replayed
                  in between, does the step_n replay produce the *right tokens*,
                  and how long does it take? "It did not hang" is not a fix -- a
@@ -77,7 +89,7 @@ from twtest.tt.traced import TracedDecoder, TracedStepN
 STAGE = sys.argv[1] if len(sys.argv) > 1 else "snapshot"
 K = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 BUDGET = 420.0
-STAGES = ("baseline", "snapshot", "thread", "no_replay", "both_replay", "stepn_only", "verify_cq", "two_stepn", "two_same")
+STAGES = ("baseline", "snapshot", "thread", "no_replay", "both_replay", "stepn_only", "verify_cq", "two_stepn", "two_same", "plus_one")
 if STAGE not in STAGES:
     raise SystemExit(f"stage must be one of {STAGES}, got {STAGE}")
 
@@ -239,6 +251,60 @@ def two_same():
     b.release()
 
 
+def plus_one():
+    """Same graph twice; the second capture records one extra elementwise op."""
+    toks = synthetic_prompt(32)
+    st = m.new_state(batch=1)
+    for t in toks[:8]:
+        m.step([t], st)
+    warm = [1000] * K
+    extra = "atan (new kernel)" if os.environ.get("TWTEST_NEW_KERNEL") else "add (existing kernel)"
+    print(f"RESULT extra op in B: {extra}", flush=True)
+    print(f"RESULT capturing A: step_n k={K}", flush=True)
+    a = TracedStepN(m, st, K)
+
+    # Capture B by hand, mirroring TracedStepN: warm the graph, then record it
+    # with one `ttnn.add` appended. `add` is used throughout the model, so no new
+    # kernel binary is introduced -- only the program count moves.
+    print("RESULT capturing B: the same graph plus one add", flush=True)
+    m.step_n(warm, st)
+    ttnn.synchronize_device(mesh)
+    m.step_n(warm, st)
+    ttnn.synchronize_device(mesh)
+    pad = ttnn.zeros((1, 1, 32, 32), dtype=ttnn.bfloat16,
+                     layout=ttnn.TILE_LAYOUT, device=mesh)
+    # The extra op has to be warmed like any other: a capture cannot load a
+    # binary that is not already in the program cache ("Cannot load new binaries
+    # during trace capture"). So the binary is resident for both traces; only
+    # trace B *references* it, which is the difference under test.
+    if os.environ.get("TWTEST_NEW_KERNEL"):
+        ttnn.atan(pad)
+    else:
+        ttnn.add(pad, pad)
+    ttnn.synchronize_device(mesh)
+    m._skip_copy = True
+    try:
+        tid = ttnn.begin_trace_capture(mesh, cq_id=0)
+        m.step_n(warm, st)
+        if os.environ.get("TWTEST_NEW_KERNEL"):
+            ttnn.atan(pad)                       # +1 program, and a *new* binary
+        else:
+            ttnn.add(pad, pad)                   # +1 program, kernel already present
+        ttnn.end_trace_capture(mesh, tid, cq_id=0)
+    finally:
+        m._skip_copy = False
+    ttnn.synchronize_device(mesh)
+    print("RESULT both captured; replaying A", flush=True)
+    a.step_n(toks[8 : 8 + K])
+    print("RESULT replaying B  <-- differs from A by exactly one program", flush=True)
+    ttnn.execute_trace(mesh, tid, cq_id=0, blocking=True)
+    print("RESULT replayed B; back to A", flush=True)
+    a.step_n(toks[8 + K : 8 + 2 * K])
+    print("RESULT alternated cleanly", flush=True)
+    ttnn.release_trace(mesh, tid)
+    a.release()
+
+
 def work():
     try:
         if STAGE == "verify_cq":
@@ -251,6 +317,10 @@ def work():
             return
         if STAGE == "two_same":
             two_same()
+            out["ok"] = True
+            return
+        if STAGE == "plus_one":
+            plus_one()
             out["ok"] = True
             return
         st = m.new_state(batch=1)

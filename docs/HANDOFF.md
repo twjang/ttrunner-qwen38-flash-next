@@ -500,9 +500,17 @@ graph twice, identical counts, and alternates A/B/A cleanly where `two_stepn`
 (k=2 against k=4) hangs -- **and that control is confounded**: two captures of
 the same graph share their program count *and* their kernel binaries, so it
 cannot separate the two. `scripts/dev/repro_trace_program_count.py` then
-alternates tiny traces of 2 and 5 programs with no trouble at all. Program count
-alone is therefore not the trigger, and binary residency is the obvious
-untested alternative.
+alternates tiny traces of 2 and 5 programs with no trouble at all.
+
+Both candidates are now retired by controls that separate them. `plus_one`
+captures the same graph twice with the second one `ttnn.add` longer -- counts
+differ by one, binaries identical -- and it alternates cleanly; the same with
+`TWTEST_NEW_KERNEL=1`, where the extra op is `ttnn.atan` so trace B references a
+kernel trace A does not, also alternates cleanly. Neither program count nor a
+distinct binary is the trigger. What the two graphs that *do* hang have in
+common is that they differ substantially: `step_n` at k=2 and k=4 unrolls k into
+the recurrence and convolution, so shapes and matmul program configs differ at
+every layer.
 
 **What is actually established**, and all of it at model scale:
 

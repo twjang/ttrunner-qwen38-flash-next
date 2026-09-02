@@ -26,9 +26,13 @@ The following all work, which is what makes it specific:
 | capture A and B, then replay **only** B | works |
 | capture A and B, replay A then B | **hangs** |
 | capture the *same graph* twice as A and B, replay A, B, A | works |
+| A and B the same graph, B with one extra op (kernel already present) | works |
+| A and B the same graph, B with one extra op introducing a **new** kernel | works |
 | two *small* traces, any program counts, alternated | works |
 
-The last two rows are why the cause is still open — see "What we do not know".
+The rows below the hang are the controls, and together they say the two graphs
+have to differ *substantially*: a one-program difference does not do it, and
+neither does a distinct kernel binary referenced by only one of them.
 
 ## Reproduction
 
@@ -46,6 +50,14 @@ PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
 # two captures of one graph, alternated A/B/A: clean
 PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
   uv run python scripts/dev/spec_capture_ladder.py two_same 2
+
+# same graph, second capture one op longer: clean (rules out program count)
+PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
+  uv run python scripts/dev/spec_capture_ladder.py plus_one 2
+
+# ... and with that op introducing a new kernel binary: also clean
+PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
+  TWTEST_NEW_KERNEL=1 uv run python scripts/dev/spec_capture_ladder.py plus_one 2
 ```
 
 `two_stepn` captures two `step_n` graphs (k=2 and k=4) over the same model state,
@@ -99,16 +111,32 @@ pointer at its own count, so alternating two traces of different sizes would
 leave host and workers disagreeing and the dispatcher waiting on a go signal
 that never matches — a hang, no error, in the right place.
 
-**We could not confirm this and think it is at best incomplete.** The prediction
-it makes — equal program counts should alternate fine — holds at model scale
-(`two_same`), but that control captures the *same graph* twice, so it shares
-program count **and** kernel binaries and cannot separate them. The standalone
-script then alternates 2-program and 5-program traces without trouble. Binary
-residency across the trace region is the obvious alternative we did not test.
+**This is ruled out.** The prediction it makes — equal program counts should
+alternate fine — held at model scale (`two_same`), but that control captures the
+*same graph* twice and so shares program count **and** kernel binaries. Two
+further controls separate them, and both pass:
+
+* `plus_one`: A and B are the same graph, B with one extra `ttnn.add` recorded
+  inside the capture. Program counts differ by one, binaries identical.
+  Alternates cleanly.
+* `plus_one` with `TWTEST_NEW_KERNEL=1`: the extra op is `ttnn.atan`, which the
+  model never uses, so trace B references a kernel binary trace A does not.
+  (It is warmed before capture, since a capture cannot load a new binary.)
+  Alternates cleanly.
+
+So neither program count nor a single distinct binary is the trigger. The
+standalone script alternating 2- and 5-program traces agrees.
 
 ## What we do not know
 
-Whether the trigger is program count, kernel-binary residency, trace-buffer
-size, or something else; and why nothing small reproduces it. The distinguishing
-experiment we did not run is two *different* graphs with *equal* program counts
-at model scale.
+What distinguishes "two graphs that differ a lot" from the marginal differences
+above. Program count is out, and so is one differing binary. Candidates we did
+not test: total trace-buffer footprint, the number of *distinct* programs
+resident across both traces, and per-program config-buffer state
+(`update_worker_state_post_trace_execution` also calls
+`config_buffer_mgr[index].mark_completely_full(...)`, carrying a
+`TODO(jbauman): Reuse old state from the trace`).
+
+The two graphs that do hang, `step_n` at k=2 and k=4, differ structurally
+throughout — k is unrolled into the recurrence and convolution, so tensor shapes
+and matmul program configs differ at every layer, not just the op count.

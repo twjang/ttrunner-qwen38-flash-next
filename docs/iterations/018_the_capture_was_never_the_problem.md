@@ -125,9 +125,17 @@ reproduction settled it the other way --
 `scripts/dev/repro_trace_program_count.py` alternates tiny traces of 2 and 5
 programs without trouble.
 
-So program count alone is not the trigger; binary residency is the obvious
-untested alternative; and the defect needs scale, since nothing small
-reproduces it at all.
+So program count alone is not the trigger. Binary residency was the obvious
+alternative and it does not survive either: `plus_one` makes the second capture
+one `ttnn.add` longer (counts differ, binaries identical) and, with
+`TWTEST_NEW_KERNEL=1`, one `ttnn.atan` longer (trace B references a kernel trace
+A does not). Both alternate cleanly.
+
+What is left is that the two graphs which hang differ *substantially* -- k is
+unrolled into the recurrence and convolution, so shapes and program configs
+differ at every layer -- and that the defect needs scale, since nothing small
+reproduces it at all. `docs/upstream/trace_alternation_hang.md` carries the
+whole control set.
 
 ## What is actually established
 
