@@ -218,6 +218,29 @@ def apply_experts(x, weights, keep, gate_w, up_w, down_w, num_experts: int,
     `x`, `weights` and `keep` all carry the same M rows; `weights`/`keep` may
     have been routed in smaller groups and concatenated.
     """
+    m = x.shape[-2]
+    if m > _MAX_FFN_ROWS:
+        # `expert_ffn` materialises [1, E, M, K], so its footprint grows with the
+        # row count times 512: at M=256 that is ~1.3 GB of intermediates and the
+        # allocator gives up (program.cpp:1555). Running it in row groups is free
+        # of consequence -- the FFN is exactly per-token (`expert_split_check.py`
+        # measures max diff 0.000e+00 against the whole-chunk form), and each
+        # group's `sparsity` is the union over its *own* rows, so an expert a
+        # group does not select is one it also weights at zero. Same answer,
+        # bounded memory, and it is what lets a prefill chunk be wider than the
+        # DeltaNet op's 128.
+        outs = []
+        for lo in range(0, m, _MAX_FFN_ROWS):
+            hi = min(lo + _MAX_FFN_ROWS, m)
+            k = list(x.shape)
+            xs = ttnn.slice(x, (0, 0, lo, 0), (k[0], k[1], hi, k[3]))
+            w = list(weights.shape)
+            ws = ttnn.slice(weights, (0, 0, lo, 0), (w[0], w[1], hi, w[3]))
+            ks = ttnn.slice(keep, (0, 0, lo, 0), (w[0], w[1], hi, w[3]))
+            outs.append(apply_experts(xs, ws, ks, gate_w, up_w, down_w,
+                                      num_experts, hidden_size, intermediate_size))
+        return ttnn.concat(outs, dim=-2)
+
     sparsity = ttnn.to_layout(
         ttnn.typecast(ttnn.max(keep, dim=-2, keepdim=True), ttnn.bfloat16),
         ttnn.ROW_MAJOR_LAYOUT,
@@ -248,6 +271,10 @@ def shared_expert(
 # broadcast one set of rows to every expert. 64 is the largest width measured to
 # win (2.35x); 128 loses in the model. See `expert_ffn`.
 _BROADCAST_MAX_M = 64
+
+# Row groups for the expert FFN. Only bites above a 128-row prefill chunk, so the
+# default path is untouched; see `apply_experts`.
+_MAX_FFN_ROWS = 128
 
 
 def expert_ffn(

@@ -33,6 +33,16 @@ argv = sys.argv[1:]
 PREFILL = 0
 SCORE_FROM = 0
 MOE_CHUNK = None
+# `--chunk N` sets the prefill chunk width. Above 128 it needs
+# TWTEST_WIDE_PREFILL_CHUNK=1, and it is not a free choice: a wider chunk changes
+# the row count every dense linear sees, which changes their blocking and so
+# their rounding (`row_count_stability_check.py`). This is how that gets priced
+# in next-token accuracy rather than argued about.
+CHUNK = 0
+if "--chunk" in argv:
+    i = argv.index("--chunk")
+    CHUNK = int(argv[i + 1])
+    argv = argv[:i] + argv[i + 2:]
 if "--moe-chunk" in argv:
     i = argv.index("--moe-chunk")
     MOE_CHUNK = int(argv[i + 1])
@@ -83,6 +93,8 @@ if PREFILL:
               "for this measurement", flush=True)
         model_mod._MAX_MOE_CHUNK = MOE_CHUNK
     kw = {} if MOE_CHUNK is None else {"moe_chunk": MOE_CHUNK}
+    if CHUNK:
+        kw["chunk"] = CHUNK
     h = m.prefill(ids[:PREFILL], st, **kw)
     lg = m.logits(h)[0].float()
     target = ids[PREFILL]

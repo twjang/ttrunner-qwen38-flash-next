@@ -2021,7 +2021,16 @@ class TTModel:
         # It must also be a whole number of tiles: `fill_cache` asserts
         # `update_idx % TILE_HEIGHT == 0`, and the attention chunk writes the K/V
         # cache at the chunk's absolute start.
-        if not 0 < chunk <= CHUNK or chunk % ttnn.TILE_SIZE:
+        # TWTEST_WIDE_PREFILL_CHUNK=1 lifts the CHUNK ceiling for measurement.
+        # The stated reason for it -- "a chunk larger than CHUNK would need the
+        # op's inter-chunk scan, which this path does not build here" -- is stale:
+        # `_linear_attention_chunk` computes `n_chunks` from `seq`, lays the heads
+        # out as [n_v, NC, CHUNK, width], and `gated_delta_attn_seq` carries the
+        # scan itself through initial_state/final_state. What a wider chunk really
+        # changes is the row count every dense linear sees, and that is not free:
+        # see `row_count_stability_check.py`.
+        ceiling = CHUNK * 64 if os.environ.get("TWTEST_WIDE_PREFILL_CHUNK") else CHUNK
+        if not 0 < chunk <= ceiling or chunk % ttnn.TILE_SIZE:
             raise ValueError(
                 f"chunk must be a multiple of {ttnn.TILE_SIZE} in "
                 f"{ttnn.TILE_SIZE}..{CHUNK} (the op's chunk width), got {chunk}"
