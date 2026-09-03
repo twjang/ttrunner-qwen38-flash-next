@@ -221,7 +221,15 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     position 127 of a chunk and the *token* is fine: 128 tokens prefilled score
     53.1 % against 51.6 % for stepping the same ones. Judge prefill by a
     same-positions decode control, which is what `--score-from` is for.
-16. **Verification standard.** A change to the model is done when (a) unit
+16. **A cited harness can stop working, and the citation will not notice.** Two
+    did: `indexer_select_check.py` called `_indexer_select` with its pre-`q_cos`
+    signature and raised `TypeError` after minutes of setup, and
+    `traced_step_n_check.py` hangs on the device. Both were quoted in items
+    marked **done**, and a citation that no longer runs still reads as evidence.
+    `pytest` now runs `scripts/dev/harness_api_check.py` over every harness
+    (`tests/test_harness_api.py`) and fails on a name or arity that has drifted;
+    the device half it cannot see, so before quoting a harness's number, run it.
+17. **Verification standard.** A change to the model is done when (a) unit
     tests pass, (b) `device_quality.py` is run and next-token accuracy does not
     regress from 83 %, (c) the number it claims to move is measured with the
     hygiene in (7) and (8) -- repeat it, one run has no noise floor -- and
