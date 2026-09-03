@@ -70,7 +70,7 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 
 | configuration | result |
 |---|---|
-| single user, 1 slot, 262144 ctx, traced | **236 ms/step** (236.2 re-measured after the paged refactor); eager 486 ms |
+| single user, 1 slot, 262144 ctx, traced | **173.7 ms/step** (236.2 before `022` stopped the MoE paying for tile padding); eager 489 ms, unchanged, because the eager path is dispatch-bound and the op count barely moved |
 | same, QSA selection on (context in (2048, 65536]) | **297 ms/step** at 8192 (297.4 re-measured) |
 | same, eager, chunked prefill on | prompt at **7.2 ms/token** (was ~45) |
 | `step_n` verifying k tokens, **eager** | 490 ms at k=1, 797 at k=2, 991 at k=4, 1404 at k=8, 6651 at k=32 (`step_n_check.py`) |
@@ -269,7 +269,30 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     Reproducing one prompt's text is not (b), and neither is agreement with the
     reference; both of those stood while the head pairing was wrong.
 
-19. **A device call on the eager prefill path is worth ~57 us, and its size does
+19. **The traced step is not measured by counting its ops; ablate it.** 5.7
+    established the traced path is not dispatch-bound, so `op_count.py` -- the
+    right instrument for prefill -- says nothing about decode. Replace a
+    component with an identity of the same shape, which adds no ops, and the
+    delta is its device time (`decode_ablation_check.py`, one ablation per
+    process because alternating two traces hangs). Doing that found 65 % of the
+    step in the routed MoE, and a top_k sweep then found that almost none of
+    *that* was the experts: 1 expert costs 259.6 ms and 20 cost 272.0, so the
+    selected experts do ~7.5 ms of work inside a 173 ms block. The rest was
+    TILE_LAYOUT padding the row axis to 32, making every [1, 512, 1, 2560] an
+    84 MB tensor holding 2.6 MB. Corollary for anything at M = 1: suspect the
+    padding before the arithmetic. See `022`.
+
+20. **When a change is not bit-identical, compare both candidates to an exact
+    reference, not to each other.** Two device forms differing says only that
+    they differ. Building the same computation in float64 from the *device's
+    own* operands -- bf16 converts exactly, so the reference has no error of its
+    own -- says which to keep. That is how `_combine`'s matmul form was shown to
+    be 27 % better on the worst element and 35 % on the mean rather than merely
+    different, and it is the check to run whenever a rewrite moves where the
+    rounding falls. End-to-end next-token accuracy cannot do this job: 127
+    scored positions do not resolve one bf16 ulp.
+
+21. **A device call on the eager prefill path is worth ~57 us, and its size does
     not matter.** Injecting a known number of ops and reading the slope gives
     90 +/- 15 us for the marginal op, and the one clean removal on record
     (`moe_chunk` 32 -> 128, 1008 calls, 918.6 -> 861.7 ms) gives 57 us for a real
@@ -367,7 +390,7 @@ stack rather than only the harnesses:
 | `TTEngine(speculate=8)`, copy-heavy prompt | 240.1 ms/token | **174.7 ms/token** (1.37x), tokens identical |
 | the same, open prose | 240.5 ms/token | 268.1 ms/token (0.90x) |
 | the same, run twice in separate processes | — | **token-identical on all three turns** |
-| traced step, 262144 ctx | 236 ms | **236.2 ms** |
+| traced step, 262144 ctx | 236 ms | **236.2 ms**, since taken to **173.7** by `022` |
 | traced step, QSA on at 8192 | 297 ms | **297.4 ms** |
 | decode with the **QSA indexer on** (8192) | 83.0 %, NLL 0.682 | **identical** |
 | `step_n`, k = 1, 2, 4, 8 | 0.00 % on the hidden | **identical** |

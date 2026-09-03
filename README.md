@@ -101,27 +101,31 @@ End-to-end through the engine, greedy, 12 output tokens after a 5-token prompt
 (so 17 device steps produce 12 tokens — prompts are fed one token per step):
 
 The server defaults to a single user: one slot at the model's full 262144-token
-context, traced. Per-token cost is flat in position (496 ms at 4, 501 ms at
-65536) because the step is dominated by the MoE and DeltaNet and the
+context, traced. Per-token cost is flat in position because the step is dominated by the MoE and DeltaNet and the
 sparse-attention budget is fixed at 2048 — long context costs memory, not time.
 The K/V cache is 6.4 GB per sequence at full length, so slots and context trade
 directly and the engine checks them against the DRAM budget at construction.
 
 | slots | context | ms/token | ms/step |
 |---|---|---|---|
-| 1 | **262144** | 300.5 | **236** |
+| 1 | **262144** | 300.5 | **173.7** |
 | 2 | 131072 | 319.0 | — |
 | 3 | 65536 | 323.7 | — |
 
-(229 ms before `docs/iterations/014`; the model was wrong then. Fixing the
-DeltaNet head pairing cost 3 ms, and only because `attn_qkv` now carries twelve
-q/k heads per device instead of four. With QSA's sparse selection on -- contexts
-in `(2048, 65536]` -- a step is 297.5 ms at 8192 tokens against 236.1 dense; the
-extra is almost all `ttnn.topk` at k=512, see `docs/iterations/015`.)
+(236.2 ms until `docs/iterations/022`, which found that the routed MoE was 65 %
+of the step and that almost none of that was the experts -- at M = 1 the row axis
+pads to 32, so every [1, 512, 1, 2560] tensor was 84 MB carrying 2.6 MB. Removing
+the per-expert input copy and combining the experts with one matmul took it to
+173.7 without giving up any accuracy: the first change is bit-identical, the
+second measurably closer to an exact float64 reference than what it replaced.
+Before that, 229 ms pre-`014`, when the model was wrong. With QSA's sparse
+selection on -- contexts in `(2048, 65536]` -- a step was 297.5 ms at 8192 tokens
+against 236.1 dense; the extra is almost all `ttnn.topk` at k=512, see
+`docs/iterations/015`.)
 
 For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
 **7.2 ms/token** instead of ~500, and no longer costs the trace: the two run
-together, so generated tokens still take ~236 ms. Turning it on took a
+together, so generated tokens still take ~174 ms. Turning it on took a
 73-token turn's cold time to first token from 11.40 s to **6.3 s**, with the
 same tokens.
 

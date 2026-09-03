@@ -4,7 +4,7 @@
 
     parts: none moe shared allreduce attn reinject ple
            expertffn combine permute routing topk<N>
-           qsa deltanet
+           qsa deltanet sdpa kvupdate gateup downproj
 
 Invariant 19 says the eager prefill path is dispatch-bound, and 5.7 says the
 traced step is emphatically not -- removing 97 ops moved it 236.1 -> 236.0 ms.
@@ -129,6 +129,59 @@ elif PART in ("combine", "routing", "permute"):
         return ttnn.sum(ttnn.multiply(per_expert, gate_per_expert), dim=1, keepdim=True)
 
     moe.moe_block = _patched
+elif PART == "sdpa":
+    # the attention itself, not the projections around it
+    _z = {}
+
+    def _stub_sdpa(q, *a, **kw):
+        key = tuple(q.shape)
+        if key not in _z:
+            import torch
+            _z[key] = ttnn.from_torch(
+                torch.zeros(*q.shape), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+        return _z[key]
+
+    ttnn.transformer.paged_scaled_dot_product_attention_decode = _stub_sdpa
+elif PART == "kvupdate":
+    ttnn.experimental.paged_update_cache = lambda *a, **kw: None
+elif PART in ("gateup", "downproj"):
+    # split expert_ffn's two matmuls. `gateup` stubs the fused gate|up and keeps
+    # the down projection; `downproj` the reverse. The stub is one cached buffer,
+    # so neither measures an allocation.
+    from twtest.tt.moe import sparse_program_config as _spc, HIFI4 as _H2
+    _buf = {}
+
+    def _zeros(shape):
+        if shape not in _buf:
+            import torch
+            _buf[shape] = ttnn.from_torch(
+                torch.zeros(*shape), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+        return _buf[shape]
+
+    def _split_ffn(x, gate_w, up_w, down_w, sparsity, nnz, E, K, I):
+        m, k_in = x.shape[-2], x.shape[-1]
+        n = gate_w.shape[-1] // 2
+        kw2 = {"sparsity": sparsity, "nnz": nnz, "is_input_a_sparse": True,
+               "is_input_b_sparse": True}
+        if PART == "gateup":
+            hidden = _zeros((1, E, m, n))
+        else:
+            both = ttnn.reshape(ttnn.sparse_matmul(
+                x, gate_w, program_config=_spc(m, k_in, 2 * n),
+                compute_kernel_config=_H2, sparsity=sparsity, nnz=nnz,
+                is_input_a_sparse=False, is_input_b_sparse=True), (1, E, m, 2 * n))
+            gate = ttnn.slice(both, (0, 0, 0, 0), (1, E, m, n))
+            up = ttnn.slice(both, (0, 0, 0, n), (1, E, m, 2 * n))
+            hidden = ttnn.multiply(ttnn.silu(gate), up)
+        if PART == "downproj":
+            return _zeros((1, E, m, K))
+        return ttnn.sparse_matmul(
+            hidden, down_w, program_config=_spc(m, hidden.shape[-1], K),
+            compute_kernel_config=_H2, **kw2)
+
+    moe.expert_ffn = _split_ffn
 elif PART.startswith("topk"):
     # Does sparse_matmul actually skip the unselected experts? If the step time
     # is flat in top_k it is reading all 512 regardless, which is the whole
