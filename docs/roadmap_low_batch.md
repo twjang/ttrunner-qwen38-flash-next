@@ -15,7 +15,7 @@
 
 Date: 2026-09-02. Status of the code this is written against: branch
 `feat/ttnn-inference-stack`, single user, 1 slot, 262144-token context, traced
-decode at **229 ms/step** (496 ms eager). Everything below is a proposal with the
+decode at **236 ms/step** (486 ms eager). Everything below is a proposal with the
 measurement it rests on; nothing here is implemented unless marked so.
 
 The one number to keep in mind: at batch 1 a step is **6355 device ops at
@@ -73,22 +73,30 @@ reference.
 ### A1. Make it fast for *short* sequences too (needed by MTP, Part B)
 
 The chunk path is built for 128 tokens: `gated_delta_attn_seq` fixes the chunk at
-128, and every layer does a **host round trip** to run `deltanet.prepare()`
-(~30 MB per layer per chunk) plus a second round trip for the output. At 128
-tokens that amortises to 45 ms/token. At 4 tokens it does not amortise at all,
-and nothing has measured it. Measure `prefill(seq=k)` for k in {2, 4, 8, 16}
-before designing anything on top of it -- MTP verification needs a *cheap*
-multi-token step, and "cheap" here means comparable to one 229 ms decode step.
+128, so at 4 tokens nothing amortises. At 128 tokens it is now **7.2 ms/token**
+(925 ms a chunk). Measure `prefill(seq=k)` for k in {2, 4, 8, 16} before
+designing anything on top of it -- MTP verification needs a *cheap* multi-token
+step, and "cheap" here means comparable to one 236 ms decode step.
+
+> **Lever 1 below is done**, and the host round trips this section was written
+> around are gone: `deltanet.prepare_device` builds the op's eight inputs on
+> device and `_attention_chunk` reads a paged cache, so the chunk path contains
+> no host->device copy at all. `short_chunk_bench.py` measures the remaining
+> fixed cost at 850 ms for k=1, which is still the wrong shape for verifying two
+> or three drafted tokens -- so lever 2 is the live one. See handoff 5.2 and
+> `docs/iterations/017`.
 
 Levers, in the order I would try them:
 
-1. **Do `prepare()` on device.** It is the l2-norm, the `beta` scaling, the
-   per-chunk decay cumsums and a `CHUNK x CHUNK` lower-triangular inverse
-   (`deltanet.block_inverse`). All but the inverse are elementwise/cumsum ops
-   ttnn has; the inverse is a fixed 128x128 solve per head that can be done with
-   a short Newton–Schulz iteration or by unrolling the forward substitution in
-   32-row tile blocks. Removes two PCIe round trips per DeltaNet layer (72 per
-   chunk).
+1. ~~**Do `prepare()` on device.**~~ **Done.** `deltanet.prepare_device` does
+   the l2-norm, the `beta` scaling, the decay cumsums and the triangular inverse
+   in ttnn, in the op's own `[H, NC, C, D]` layout, so each device prepares the
+   heads it already holds and nothing is gathered. The inverse is *not* the
+   Newton-Schulz iteration proposed here: that form is what
+   `deltanet.block_inverse` already used and it turned out unstable on real data
+   -- 620875 % on device, where a matmul carries ~1e-3 rather than ~1e-7. It was
+   replaced by a blocked `D + C` recursion that never grows. `017` has the
+   story; the fix applied to the host path too, which had been quietly 0.27 out.
 2. **Short-sequence DeltaNet without the chunk op.** For seq ≤ ~8 the recurrence
    unrolled `seq` times (the decode `linear_attn.decode_step`, ~40 ops) is
    36 × seq × 40 × 36 µs ≈ 52 ms × seq -- for seq = 4 that is ~200 ms on top of a
@@ -96,8 +104,10 @@ Levers, in the order I would try them:
    is a 4-token step at ~430 ms, i.e. ~110 ms/token, *without* fixing anything
    in the chunk path. It also gives the intermediate recurrent states for free,
    which A4/B1 need.
-3. **MoE chunking.** `moe_chunk=16` was chosen for 128-token chunks to bound
-   union waste (`|∪ experts| × M` rows). For a short chunk use `moe_chunk=seq`.
+3. **MoE chunking.** The default is now `moe_chunk=32`, measured rather than
+   reasoned from the waste figures, and **capped** there: past one row tile the
+   answer changes (handoff 5.8, invariant 13). For a short chunk
+   `moe_chunk=seq` is right and needs no thought, since seq <= 32.
 4. **PLE and attention chunks already batch over seq**; nothing to do until the
    profile says otherwise.
 
@@ -204,7 +214,7 @@ against the HF `mtp.*` module if one is published. Until then treat the order of
 **Why it fits this hardware.** A draft step is ~1/48 of the model's ops (~5 ms
 traced) plus an LM head. Verifying k drafted tokens is a k+1-row step, and rows
 are free up to 64. The whole gain is therefore (accepted tokens per verify) ÷
-(cost of a verify step ÷ 229 ms). Published acceptance for one NextN head is
+(cost of a verify step ÷ 236 ms). Published acceptance for one NextN head is
 around 0.7-0.85 per position on text; with k = 3 that is ~2.3 tokens per
 iteration.
 
@@ -218,7 +228,7 @@ for "after j tokens". Three ways out, cheapest first:
    recurrence token-by-token *within* the batched step and keep every
    intermediate state (k+1 × 4.7 MB × 36 layers -- fine). On acceptance of j
    tokens, `ttnn.copy` state_j into the live state. One extra copy per layer,
-   no re-execution. Cost per iteration ≈ 229 ms + 52 ms × k for the unrolled
+   no re-execution. Cost per iteration ≈ 236 ms + 52 ms × k for the unrolled
    part. At k = 3, α = 0.75: ~2.3 tokens / ~385 ms ≈ **170 ms/token, 1.35x**.
    Honest, and the unrolled path is also the correct short-sequence prefill.
 2. **Snapshot + re-run.** Snapshot recurrent/ring state before verify; on
@@ -295,7 +305,7 @@ removed per unit of risk:
 
 ### B4. Throughput at batch 2-3 is already free -- expose it
 
-Step time is flat to 64 rows, so 3 concurrent sequences cost the same 229 ms.
+Step time is flat to 64 rows, so 3 concurrent sequences cost the same 236 ms.
 For a single user that means:
 
 * **`n > 1` / best-of-n sampling** in the OpenAI API: n candidates in one step.
