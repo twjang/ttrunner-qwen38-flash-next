@@ -131,9 +131,10 @@ same tokens.
 
 `speculate=k` drafts from the prompt and verifies k tokens in one pass. It is
 **exact** — the output is identical to decoding one token at a time — and worth
-1.37x on text that quotes its context (174.7 ms/token against 240.1 at
-`speculate=8`), while costing about 10 % on open prose, where the drafter rarely
-fires. Off by default for that reason. Prefix reuse
+1.10x on text that quotes its context (160.3 ms/token against 176.4 at
+`speculate=8`), and neutral on open prose, where the drafter rarely fires. It
+was worth 1.37x until the traced step itself got 1.36x faster; speculation
+amortises that step, so most of its advantage went with it. Off by default. Prefix reuse
 across chat turns is on unconditionally — a follow-up turn re-feeds only what it
 added, measured **2.27 s** to first token warm. Cold depends on how the prompt is
 fed and the earlier figure here did not say: **11.40 s** with

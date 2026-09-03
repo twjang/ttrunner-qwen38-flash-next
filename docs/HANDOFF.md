@@ -384,11 +384,11 @@ stack rather than only the harnesses:
 | prefill=32, 128 scored | 71.9 %, NLL 1.433 | **identical** |
 | prefill=128, 107 scored | 24.3 %, NLL 5.648 | **identical** |
 | chunk wall clock | 1060.5 ms | 1070.5 ms |
-| `TTEngine`, 48 tokens x 2 prompts | 240.1 / 240.5 ms/token | **239.6 / 240.4, same tokens** |
+| `TTEngine`, 48 tokens x 2 prompts | 240.1 / 240.5 ms/token | **176.4 / 177.3 ms/token** after `022`; was 239.6 / 240.4 |
 | `TTEngine` + `chunked_prefill`, prefix reuse | — | **11.40 s cold, 2.27 s warm, warm == cold** |
 | the same **with the decode trace on** | — | **6.2–6.4 s cold**, same tokens, twice over |
-| `TTEngine(speculate=8)`, copy-heavy prompt | 240.1 ms/token | **174.7 ms/token** (1.37x), tokens identical |
-| the same, open prose | 240.5 ms/token | 268.1 ms/token (0.90x) |
+| `TTEngine(speculate=8)`, copy-heavy prompt | 176.4 ms/token plain | **160.3 ms/token** (1.10x), tokens identical |
+| the same, open prose | 177.3 ms/token plain | 176.5 ms/token (1.00x) |
 | the same, run twice in separate processes | — | **token-identical on all three turns** |
 | traced step, 262144 ctx | 236 ms | **236.2 ms**, since taken to **173.7** by `022` |
 | traced step, QSA on at 8192 | 297 ms | **297.4 ms** |
@@ -621,7 +621,15 @@ prefix of the k tokens needs a state snapshot -- or a replay, which the numbers
 above make affordable.
 
 
-### 5.6 Speculation — **done**: exact, and 1.37x on text that quotes itself
+### 5.6 Speculation — **done**: exact, and 1.10x on text that quotes itself
+
+> **Re-measured after `022`, and the headline moved.** Speculation amortises the
+> traced step, so making the step 1.36x faster takes most of its advantage with
+> it: copy-heavy went 174.7 -> **160.3 ms/token**, but plain decode went
+> 240.1 -> 176.4, so the ratio fell from **1.37x to 1.10x**. Open prose is now
+> neutral (176.5 against 177.3) where it used to cost 10 %. The scheme is
+> unchanged and still exact -- what changed is what it is being compared against,
+> which is the thing to re-check whenever the baseline moves.
 
 Built end to end and opt-in via `TTEngine(speculate=k)`, where k is the tokens a
 verify *feeds* and it drafts `k - 1`. `docs/iterations/016` has the iteration and
