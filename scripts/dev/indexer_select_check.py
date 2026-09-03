@@ -47,7 +47,13 @@ print(f"RESULT reference mask built, {T} positions", flush=True)
 st = LayerState()
 for t in range(T):
     row = m.to_dev(hidden[:, t : t + 1].reshape(1, 1, 1, cfg.hidden_size).contiguous())
-    mask = m._indexer_select(row, LAYER, st, [t])
+    # `_indexer_select` takes the query's rope table rather than deriving it:
+    # `_attention_step` has already built cos/sin for the position and the
+    # indexer reuses them. Same tables, same layout as the call site.
+    q_cos, q_sin = m.rope([t])
+    mask = m._indexer_select(
+        row, LAYER, st, [t], m.to_dev(q_cos, ttnn.float32), m.to_dev(q_sin, ttnn.float32)
+    )
     if t % 500 == 0:
         print(f"  step {t}/{T}", flush=True)
 

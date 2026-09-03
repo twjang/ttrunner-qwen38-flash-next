@@ -418,6 +418,20 @@ block boundary (2048/2048), and one block out mid-block, at rank 511 against
 rank 512 with a score gap of 8.2e-4 -- below what bf16 resolves. Below the budget
 it is numerically identical to dense. Traced matches eager token for token.
 
+**Re-verified, after repairing the harness.** `indexer_select_check.py` had gone
+stale against the code -- `_indexer_select` grew `q_cos`/`q_sin` parameters and
+the harness still called the old signature, so it raised a `TypeError` rather
+than checking anything. Fixed, it now reports 2048 of 2048 tokens selected with
+**nothing missing and nothing extra**, no block off in either direction, and the
+trailing partial block present. So the mid-block caveat above is conservative
+at this position rather than a standing error.
+
+Separately, the branch that hands the selection to
+`paged_scaled_dot_product_attention_decode` as an `attn_mask` is exercised only
+when `max_seq_len` exceeds the budget, which no other quality check here does:
+at 8192 with the selection on, decode scores 83.0 % top-1 / NLL 0.682, identical
+to dense (5.2's gate table).
+
 Cost at 8192 context: 297.5 ms traced against 236.1 dense.
 
 Two kernel limits, both recorded in 015: `ttnn.scatter` takes uint16 indices, so
