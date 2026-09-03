@@ -269,6 +269,19 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     Reproducing one prompt's text is not (b), and neither is agreement with the
     reference; both of those stood while the head pairing was wrong.
 
+19. **A device call on the eager prefill path is worth ~57 us, and its size does
+    not matter.** Injecting a known number of ops and reading the slope gives
+    90 +/- 15 us for the marginal op, and the one clean removal on record
+    (`moe_chunk` 32 -> 128, 1008 calls, 918.6 -> 861.7 ms) gives 57 us for a real
+    one; price reductions with the smaller figure. An injected op on a 128x2560
+    activation costs 1.11x one on a 32x32 tile, so what is being paid for is the
+    launch and not the arithmetic. Two corollaries. `op_count.py`'s totals are
+    python calls into `ttnn`, not dispatches -- an injected `reshape` measures
+    2.1 us, and `reshape` is 1094 of the 11681 a chunk reports -- so a count is
+    an upper bound on the dispatches it stands for. And the 0.30 ms per dispatch
+    that 5.7 used for four iterations is retired: it was one A/B on the decode
+    path and it over-predicts both paths by 4-6x (`021`).
+
 ## 5. Open work, with definition of done
 
 The model is correct as of `docs/iterations/014`, so this is no longer gated on
@@ -787,7 +800,7 @@ The upstream report stands regardless: the defect is real, it is just no longer
 in the way.
 
 
-### 5.7 Fewer launches — worth little on the traced step, a lot on prefill
+### 5.7 Fewer launches — **done**: a launch is ~57 us, and that prices the item out
 
 **Read this before spending a day on it.** `docs/iterations/012` framed the
 single-user step as op-count bound, "6355 ops x ~36 us traced". That arithmetic
@@ -797,9 +810,18 @@ both paths at the same configuration:
     eager    498.7 -> 469.1 ms   (-5.9 %)
     traced   236.1 -> 236.0 ms   (unchanged)
 
-29.6 ms for 97 ops is **0.30 ms apiece, and that is a host dispatch**. A trace
-replays with one dispatch, which was its whole point, so removing launches buys
-nothing there. Fewer launches pays for chunked prefill and for eager decode --
+29.6 ms for 97 ops is 0.30 ms apiece. A trace replays with one dispatch, which
+was its whole point, so removing launches buys nothing there.
+
+> **That 0.30 ms is not a dispatch cost, and `021` retired it.** It is the cost
+> of those 97 particular ops on that path, and it was then applied to every
+> other path for four iterations. It does not survive contact with either:
+> extrapolated over the step it was measured on it predicts 1873 ms for a 498.7
+> ms step, and over a prefill chunk 3.50 s for 925 ms. Measured directly on
+> prefill by injecting a known number of ops and reading the slope
+> (`dispatch_cost_check.py`), a launch is **90 +/- 15 us** marginal and **57 us**
+> realisable. Everything below that prices a candidate in dispatches is
+> therefore quoting a number five to six times too large. Fewer launches pays for chunked prefill and for eager decode --
 which is what speculation currently needs -- and not for traced decoding.
 
 `scripts/dev/op_count.py` wraps the ttnn namespace and counts one step. The
@@ -819,10 +841,15 @@ scaling.
 
 **Prefill is where this item is now worth something.** The framing above was
 written when the eager path was a fallback. It is not any more: chunked prefill
-is on for one-slot engines, it is *not* traced, and it issues **12293** device
+is on for one-slot engines, it is *not* traced, and it issues **11681** device
 calls for a 128-token chunk against 6143 for a single-token step
-(`op_count.py --prefill 128`). At ~1060 ms a chunk that is essentially all
-dispatch. Op-count reduction pays here at full rate.
+(`op_count.py --prefill 128`). Op-count reduction pays here at full rate --
+but at 57 us a call, not at 0.30 ms.
+
+Note that "11681 calls" overstates the dispatches: `op_count.py` counts python
+calls into `ttnn`, and an injected `reshape` measures **2.1 us**, i.e. it is a
+host-side view that never reaches the device. `reshape` alone is 1094 of that
+total.
 
 `--by-caller` attributes each call to the `twtest` line that issued it, which is
 what says where to cut; "multiply, 1993" does not. The distribution is flat --
@@ -901,33 +928,34 @@ wall clock, never the call count alone. Accuracy on this path is not repeatable 
 `device_quality.py` unchanged, `op_count.py` before and after, and
 `bench_step.py` at one configuration for both paths.
 
-Done when: the prefill chunk is **captured**, which is not what closed 5.2.
+**Done: the conversion factor is measured and it closes the item.** 5.7 never
+had a definition of done for most of its life, and the two it acquired were both
+wrong — "5.2's step 5 lands" (5.2 closed by another route, without capturing the
+prefill) and then "the chunk is captured" (that is blocked upstream, so it makes
+the item permanently open on someone else's schedule). Neither asks the question
+5.7 is actually for, which is *what is a launch worth here*. That now has an
+answer, and the answer prices the category out:
 
-> That criterion said "5.2's step 5 lands", on the reasoning that a trace
-> replays a whole graph on one dispatch and so takes the launch count out of the
-> equation wholesale. 5.2 closed by a different route -- chunked prefill now
-> coexists with the *decode* trace rather than being captured itself -- so the
-> premise did not arrive with it. A prefill chunk still issues **12293 device
-> calls** and is still dispatch-bound, and capturing it needs a second trace and
-> therefore the defect in 5.6's report. Until then this item is live on its own
-> terms.
+| what | calls | worth at 57 us |
+|---|---|---|
+| the largest single call site (`shared_expert`) | 576 | 33 ms, 3.6 % |
+| every site in the by-caller top twelve | 3712 | 212 ms, 23 % |
 
-The original reasoning, which still holds once a capture is possible: This item had no definition of done for most
-of its life, which reads less like an oversight in the writing than a missing
-observation. 5.7 exists *because* prefill is dispatch-bound and untraced. A
-trace replays a whole graph on one dispatch, so capturing the prefill chunk
-takes the launch count out of the equation wholesale -- which is exactly why the
-item is already worth nothing on the traced decode step, as the paragraphs above
-spend some length establishing without drawing the conclusion. Grinding op count
-here buys percentages against a change that would buy the category.
+The second row is the ceiling on the whole item, not an opportunity — those
+calls are doing the model's work. With the distribution flat (no site above
+4.9 %) every *individual* remaining reduction is under 4 %, against a required
+A/B of `device_quality.py`, `op_count.py` and `bench_step.py`, on a path where
+three of three attempts so far either changed the answer or ran slower.
 
-So treat 5.7 as a standing invitation while prefill runs eagerly, take a
-reduction only when the A/B above says it pays, and close it when the traced
-path exists. Three candidates are already priced -- one kept at 13.6 %, two
-refused, the shared-expert hoist (4 % of clock for 14 % of NLL) and the shared
-q/k/v permute (360 fewer calls, 30 % slower) -- so start from `op_count.py
---by-caller`, not from that list.
+So: **stop grinding op count here.** The measurement, the size control that
+shows it is the launch and not the arithmetic, and the calibration against a
+real removal are in `021`; the harness is `dispatch_cost_check.py` and it
+re-runs in a few minutes if the baseline moves.
 
+What would still buy the category is capturing the chunk, which takes the launch
+count out of the equation wholesale rather than by percentages. That is blocked
+on the trace-alternation defect in `ttnn_bug_report/` and is tracked there, not
+here.
 
 ### 5.8 The MoE row-group cliff — **done**: defect fixed, cap measured
 

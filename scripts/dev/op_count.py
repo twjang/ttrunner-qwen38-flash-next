@@ -13,10 +13,10 @@ per-section syncs, and the question here is "how many", not "how long".
 `--by-caller` attributes each call to the `twtest` line that issued it, which is
 what actually says where to cut -- "multiply, 3241" does not.
 
-`--prefill N` counts one N-token chunked prefill instead. That is the number
-that says whether tracing chunked prefill is worth the paged-cache refactor it
-needs: multiply by the ~0.30 ms an eager dispatch costs and compare against the
-measured wall clock.
+`--prefill N` counts one N-token chunked prefill instead. Multiply by ~57 us --
+the measured value of a removed call on that path -- to price a reduction, and
+treat the result as an upper bound, since some counted calls are host-side views
+that never dispatch. `dispatch_cost_check.py` is where those numbers come from.
 """
 import sys
 import traceback
@@ -83,8 +83,14 @@ total = sum(counts.values())
 what = f"one {PREFILL}-token chunked prefill" if PREFILL else "one step"
 print(f"RESULT total device calls in {what}: {total}", flush=True)
 if PREFILL:
-    print(f"RESULT at ~0.30 ms an eager dispatch: {total * 0.30 / 1000:.2f} s of dispatch",
-          flush=True)
+    # 57 us, not the 0.30 ms this used to print. That figure came from removing
+    # 97 particular ops from an eager *decode* step and does not transfer: it
+    # predicted 3.50 s of dispatch inside a chunk that measures 0.92 s. See
+    # `dispatch_cost_check.py`, which measures the slope directly on this path,
+    # and note the estimate below is still an overstatement because some of
+    # these calls never dispatch -- an injected `reshape` costs 2.1 us.
+    print(f"RESULT at ~57 us a removed call: {total * 0.057 / 1000:.2f} s, "
+          f"an upper bound on what removing every one would buy", flush=True)
 for name, n in sorted(counts.items(), key=lambda kv: -kv[1])[:TOP]:
     print(f"RESULT {n:6d}  {100 * n / total:5.1f}%  {name}", flush=True)
 print(f"RESULT per layer (48): {total / 48:.1f}", flush=True)
