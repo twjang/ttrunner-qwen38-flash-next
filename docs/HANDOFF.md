@@ -861,10 +861,25 @@ the answer changes past 32, which is one tile:
 | 128 | 998.7 ms | 128.2 | 144.9 % | 50 |
 
 The wall-clock column is one unwarmed draw per row, taken before
-`moe_chunk_sweep.py` was fixed to warm twice and take a median of nine.
-Re-measured that way, 16 is 1214 ms and 32 is 919 ms — **1.32x**, not the 1.85x
-the raw draws implied. The ordering and the logits column stand; the ratio did
-not, and neither does any speed comparison drawn from the other rows.
+`moe_chunk_sweep.py` was fixed to warm twice and take a median of nine. **Ignore
+it.** Re-measured properly (`TWTEST_LIFT_MOE_CAP=1` to reach past the cap):
+
+| moe_chunk | median | min | max | tok/s |
+|---|---|---|---|---|
+| 16 | 1214.1 ms | 1206.2 | 1227.4 | 105.4 |
+| 32 | **918.6 ms** | 914.8 | 923.4 | 139.3 |
+| 64 | 881.6 ms | 879.5 | 970.0 | 145.2 |
+| 128 | 861.7 ms | 858.3 | 960.7 | 148.6 |
+
+Two things the single draws got wrong. 16 -> 32 is **1.32x**, not the 1.85x they
+implied. And they had 128 *slower* than 64 (998.7 against 936.1) where it is in
+fact faster, so the ordering was wrong too, not just the ratio -- larger chunks
+are monotonically quicker.
+
+**Which makes the cap nearly free.** Lifting it from 32 to 128 buys **6.6 %**,
+not the 1.18x claimed from the raw draws. For that it changes the answer past one
+row tile. The logits column below is the evidence that matters and is unaffected;
+it was measured within one process.
 
 **Measure this on prefill's logits, not on next-token accuracy.** The cap was
 first set from one `device_quality.py --prefill 128` run per setting, and two
@@ -988,7 +1003,7 @@ turns a 0.5 % perturbation into a changed expert set is our own
 `keep = ge(probs, threshold)`, which admits ties: on the one row that moves, the
 threshold is *bit-identical* and a twelfth expert simply crossed it.
 
-**So the cap stays at 32, permanently, as a measured policy choice.** With the
+**So the cap stays at 32, permanently, and it costs 6.6 % of a chunk.** With the
 matmul fixed, over 107 scored positions:
 
 | moe_chunk | top-1 | NLL |
@@ -997,7 +1012,7 @@ matmul fixed, over 107 scored positions:
 | 64 | 23.4 % | 6.443 |
 | 128 | 22.4 % | 6.136 |
 
-1.18x on prompt intake is not worth that, and unlike before the reason is
+6.6 % of prompt intake is not worth that, and unlike before the reason is
 understood rather than mysterious.
 
 **And replacing the threshold would not help either**, which was the obvious

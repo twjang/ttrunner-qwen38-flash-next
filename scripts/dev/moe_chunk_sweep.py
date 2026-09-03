@@ -18,6 +18,7 @@ and 32 agree on every token while 64 and 128 degrade monotonically. So
 than raises above the cap, since re-deriving it is what the script is for.
 Pair it with `device_quality.py --prefill 128 --moe-chunk N`.
 """
+import os
 import sys
 import time
 
@@ -34,6 +35,14 @@ MOE = args[1:] or [8, 16, 32, 64, 128]
 # this harness did not do it -- which means the 1.85x and 13.6x it was quoted
 # for were single draws.
 WARM, ITERS = 2, 9
+
+# Lifting the cap is the point of asking: whether it costs anything is exactly
+# what this measures, and the answer decides whether 5.8's "remaining prize" is
+# real.
+if os.environ.get("TWTEST_LIFT_MOE_CAP"):
+    import twtest.tt.model as model_mod
+    model_mod._MAX_MOE_CHUNK = max(MOE)
+    print(f"RESULT lifted _MAX_MOE_CHUNK to {max(MOE)} for this measurement", flush=True)
 
 mesh, cfg, m = open_model(max_seq_len=512)
 prompt = [1000] * CHUNK

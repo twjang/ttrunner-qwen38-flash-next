@@ -1975,9 +1975,11 @@ class TTModel:
 
         Those are **one unwarmed draw each** -- the harness took a single
         sample until it was fixed to warm twice and take the median of nine --
-        and they overstate the spread. Re-measured properly: 16 is 1214 ms and
-        32 is **919 ms** (min 915, max 997). So 1.32x, not the 1.85x the raw
-        draws implied. The ordering stands; the ratio did not.
+        and they are wrong in both magnitude and order. Re-measured: 16 is
+        1214 ms, 32 is **918.6**, 64 is 881.6, 128 is 861.7. So 16 -> 32 is
+        1.32x rather than 1.85x, and larger chunks are monotonically quicker
+        where the draws had 128 slower than 64. Lifting the cap from 32 to 128
+        would buy 6.6 %.
 
         The default had been 16, chosen from the waste figures alone.
 
