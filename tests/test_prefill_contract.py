@@ -78,6 +78,10 @@ def test_chunked_deltanet_never_leaves_the_device() -> None:
     `to_torch`/`from_torch` or that comes back.
     """
     src = inspect.getsource(TTModel._linear_attention_chunk)
+    # Positive anchor first: a test of "X is absent" passes on a gutted function,
+    # so it has to prove it is reading the live path before the absence means
+    # anything.
+    assert "prepare_device(" in src, "the chunk must still prepare the op's inputs on device"
     for host_op in ("to_torch", "from_torch", "ShardTensorToMesh", "ConcatMeshToTensor"):
         assert host_op not in src, f"{host_op} puts the host back in the chunk path"
 
@@ -178,6 +182,9 @@ def test_chunked_attention_builds_no_host_mask() -> None:
     it, and the failure was silent the first time.
     """
     src = _code_of(TTModel._attention_chunk)
+    # Positive anchor: absence proves nothing about a function that no longer
+    # does the work.
+    assert "chunked_scaled_dot_product_attention" in src, "still the causal chunked op"
     assert "attn_mask" not in src, "the chunk path must not build an attention mask"
     assert "torch.where" not in src and "torch.arange" not in src, (
         "no host-built mask or position vector in the chunk path"

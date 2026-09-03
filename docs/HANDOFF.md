@@ -229,7 +229,18 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     `pytest` now runs `scripts/dev/harness_api_check.py` over every harness
     (`tests/test_harness_api.py`) and fails on a name or arity that has drifted;
     the device half it cannot see, so before quoting a harness's number, run it.
-17. **Verification standard.** A change to the model is done when (a) unit
+17. **Half this suite tests source text, not behaviour.** 50 of 113 tests read
+    `inspect.getsource` and assert on strings. That is a deliberate trade -- it
+    costs no hardware and it catches a refactor that quietly undoes a fix -- but
+    it locks in *text*, and text can be wrong. One of them was: the `step_n`
+    guard test asserted `"0 < k <= 64" in src` and so stood guard over a range
+    half of which was broken (5.5), passing all the while and requiring the test
+    to be edited before the bug could be fixed. Two rules follow. A source test
+    must anchor on something *positive*, or a gutted function satisfies it for
+    the wrong reason -- three such tests existed and were fixed. And when a
+    source test pins a number or a limit, check the number, because the test
+    cannot.
+18. **Verification standard.** A change to the model is done when (a) unit
     tests pass, (b) `device_quality.py` is run and next-token accuracy does not
     regress from 83 %, (c) the number it claims to move is measured with the
     hygiene in (7) and (8) -- repeat it, one run has no noise floor -- and

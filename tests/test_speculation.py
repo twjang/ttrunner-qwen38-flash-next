@@ -112,6 +112,11 @@ def test_the_second_command_queue_is_not_reintroduced() -> None:
     from twtest.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
+    # Positive anchor: this is an "X is absent" test, which a gutted or renamed
+    # `__init__` would satisfy for the wrong reason.
+    assert "open_mesh_device" in src and "trace_region_size" in src, (
+        "must be reading the real mesh setup"
+    )
     assert "num_command_queues" not in src, (
         "a second command queue trades the hang for a silently wrong replay"
     )
