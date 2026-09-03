@@ -120,9 +120,16 @@ in `(2048, 65536]` -- a step is 297.5 ms at 8192 tokens against 236.1 dense; the
 extra is almost all `ttnn.topk` at k=512, see `docs/iterations/015`.)
 
 For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
-**7.2 ms/token** instead of ~500, at the cost of the trace (each generated token
-then costs ~513 ms). A 2000-token prompt with 200 output tokens is ~117 s that
-way against ~1047 s traced-and-stepped; short prompts invert it. Prefix reuse
+**7.2 ms/token** instead of ~500, and no longer costs the trace: the two run
+together, so generated tokens still take ~236 ms. Turning it on took a
+73-token turn's cold time to first token from 11.40 s to **6.3 s**, with the
+same tokens.
+
+`speculate=k` drafts from the prompt and verifies k tokens in one pass. It is
+**exact** — the output is identical to decoding one token at a time — and worth
+1.37x on text that quotes its context (174.7 ms/token against 240.1 at
+`speculate=8`), while costing about 10 % on open prose, where the drafter rarely
+fires. Off by default for that reason. Prefix reuse
 across chat turns is on unconditionally — a follow-up turn re-feeds only what it
 added, measured **2.27 s** to first token warm. Cold depends on how the prompt is
 fed and the earlier figure here did not say: **11.40 s** with

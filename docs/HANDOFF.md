@@ -290,7 +290,7 @@ is back to 236.1 ms from 239.1; attn_qkv costs ~200 MB more per device.
 what any change to the plan or the shard layout needs.
 
 
-### 5.2 Chunked prefill inside the trace — every unknown resolved, refactor not done
+### 5.2 Chunked prefill alongside the trace — **done**, though not by capturing it
 
 Chunked prefill works and is on for one-slot engines, but it turns the trace off:
 it runs eagerly, and a captured prefill graph replayed as token 0 repeated.
@@ -350,6 +350,9 @@ stack rather than only the harnesses:
 | chunk wall clock | 1060.5 ms | 1070.5 ms |
 | `TTEngine`, 48 tokens x 2 prompts | 240.1 / 240.5 ms/token | **239.6 / 240.4, same tokens** |
 | `TTEngine` + `chunked_prefill`, prefix reuse | — | **11.40 s cold, 2.27 s warm, warm == cold** |
+| the same **with the decode trace on** | — | **6.2–6.4 s cold**, same tokens, twice over |
+| `TTEngine(speculate=8)`, copy-heavy prompt | 240.1 ms/token | **174.7 ms/token** (1.37x), tokens identical |
+| the same, open prose | 240.5 ms/token | 268.1 ms/token (0.90x) |
 | the same, run twice in separate processes | — | **token-identical on all three turns** |
 | traced step, 262144 ctx | 236 ms | **236.2 ms** |
 | traced step, QSA on at 8192 | 297 ms | **297.4 ms** |
@@ -441,6 +444,31 @@ which is exactly what a trace removes. See also 5.7.
 Done when: `use_trace=True` and `chunked_prefill=True` together reproduce the
 eager result token for token over
 `scripts/dev/prefix_reuse_check.py --chunked --trace`.
+
+**Met — and read what was actually done, because it is not step 5.** The two
+flags conflicted for the reason the eager verifier first hung in 5.6: a
+prefill's first call allocates gigabytes of its own temporaries, and doing that
+while a trace is live corrupts the replay. That is what "token 0 repeated" was.
+`_device_loop` now warms one chunk before capturing the decoder, so the buffers
+exist and nothing allocates under a live trace, and `_use_trace` no longer
+switches itself off when chunked prefill is on.
+
+Run twice, identical both times and identical to the untraced chunked run:
+
+| | |
+|---|---|
+| four requests, tokens | identical to `--chunked` without the trace |
+| prefix reuse | 69 of 73 as expected; the unrelated prompt correctly misses |
+| warm == cold | yes |
+| cold time to first token | **6.2–6.4 s**, against 11.40 s untraced |
+
+**The prefill chunk itself is still not captured.** It runs eagerly, still
+issues 12293 device calls, and steps 1–4 above are what make that cheap rather
+than a trace. What changed is that it no longer costs you the *decode* trace,
+which is where the 11.40 → 6.3 s comes from. Capturing the chunk would need a
+second trace and so waits on the defect in 5.6's report; whether it is worth it
+once that lands is a fresh question, since prompt intake is already
+7.2 ms/token.
 
 
 ### 5.3 QSA indexer on device — **done**
@@ -557,7 +585,7 @@ prefix of the k tokens needs a state snapshot -- or a replay, which the numbers
 above make affordable.
 
 
-### 5.6 Speculation — exact, and blocked only by the ttnn trace-replay bug
+### 5.6 Speculation — **done**: exact, and 1.37x on text that quotes itself
 
 Built end to end and opt-in via `TTEngine(speculate=k)`, where k is the tokens a
 verify *feeds* and it drafts `k - 1`. `docs/iterations/016` has the iteration and
@@ -732,6 +760,32 @@ Done when: the interleaved replay works -- upstream fix or a formulation that
 avoids two traces -- and `speculation_check.py` shows a round cheaper than
 `speculate=0` on the copy-heavy prompt.
 
+**Met, by the second route.** Nothing required the verifier to be *captured*.
+Run eagerly it leaves the decoder's trace as the only one in the process, never
+alternated against anything, and the defect has nothing to bite. A verify
+amortises over the tokens it checks -- warmed eager `step_n` costs 150 ms per
+token verified at k=8 against a traced step's 236 -- so from k=4 up it is ahead
+whenever the draft is accepted.
+
+At `speculate=8`, 48 tokens, both prompts:
+
+| | speculative | baseline | |
+|---|---|---|---|
+| copy-heavy | **174.7 ms/token** | 240.1 | **1.37x** |
+| open prose | 268.1 | 240.5 | 0.90x |
+
+163 rounds, 42 of 49 drafted tokens accepted, and the output is **identical to
+the non-speculative engine token for token on both prompts**. Open prose loses
+10 % -- the drafter fires on 4 % of rounds there and each drafted round pays a
+full verify -- so it stays opt-in per `speculate=k`, off by default.
+
+Every width the rounds can use is warmed before the decoder is captured. Without
+that the first attempt hung anyway, because an eager `step_n` allocates its own
+48-layer graph and doing that under a live trace is the hazard above.
+
+The upstream report stands regardless: the defect is real, it is just no longer
+in the way.
+
 
 ### 5.7 Fewer launches — worth little on the traced step, a lot on prefill
 
@@ -847,7 +901,18 @@ wall clock, never the call count alone. Accuracy on this path is not repeatable 
 `device_quality.py` unchanged, `op_count.py` before and after, and
 `bench_step.py` at one configuration for both paths.
 
-Done when: **5.2's step 5 lands.** This item had no definition of done for most
+Done when: the prefill chunk is **captured**, which is not what closed 5.2.
+
+> That criterion said "5.2's step 5 lands", on the reasoning that a trace
+> replays a whole graph on one dispatch and so takes the launch count out of the
+> equation wholesale. 5.2 closed by a different route -- chunked prefill now
+> coexists with the *decode* trace rather than being captured itself -- so the
+> premise did not arrive with it. A prefill chunk still issues **12293 device
+> calls** and is still dispatch-bound, and capturing it needs a second trace and
+> therefore the defect in 5.6's report. Until then this item is live on its own
+> terms.
+
+The original reasoning, which still holds once a capture is possible: This item had no definition of done for most
 of its life, which reads less like an oversight in the writing than a missing
 observation. 5.7 exists *because* prefill is dispatch-bound and untraced. A
 trace replays a whole graph on one dispatch, so capturing the prefill chunk

@@ -458,6 +458,21 @@ class TTEngine(Engine):
         # feed the tokens it added.
         prefix: list[list[int] | None] = [None] * B
 
+        if self._chunked_prefill and self._use_trace:
+            # Warm the chunk graph before anything is captured, for the same
+            # reason the eager verifier needs its widths warmed: a first prefill
+            # allocates gigabytes of its own temporaries, and doing that while a
+            # trace is live corrupts the replay -- which is what "token 0
+            # repeated" was. One chunk of the default width makes every buffer
+            # exist.
+            mark("warming the prefill chunk graph")
+            from .deltanet import CHUNK
+
+            warm_state = self.model.new_state(batch=1)
+            self.model.prefill([0] * CHUNK, warm_state)
+            del warm_state
+            mark("prefill graph warmed")
+
         # Captured here rather than in __init__: it runs a warmup step, which
         # compiles every kernel and takes tens of seconds, and it must happen on
         # the device thread. A failure (most often no room for the trace buffer
