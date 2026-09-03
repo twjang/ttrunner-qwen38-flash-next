@@ -80,7 +80,7 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 | prefill, 128 tokens, `moe_chunk=32` | **925 ms** (138.4 tok/s); 2033 ms at the old `moe_chunk=16` default, 1070 ms before routing and expert compute were split |
 | unit tests | `uv run pytest -q` → 202 passed, ~3 s, no hardware needed |
 | **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; float32 reference 80.9 %** |
-| chunked prefill, judged against a same-positions decode control | 128 prefilled, 107 scored: **25.2 %** top-1 / NLL 5.82 vs 22.6 % / 6.00 stepped; 32 prefilled, 128 scored: **71.9 %** / 1.43 vs 71.7 % / 1.48 |
+| chunked prefill, judged against a same-positions decode control | 32 prefilled, 128 scored: **71.9 %** / NLL 1.43 vs 71.7 % / 1.48 — deterministic, one row tile. 128 prefilled, 107 scored: **21.5–27.1 %** / 5.61–6.35 against a control of 22.6 % / 6.00 — *not* repeatable, see invariant 8 |
 | a sequence's output vs the same sequence alone | identical to **batch 32**; differs above it, and that is arithmetic, not a bug (invariant 13) |
 
 Step time is flat in position (496 ms at pos 4, 501 ms at pos 65536) and flat
@@ -163,15 +163,28 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
    defaults). A cold single run once misreported a 1.3× win as 0.94×. Discard
    the first request when timing the server (it includes JIT). To time a
    position, set `state.positions` directly — generating to 65536 is 9 hours.
-8. **Accuracy hygiene too, and it is weaker than you think.**
-   `device_quality.py --prefill 128` scores 32 positions and is **not**
-   repeatable: two runs of the identical configuration gave 50.0 % and 53.1 %
-   top-1 (NLL 3.110 and 3.108). One run per setting cannot separate an effect
-   from noise, and a 10-point "cliff" was once built on exactly that. Prefer a
-   deterministic proxy where one exists -- prefill's own logits repeat to
-   0.0000 % (`moe_chunk_noise.py`) -- or a per-row invariant that needs no
-   reference at all (`moe_rows_check.py`); failing that, repeat the run and
-   quote NLL, which moves far less than top-1 on 32 samples.
+8. **A 128-row prefill is not a repeatable measurement. Decode is.**
+   `device_quality.py 48` has returned 83.0 % / NLL 0.682 in every run of this
+   session, across board resets. `device_quality.py 250 --prefill 128` has
+   returned 21.5 %, 25.2 % and 27.1 % top-1 (NLL 6.345, 5.823, 5.614) from the
+   identical binary and prompt -- *stable within a batch of invocations and
+   shifting between them*, with no code change and no reset in between. A
+   32-token prefill is deterministic, because 32 rows is one tile (invariant
+   13); it is the 128-row path that moves.
+
+   Consequences, and they are strict:
+
+   * Never compare a 128-row prefill number across turns, sessions or commits.
+     Several judgements in this file were originally made that way and have been
+     re-framed onto axes that hold still -- dispatch count, wall clock, and
+     exact-token equality.
+   * A/B a prefill change **back to back in one batch of invocations**, or not
+     at all.
+   * Prefer something deterministic: prefill's own logits within one process
+     (`moe_chunk_noise.py`), a per-row invariant needing no reference
+     (`moe_rows_check.py`), or token equality (`batch_equivalence_check.py`).
+   * The observed spread is 5.6 points of top-1 and 0.73 of NLL. Treat any
+     prefill difference smaller than that as unmeasured.
 9. **Instrumented profiles are inflated ~40 %** by per-section syncs; read the
    shares, not the totals.
 10. **V heads are tiled over K heads** -- v-head j reads k-head `j % n_k`, so
@@ -751,14 +764,19 @@ the whole chunk instead of `seq / moe_chunk` times.
 12293 -> 11681 dispatches and **1070.5 -> 925.1 ms** a chunk, 13.6 %, taking
 prompt intake to 7.2 ms/token.
 
-It is *not* bit-identical, which I expected it to be and it is worth saying why:
-batching the expert compute to 128 rows forces the single-K-block program config
-(the narrow one is the buggy one above a row tile), and that changes the
-accumulation order. The move is inside the bf16 band and does not point one way
--- over 107 scored positions top-1 goes 24.3 % -> **25.2 %** and NLL 5.648 ->
-5.823. With one row group it reduces exactly to the old path: prefill=32 is
-bit-identical at 71.9 % / 1.433, which is the check that says the split itself
-is faithful.
+It is *not* bit-identical, which I expected it to be: batching the expert
+compute to 128 rows forces the single-K-block program config (the narrow one is
+the buggy one above a row tile), and that changes the accumulation order.
+
+**The quality side of this comparison does not hold, and the decision does not
+rest on it.** The 24.3 % -> 25.2 % and NLL 5.648 -> 5.823 quoted here were
+measured in different batches of invocations, and a 128-row prefill is not
+repeatable across those -- the same binary spans 21.5-27.1 % top-1 (invariant
+8). Both numbers are inside that spread, so the change is *quality-unmeasured*,
+not quality-positive. What does hold is 612 fewer dispatches and 1070.5 -> 925.1
+ms, neither of which moves, and prefill=32 reducing exactly to the old path at
+71.9 % / 1.433, which is deterministic and is the check that the restructuring
+itself is faithful.
 
 **A worked example, measured and rejected.** The shared expert is dense and has
 no routing, so `moe_chunk` -- which exists to bound the routed MoE's
@@ -775,11 +793,14 @@ scored positions whole-chunk gave 20.6 % top-1 / NLL 6.389 against 24.3 % /
 re-attempted.
 
 **Re-measured after the routing/compute split**, because that moved the baseline
-and a stale rejection is worth as little as a stale acceptance: the hoist now
-buys 925.1 -> 887.6 ms (4 %) for NLL 5.823 -> **6.650**, top-1 unchanged at
-25.2 %. Same verdict, wider margin. It is the largest single call site left --
-`shared_expert` is 960 dispatches, 8.2 % of the chunk -- and it is not available
-at this price. The lesson generalises: on this path a dispatch saving that
+and a stale rejection is worth as little as a stale acceptance: the hoist buys
+925.1 -> 887.6 ms (4 %) for NLL 5.823 -> 6.650 with top-1 unchanged at 25.2 %.
+
+That NLL gap is at the edge of what a 128-row prefill can resolve across batches
+(spread 0.73, invariant 8), so read the rejection as *4 % of wall clock for a
+quality question this measurement cannot settle* rather than for a proven loss.
+The conservative call on a path this session spent its effort making correct is
+to leave the dispatches. Revisit it with a back-to-back A/B if 4 % ever matters. The lesson generalises: on this path a dispatch saving that
 changes any group size is buying speed with bf16 accuracy, and 7 % is not a good
 price. Look for savings that leave every group width alone.
 

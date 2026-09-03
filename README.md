@@ -226,12 +226,16 @@ text, not whether it matches decode token for token:
 
 | prefilled | scored | prefill | decode control |
 |---|---|---|---|
-| 128 | 107 | **25.2 %** top-1, NLL 5.82 | 22.6 %, NLL 6.00 |
 | 32 | 128 | **71.9 %** top-1, NLL 1.43 | 71.7 %, NLL 1.48 |
+| 128 | 107 | 21.5–27.1 % top-1, NLL 5.61–6.35 | 22.6 %, NLL 6.00 |
 
-Both rows score 100+ positions on purpose: at 32 positions this measurement is
-not repeatable (two runs of one configuration gave 50.0 % and 53.1 %), so a
-narrower sample cannot tell an effect from variance. See `docs/HANDOFF.md`
+The two rows do not deserve equal weight. **A 32-token prefill is
+deterministic** -- 32 rows is one tile -- and it beats its control repeatably. A
+128-token prefill is *not*: the identical binary and prompt has returned 21.5 %,
+25.2 % and 27.1 % top-1 in different runs, stable within a batch of invocations
+and shifting between them, while the decode control returns 22.6 % every time.
+So prefill at 128 sometimes beats its control and sometimes does not, and no
+single run of it should be quoted as a comparison. See `docs/HANDOFF.md`
 invariant 8.
 
 (Absolutely lower than the decode row above because the passage runs on into
