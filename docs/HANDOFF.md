@@ -73,18 +73,19 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 | single user, 1 slot, 262144 ctx, traced | **236 ms/step** (236.2 re-measured after the paged refactor); eager 486 ms |
 | same, QSA selection on (context in (2048, 65536]) | **297 ms/step** at 8192 (297.4 re-measured) |
 | same, eager, chunked prefill on | prompt at **7.2 ms/token** (was ~45) |
-| `step_n` verifying k tokens, traced | 255 ms at k=2, 276.6 at k=4, 323.9 at k=8 |
-| same, eager | 496 ms/step |
+| `step_n` verifying k tokens, **eager** | 490 ms at k=1, 797 at k=2, 991 at k=4, 1404 at k=8, 6651 at k=32 (`step_n_check.py`) |
+| same, traced | *historical*: 255 ms at k=2, 276.6 at k=4, 323.9 at k=8. Its harness no longer completes — see 5.5 |
 | batch 64, eager, fused experts | **107.6 tok/s** aggregate (`bench_batch.py`); 61.9 at batch 32, 15.3 at 8 |
 | server, 32 concurrent | **69.3 tok/s** sustained generation, 46.9 end to end at 128 tokens out (`bench_server.py`) |
 | prefill, 128 tokens, `moe_chunk=32` | **925 ms** (138.4 tok/s); 2033 ms at the old `moe_chunk=16` default, 1070 ms before routing and expert compute were split |
-| unit tests | `uv run pytest -q` → 197 passed, ~3 s, no hardware needed |
+| unit tests | `uv run pytest -q` → 202 passed, ~3 s, no hardware needed |
 | **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; float32 reference 80.9 %** |
-| chunked prefill, judged against a same-positions decode control | 128 tokens prefilled: **53.1 %** vs 51.6 % stepped; 32 prefilled, 128 scored: **71.9 %** vs 71.7 % |
+| chunked prefill, judged against a same-positions decode control | 128 prefilled, 107 scored: **25.2 %** top-1 / NLL 5.82 vs 22.6 % / 6.00 stepped; 32 prefilled, 128 scored: **71.9 %** / 1.43 vs 71.7 % / 1.48 |
+| a sequence's output vs the same sequence alone | identical to **batch 32**; differs above it, and that is arithmetic, not a bug (invariant 13) |
 
 Step time is flat in position (496 ms at pos 4, 501 ms at pos 65536) and flat
 in batch up to 64 rows. The *eager* path is dispatch-bound -- measured at 0.30 ms
-per device call, so 6143 calls is most of its 469 ms -- and the traced path is
+per device call, so 6143 calls is most of its 486 ms -- and the traced path is
 not: removing 97 calls moved eager by 29.6 ms and traced by nothing. Judge a
 change on the path it is meant to help (§5.7).
 
