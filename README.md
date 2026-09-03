@@ -9,7 +9,7 @@ n-gram embedding, and hyper-connections in place of every layer norm).
 | 1 | download the 4-bit checkpoint | **done** — UD-IQ4_XS, 93.68 GB, verified |
 | 2 | plain PyTorch CPU reference engine | **done** — token-exact vs llama.cpp |
 | 3 | ttnn engine + custom kernels + async core | **done** — 107.6 tok/s at batch 64; bit-exact vs single-sequence up to batch 32 |
-| 4 | OpenAI-compatible server | **done** — streaming, continuous batching, 69.3 tok/s at 32 concurrent |
+| 4 | OpenAI-compatible server | **done** — streaming, continuous batching, 70.3 tok/s at 32 concurrent |
 
 ## Measured performance
 
@@ -135,7 +135,8 @@ Throughput-oriented configurations (more slots, shorter context):
 
 | concurrency | sustained generation | end to end, 128 tokens out |
 |---|---|---|
-| 32 | **69.3 tok/s** | 46.9 tok/s |
+| 32 | **70.3 tok/s** | 46.9 tok/s |
+| 64 | 72.3 tok/s | — |
 
 Two numbers because they answer different questions. *Sustained generation* is
 tokens over the span in which generation is actually running, which is what a

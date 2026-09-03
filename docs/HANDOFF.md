@@ -76,7 +76,7 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 | `step_n` verifying k tokens, **eager** | 490 ms at k=1, 797 at k=2, 991 at k=4, 1404 at k=8, 6651 at k=32 (`step_n_check.py`) |
 | same, traced | *historical*: 255 ms at k=2, 276.6 at k=4, 323.9 at k=8. Its harness no longer completes — see 5.5 |
 | batch 64, eager, fused experts | **107.6 tok/s** aggregate (`bench_batch.py`); 61.9 at batch 32, 15.3 at 8 |
-| server, 32 concurrent | **69.3 tok/s** sustained generation, 46.9 end to end at 128 tokens out (`bench_server.py`) |
+| server, 32 concurrent | **70.3 tok/s** sustained generation (median of 3 rounds after a discarded warm one: 70.19 / 70.34 / 70.40); end to end depends on output length — 36.1 tok/s at 32 tokens out, 46.9 at 128 (`bench_server.py`) |
 | prefill, 128 tokens, `moe_chunk=32` | **925 ms** (138.4 tok/s); 2033 ms at the old `moe_chunk=16` default, 1070 ms before routing and expert compute were split |
 | unit tests | `uv run pytest -q` → 202 passed, ~3 s, no hardware needed |
 | **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; float32 reference 80.9 %** |

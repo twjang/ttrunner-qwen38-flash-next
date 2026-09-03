@@ -24,6 +24,11 @@ from twtest.tt.engine import TTEngine
 
 CONC = int(sys.argv[1]) if len(sys.argv) > 1 else 32
 MAX_TOKENS = int(sys.argv[2]) if len(sys.argv) > 2 else 32
+ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+# One round is not a measurement. `moe_chunk_sweep.py` published a 1.85x that was
+# 1.32x because it timed a single unwarmed pass; the first round here pays for
+# kernel compilation and trace capture, so it is discarded and the rest reported
+# as a median (invariant 7).
 GGUF = os.environ.get("TWTEST_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS"))
 CACHE = os.environ.get("TWTEST_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
 TOKENIZER = os.environ.get(
@@ -57,18 +62,27 @@ async def main():
             "covering the order of operations and what is verified before moving on.\n\nAnswer:"
             for i in range(CONC)
         ]
-        out: list = []
-        t0 = time.perf_counter()
-        await asyncio.gather(*(one(engine, p, out) for p in prompts))
-        total = time.perf_counter() - t0
-        tokens = sum(n for _, n in out)
-        firsts = [f for f, _ in out if f]
-        gen_span = time.perf_counter() - min(firsts) if firsts else total
-        print(f"RESULT concurrency {CONC}  max_tokens {MAX_TOKENS}", flush=True)
-        print(f"RESULT {tokens} tokens in {total:.2f}s wall -> "
-              f"{tokens / total:.2f} tok/s including prompt ingestion", flush=True)
-        print(f"RESULT generation-only span {gen_span:.2f}s -> "
-              f"{tokens / gen_span:.2f} tok/s", flush=True)
+        print(f"RESULT concurrency {CONC}  max_tokens {MAX_TOKENS}  "
+              f"{ROUNDS} rounds, first discarded", flush=True)
+        e2e, gen = [], []
+        for r in range(ROUNDS + 1):
+            out: list = []
+            t0 = time.perf_counter()
+            await asyncio.gather(*(one(engine, p, out) for p in prompts))
+            total = time.perf_counter() - t0
+            tokens = sum(n for _, n in out)
+            firsts = [f for f, _ in out if f]
+            span = time.perf_counter() - min(firsts) if firsts else total
+            tag = "warm" if r == 0 else f"round {r}"
+            print(f"RESULT   {tag}: {tokens} tokens, {tokens / total:.2f} tok/s end to "
+                  f"end, {tokens / span:.2f} tok/s generation-only", flush=True)
+            if r:
+                e2e.append(tokens / total)
+                gen.append(tokens / span)
+        e2e.sort()
+        gen.sort()
+        print(f"RESULT median {gen[len(gen) // 2]:.2f} tok/s sustained generation, "
+              f"{e2e[len(e2e) // 2]:.2f} tok/s end to end", flush=True)
     finally:
         await engine.close()
 
