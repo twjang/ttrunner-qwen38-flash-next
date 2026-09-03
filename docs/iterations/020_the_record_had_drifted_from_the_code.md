@@ -132,6 +132,32 @@ already done, and the implementation it suggested — a short Newton–Schulz
 iteration for the chunk inverse — is precisely the unstable form `017` had just
 replaced. Anyone following it would have re-implemented the bug.
 
+## Observation 7 — and one finding of my own that did not survive either
+
+The closing sweep did not reproduce a prefill number I had published hours
+earlier from what the git history says is identical code: 27.1 % where I had
+recorded 25.2 %, and 21.5 % on the six runs after that. I wrote that up as
+nondeterminism in the 128-row path, corrected the README and two judgements in
+5.7 around it, and added an invariant.
+
+Then I tested it directly, which is what I should have done first.
+`prefill_determinism_probe.py` prefills 128 rows in three separate processes, on
+a synthetic prompt and on the exact tokens `device_quality` scores, and returns
+**bit-identical** logits and next-eight-decode-steps every time -- cold or after
+prior device work. The path is deterministic. The three historical readings are
+unexplained, and calling them a property of the code was wrong.
+
+What survives is the procedural half, which cost nothing to keep: pair a prefill
+A/B in one batch of invocations rather than against a number from an earlier
+turn, and prefer decode as the regression gate, since it has returned
+83.0 % / NLL 0.682 in every run across every board reset. The two 5.7 judgements
+stay re-framed onto dispatch count and wall clock, which is where they should
+have rested regardless.
+
+Third retraction of an explanation in this session, after the trace-hang
+mechanism and the row-tile cause. All three were plausible, published, and
+disproved by an experiment that took one run.
+
 ## The lesson
 
 This project is unusually disciplined about recording evidence, and that created

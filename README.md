@@ -227,16 +227,17 @@ text, not whether it matches decode token for token:
 | prefilled | scored | prefill | decode control |
 |---|---|---|---|
 | 32 | 128 | **71.9 %** top-1, NLL 1.43 | 71.7 %, NLL 1.48 |
-| 128 | 107 | 21.5–27.1 % top-1, NLL 5.61–6.35 | 22.6 %, NLL 6.00 |
+| 128 | 107 | 21.5 % top-1, NLL 6.35 | 22.6 %, NLL 6.00 |
 
-The two rows do not deserve equal weight. **A 32-token prefill is
-deterministic** -- 32 rows is one tile -- and it beats its control repeatably. A
-128-token prefill is *not*: the identical binary and prompt has returned 21.5 %,
-25.2 % and 27.1 % top-1 in different runs, stable within a batch of invocations
-and shifting between them, while the decode control returns 22.6 % every time.
-So prefill at 128 sometimes beats its control and sometimes does not, and no
-single run of it should be quoted as a comparison. See `docs/HANDOFF.md`
-invariant 8.
+Both pairs measured back to back in one batch of runs, which matters: readings
+of the 128-row row taken at different points in one session spanned 21.5–27.1 %
+from what appears to be identical code, and that spread is unexplained. Direct
+testing finds the path deterministic — three processes return bit-identical
+logits and decode steps — so the rule is to pair an A/B rather than to distrust
+the path. `docs/HANDOFF.md` invariant 8.
+
+On these numbers a 32-row prefill leaves state slightly *better* than stepping
+the same tokens and a 128-row prefill slightly worse.
 
 (Absolutely lower than the decode row above because the passage runs on into
 dates and proper nouns; both paths fall together, which is the point of having a

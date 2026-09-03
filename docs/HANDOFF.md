@@ -80,7 +80,7 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 | prefill, 128 tokens, `moe_chunk=32` | **925 ms** (138.4 tok/s); 2033 ms at the old `moe_chunk=16` default, 1070 ms before routing and expert compute were split |
 | unit tests | `uv run pytest -q` → 202 passed, ~3 s, no hardware needed |
 | **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; float32 reference 80.9 %** |
-| chunked prefill, judged against a same-positions decode control | 32 prefilled, 128 scored: **71.9 %** / NLL 1.43 vs 71.7 % / 1.48 — deterministic, one row tile. 128 prefilled, 107 scored: **21.5–27.1 %** / 5.61–6.35 against a control of 22.6 % / 6.00 — *not* repeatable, see invariant 8 |
+| chunked prefill, judged against a same-positions decode control | measured back to back in one batch: 32 prefilled, 128 scored **71.9 %** / NLL 1.43 against 71.7 % / 1.48; 128 prefilled, 107 scored **21.5 %** / 6.345 against 22.6 % / 5.996. So a 32-row prefill is slightly ahead of stepping and a 128-row one slightly behind. Earlier readings of the 128 row spanned 21.5–27.1 % and are unexplained — invariant 8 |
 | a sequence's output vs the same sequence alone | identical to **batch 32**; differs above it, and that is arithmetic, not a bug (invariant 13) |
 
 Step time is flat in position (496 ms at pos 4, 501 ms at pos 65536) and flat
@@ -163,37 +163,34 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
    defaults). A cold single run once misreported a 1.3× win as 0.94×. Discard
    the first request when timing the server (it includes JIT). To time a
    position, set `state.positions` directly — generating to 65536 is 9 hours.
-8. **A 128-row prefill is not a repeatable measurement. Decode is.**
-   `device_quality.py 48` has returned 83.0 % / NLL 0.682 in every run of this
-   session, across board resets. `device_quality.py 250 --prefill 128` has
-   returned 21.5 %, 25.2 % and 27.1 % top-1 (NLL 6.345, 5.823, 5.614) from the
-   identical binary and prompt -- *stable within a batch of invocations and
-   shifting between them*, with no code change and no reset in between. A
-   32-token prefill is deterministic, because 32 rows is one tile (invariant
-   13); it is the 128-row path that moves.
+8. **Pair a prefill A/B in one batch of runs; do not compare across turns.**
+   `device_quality.py 250 --prefill 128` was recorded at 21.5 %, 25.2 % and
+   27.1 % top-1 (NLL 6.345, 5.823, 5.614) at different points in one session,
+   from what the git history says is the same model code and the same harness.
+   That looked like nondeterminism and was written up as such. Direct testing
+   says otherwise: `scripts/dev/prefill_determinism_probe.py` prefills 128 rows
+   in three separate processes, on both a synthetic prompt and the exact tokens
+   `device_quality` scores, and the final logits *and* the next eight decode
+   steps come back **bit-identical** every time -- warm or cold, whatever the
+   process did first. Six consecutive `device_quality` runs now agree to the
+   digit.
 
-   Consequences, and they are strict:
+   So the three historical readings are **unexplained**, not evidence of a
+   property. Something in the environment differed and has not been identified.
+   The practical rules stand either way, because they cost nothing:
 
-   * Never compare a 128-row prefill number across turns, sessions or commits.
-     Several judgements in this file were originally made that way and have been
-     re-framed onto axes that hold still -- dispatch count, wall clock, and
-     exact-token equality.
-   * A/B a prefill change **back to back in one batch of invocations**, or not
-     at all.
-   * Prefer something deterministic: prefill's own logits within one process
-     (`moe_chunk_noise.py`), a per-row invariant needing no reference
-     (`moe_rows_check.py`), or token equality (`batch_equivalence_check.py`).
-   * The observed spread is 5.6 points of top-1 and 0.73 of NLL. Treat any
-     prefill difference smaller than that as unmeasured.
+   * A/B a prefill change **back to back in one batch of invocations**. Every
+     cross-turn prefill comparison in this file's history is suspect, and two
+     judgements in 5.7 were re-framed onto axes that hold still -- dispatch
+     count, wall clock, exact-token equality.
+   * Prefer something deterministic where one exists: prefill's logits within
+     one process (`prefill_determinism_probe.py`, `moe_chunk_noise.py`), a
+     per-row invariant needing no reference (`moe_rows_check.py`), or token
+     equality (`batch_equivalence_check.py`).
+   * Decode is rock solid: `device_quality.py 48` has returned 83.0 % / NLL
+     0.682 in every run of this session, across board resets. Prefer it as the
+     regression gate.
 
-   **It has not been shown in the engine.** `TTEngine` with
-   `chunked_prefill=True` returns token-identical output across separate
-   processes -- all three turns of `prefix_reuse_check.py --chunked`, run twice.
-   Its prompts prefill in **64-row** chunks (`take = available - available % 32`
-   on a 73-token prompt), where the 128-row harness call is what moves. So the
-   concern is scoped to the measurement until someone shows otherwise; a prompt
-   long enough for a full 128-row chunk is the case to try, and if it varies the
-   engine needs a notice like the batch one.
 9. **Instrumented profiles are inflated ~40 %** by per-section syncs; read the
    shares, not the totals.
 10. **V heads are tiled over K heads** -- v-head j reads k-head `j % n_k`, so
