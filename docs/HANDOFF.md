@@ -557,7 +557,7 @@ prefix of the k tokens needs a state snapshot -- or a replay, which the numbers
 above make affordable.
 
 
-### 5.6 Speculation — the hang is diagnosed; it is a ttnn trace-replay bug
+### 5.6 Speculation — exact, and blocked only by the ttnn trace-replay bug
 
 Built end to end and opt-in via `TTEngine(speculate=k)`, where k is the tokens a
 verify *feeds* and it drafts `k - 1`. `docs/iterations/016` has the iteration and
@@ -686,12 +686,26 @@ lands 5.2's traced prefill, since that alternates a prefill replay with the
 decode step's. Until then the flag stays refused, because it takes the boards
 with it.
 
-**It is also not identical to token-by-token decoding**, despite greedy
-acceptance. The verifier batches k rows where the stepper runs one, bf16 rounding
-differs in the last bits, and argmax amplifies it -- measured divergence at
-tokens 29 and 39. Every emitted token is still the argmax of the verifier's own
-logits, so it is *a* greedy decode, not the same one. Do not repeat the "exact by
-construction" claim.
+**It *is* identical to token-by-token decoding**, which reverses what this item
+said for most of its life. `speculation_exactness_check.py` drives the round
+loop directly -- draft, snapshot, verify, accept, restore, replay -- against a
+plain sequential decode from the same start, in one process and all eager, so it
+needs neither the trace nor the fix above. The token streams are **identical**
+at k=2, 8 and 17 over 64 tokens, with 30, 53 and 64 drafted tokens accepted.
+17 is the widest width speculation uses.
+
+The old claim rested on "the verifier batches k rows where the stepper runs one,
+so bf16 rounding differs". That premise is false: `step_n` reproduces k
+sequential steps exactly at every k up to 32, and invariant 13 says why -- k <=
+32 rows and 1 row are both inside one 32-row tile. The 0.00 % that
+`step_n_check.py` reports was read as a rounded maximum hiding something; it was
+not.
+
+The divergence at tokens 29 and 39 that prompted the old claim is unexplained.
+It was measured through the engine across two processes, which was unavoidable
+then and is not a comparison this file trusts elsewhere. If the engine adds
+divergence of its own that is an engine bug, not a property of the scheme, and it
+cannot be tested while the engine hangs.
 
 **Instrumentation to start from.** `TTEngine.speculation_report()` breaks a round
 into snapshot / verify / restore / replay and reports the drafter's own cost; the

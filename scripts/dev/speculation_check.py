@@ -10,13 +10,11 @@ its tokens for comparison across runs.
 
     uv run python scripts/dev/speculation_check.py [k]            (default 8)
 
-Greedy acceptance does *not* make speculation exact here, though the argument
-that it must is standard and was believed for a cycle: the verifier batches k
-rows where the stepper runs one, bf16 rounding differs in the last bits, and
-argmax amplifies it -- measured divergence at tokens 29 and 39. Every emitted
-token is still the argmax of the verifier's own logits, so this is *a* greedy
-decode rather than the same one, and the token comparison below is a measure of
-how far it drifts, not a pass/fail.
+Greedy acceptance *does* make speculation exact here, which this file denied
+for a while. `speculation_exactness_check.py` drives the round loop directly
+against a plain sequential decode in one process and gets identical tokens at
+k=2, 8 and 17. So the token comparison below is a pass/fail after all -- and if
+it ever fails, that is an engine bug rather than a property of the scheme.
 
 Two prompts, because prompt-lookup drafting is a bet on repetition: one that
 quotes its context back (where it should pay) and one that does not (where it

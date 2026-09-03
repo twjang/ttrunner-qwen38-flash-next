@@ -62,17 +62,26 @@ def test_a_draft_never_overlaps_its_own_key() -> None:
     assert got == [5, 5]  # a real earlier occurrence, not the tail
 
 
-def test_the_engine_does_not_promise_identical_output() -> None:
-    """Greedy acceptance is exact only if the verifier and the stepper agree bit
-    for bit. `step_n` batches k rows where `step` runs one, bf16 rounding
-    differs, and argmax amplifies it -- measured divergence at token 29 and 39.
-    Every emitted token is still the argmax of the verifier's own logits."""
+def test_the_engine_records_that_speculation_is_exact() -> None:
+    """Greedy acceptance *does* make this exact, contrary to what was recorded.
+
+    `scripts/dev/speculation_exactness_check.py` drives the round loop -- draft,
+    snapshot, verify, accept, restore, replay -- against a plain sequential
+    decode from the same start, and the token streams are identical at k=2, 8
+    and 17 over 64 tokens. The old argument, that `step_n` must round
+    differently for computing row i in a k-row batch, has a false premise:
+    `step_n` reproduces k sequential steps exactly to k=32, because k <= 32 rows
+    and 1 row are both inside one row tile (handoff invariant 13).
+    """
     import inspect
 
     from twtest.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
-    assert "**Not** identical to decoding one token at a time" in src
+    assert "**Identical** to decoding one token at a time" in src, (
+        "the engine must record that the scheme is exact -- verified by "
+        "speculation_exactness_check.py at k=2, 8 and 17"
+    )
 
 
 def test_speculation_refuses_rather_than_wedging_the_device() -> None:

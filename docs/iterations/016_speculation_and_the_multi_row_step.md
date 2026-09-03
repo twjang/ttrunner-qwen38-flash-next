@@ -114,6 +114,26 @@ from k there.
 
 ## Observation 6 — greedy acceptance is not exact here
 
+> **Corrected in `020`.** The scheme *is* exact, and the mechanism argued below
+> is wrong. `scripts/dev/speculation_exactness_check.py` drives the round loop
+> directly -- draft, snapshot, verify, accept, restore, replay -- against a
+> plain sequential decode from the same start, in one process, and the token
+> streams are **identical** at k=2, 8 and 17 over 64 tokens, with 30, 53 and 64
+> drafted tokens accepted. 17 is the widest speculation uses.
+>
+> The reasoning fails at its premise: `step_n` does *not* round differently from
+> `step`. It reproduces k sequential steps exactly at every k up to 32
+> (`step_n_check.py`, tokens matching and positions right, not just a rounded
+> hidden-state maximum), and `020`'s row-tile finding says why -- k <= 32 rows
+> and 1 row both fit inside one 32-row tile, so they accumulate identically. The
+> guess that 0.00 % was hiding something turned out to be exactly backwards.
+>
+> What produced the divergence at tokens 29 and 39 is not known. It was measured
+> through the engine across two separate processes, which was necessary at the
+> time and is not a comparison this project trusts elsewhere. If the engine does
+> add divergence of its own, that is an engine bug rather than a property of
+> speculation -- and it cannot be tested while the engine hangs.
+
 The claim that greedy acceptance makes speculation identical to token-by-token
 decoding is standard, and it is wrong on this stack. Two separate single-engine
 runs, one speculating and one not, diverge at token **29** on the copy-heavy

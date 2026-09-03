@@ -307,21 +307,24 @@ class TTEngine(Engine):
         # earlier occurrence of the last few, verify them all in one `step_n`,
         # and keep the prefix that agrees.
         #
-        # **Not** identical to decoding one token at a time, despite greedy
-        # acceptance. Greedy acceptance is exact only if the verifier and the
-        # stepper agree bit for bit, and they do not: `step_n` computes row i's
-        # logits in a k-row batch where `step` computes them in a 1-row batch,
-        # and bf16 rounding differs in the last bits. `step_n_check.py` reports
-        # 0.00 % on the hidden state, but that is a rounded maximum, and argmax
-        # amplifies whatever is left -- measured divergence from the sequential
-        # stream at token 29 on one prompt and 39 on another.
+        # **Identical** to decoding one token at a time, which this comment
+        # denied for a while. `speculation_exactness_check.py` drives the round
+        # loop -- draft, snapshot, verify, accept, restore, replay -- against a
+        # plain sequential decode from the same start, in one process and all
+        # eager, and the token streams match at k=2, 8 and 17 over 64 tokens,
+        # with 30, 53 and 64 drafted tokens accepted. 17 is the widest width
+        # this engine uses.
         #
-        # Every emitted token is still the argmax of the verifier's own logits,
-        # so this is *a* greedy decode, just not the same one. On a model where
-        # two correct implementations already disagree on half their greedy
-        # tokens (see docs/iterations/014), that is a caveat rather than a
-        # defect -- but it is not what "exact" promises, so it is off by default
-        # and says so.
+        # The old claim argued that `step_n` must round differently because it
+        # computes row i in a k-row batch where `step` uses one row. That
+        # premise is false: `step_n` reproduces k sequential steps exactly at
+        # every k up to 32, and one row tile is why -- k <= 32 rows and 1 row
+        # are both inside it (handoff invariant 13). The 0.00 % that
+        # `step_n_check.py` reports was dismissed as a rounded maximum hiding
+        # something, and it was not.
+        #
+        # So exactness is not the reason this is off by default; the trace
+        # replay hang below is.
         #
         # Measured (scripts/dev/ngram_accept_rate.py, with the rollback and the
         # replay of the accepted prefix both paid for):
