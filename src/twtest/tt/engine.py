@@ -466,10 +466,10 @@ class TTEngine(Engine):
             # repeated" was. One chunk of the default width makes every buffer
             # exist.
             mark("warming the prefill chunk graph")
-            from .deltanet import CHUNK
+            from .model import PREFILL_CHUNK
 
             warm_state = self.model.new_state(batch=1)
-            self.model.prefill([0] * CHUNK, warm_state)
+            self.model.prefill([0] * PREFILL_CHUNK, warm_state)
             del warm_state
             mark("prefill graph warmed")
 

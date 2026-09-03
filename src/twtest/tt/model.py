@@ -31,7 +31,7 @@ import ttnn
 from ..reference.config import Qwen4ExpConfig
 from ..reference.weights import WeightStore
 from . import linear_attn, moe
-from .ops import HIFI4, gated_residual_mix, grouped_rms_norm, reinject, rms_norm
+from .ops import linear_rows, HIFI4, gated_residual_mix, grouped_rms_norm, reinject, rms_norm
 from .weights import TTWeights
 
 
@@ -53,6 +53,16 @@ DELTANET_CHUNK = 128
 # while 64 gets **33 of 64 rows wrong**, worst row 102.9 %. 32 is one tile.
 # See `TTModel.prefill` and handoff 5.8.
 _MAX_MOE_CHUNK = 32
+
+# Prefill chunk width. Wider is faster -- 512 tokens go 3476 -> 3135 ms, 10.9 % --
+# because the dense matmuls get wider, and it is not paid for in accuracy. Of the
+# ten linear shapes this path uses, five are bit-identical at 512 rows and 128,
+# and the other five all land *closer* to the exact float64 product at 512 than at
+# 128, five out of five, never further (`row_count_stability_check.py`). Wider
+# blocking means fewer partial-sum roundings. The DeltaNet op still sees its own
+# 128-wide chunks -- `_linear_attention_chunk` builds n_chunks from `seq` -- so
+# this also batches its scan for free.
+PREFILL_CHUNK = 512
 
 
 @dataclass
@@ -537,8 +547,8 @@ class TTModel:
         # `mixed` is [1, 1, B, hidden]; B sequences decode together.
         batch = mixed.shape[-2]
 
-        qkv = ttnn.linear(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
-        z = ttnn.linear(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
+        qkv = linear_rows(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
+        z = linear_rows(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
 
         # [1,1,B,conv_dim] -> [1,B,conv_dim,1] so each sequence owns a window
         qkv_col = ttnn.transpose(ttnn.permute(qkv, (0, 2, 1, 3)), -2, -1)
@@ -567,8 +577,8 @@ class TTModel:
         q = ttnn.multiply(self._l2norm(q), hd**-0.5)
         k = self._l2norm(k)
 
-        a = ttnn.linear(mixed, self.w.blk(layer, "ssm_alpha.weight"), compute_kernel_config=HIFI4)
-        b = ttnn.linear(mixed, self.w.blk(layer, "ssm_beta.weight"), compute_kernel_config=HIFI4)
+        a = linear_rows(mixed, self.w.blk(layer, "ssm_alpha.weight"), compute_kernel_config=HIFI4)
+        b = linear_rows(mixed, self.w.blk(layer, "ssm_beta.weight"), compute_kernel_config=HIFI4)
         dt = self.w.blk(layer, "ssm_dt.bias")
         a_decay = self.w.blk(layer, "ssm_a")
         # g = A * softplus(a + dt_bias); A is stored already negated (= -exp(A_log))
@@ -601,7 +611,7 @@ class TTModel:
         gated = ttnn.reshape(gated, (1, 1, batch, self.value_dim_local))
         # ssm_out is row-sharded on its contraction dim, so each device produces a
         # partial sum -- this is the collective that head-sharding costs.
-        out = ttnn.linear(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
+        out = linear_rows(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
         return self.all_reduce(out)
 
     # -- full attention (QSA), one token -------------------------------------
@@ -956,10 +966,10 @@ class TTModel:
         n_v, hd = self.n_v_local, cfg.linear_head_dim
         kd, vd = self.key_dim_local, self.value_dim_local
 
-        qkv = ttnn.linear(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
-        z = ttnn.linear(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
-        a = ttnn.linear(mixed, self.w.blk(layer, "ssm_alpha.weight"), compute_kernel_config=HIFI4)
-        b = ttnn.linear(mixed, self.w.blk(layer, "ssm_beta.weight"), compute_kernel_config=HIFI4)
+        qkv = linear_rows(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
+        z = linear_rows(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
+        a = linear_rows(mixed, self.w.blk(layer, "ssm_alpha.weight"), compute_kernel_config=HIFI4)
+        b = linear_rows(mixed, self.w.blk(layer, "ssm_beta.weight"), compute_kernel_config=HIFI4)
         g = ttnn.multiply(
             self.w.blk(layer, "ssm_a"),
             ttnn.softplus(ttnn.add(a, self.w.blk(layer, "ssm_dt.bias"))),
@@ -1738,16 +1748,16 @@ class TTModel:
         # and, worse, silently prepares only device 0's heads for all four.
         n_v, hd = self.n_v_local, cfg.linear_head_dim
 
-        qkv = ttnn.linear(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
-        z = ttnn.linear(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
+        qkv = linear_rows(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
+        z = linear_rows(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
         conv_out, st.conv, st.conv_step = self._causal_conv_chunk(
             ttnn.transpose(qkv, -2, -1), self.w.blk(layer, "ssm_conv1d.weight"),
             st.conv, self.conv_dim_local, seq, layer, st.conv_step,
         )
         qkv = ttnn.transpose(conv_out, -2, -1)              # [1,1,seq,conv_dim_local]
 
-        a = ttnn.linear(mixed, self.w.blk(layer, "ssm_alpha.weight"), compute_kernel_config=HIFI4)
-        b = ttnn.linear(mixed, self.w.blk(layer, "ssm_beta.weight"), compute_kernel_config=HIFI4)
+        a = linear_rows(mixed, self.w.blk(layer, "ssm_alpha.weight"), compute_kernel_config=HIFI4)
+        b = linear_rows(mixed, self.w.blk(layer, "ssm_beta.weight"), compute_kernel_config=HIFI4)
         g = ttnn.multiply(
             self.w.blk(layer, "ssm_a"),
             ttnn.softplus(ttnn.add(a, self.w.blk(layer, "ssm_dt.bias"))),
@@ -1796,7 +1806,10 @@ class TTModel:
 
         cfg = self.cfg
         n_v, hd = self.n_v_local, cfg.linear_head_dim
-        n_chunks = 1
+        # One call may cover several of the op's 128-wide chunks: `prefill`'s
+        # chunk is 512 by default, while `_linear_attention_multi` hands this one
+        # chunk at a time. Derive it from `seq` rather than assuming either.
+        n_chunks = -(-seq // CHUNK)
         # [BH, NC, C, Dv] -> [1, 1, seq*n_v, hd], on device and per device.
         out = ttnn.slice(
             ttnn.reshape(out, (n_v, 1, n_chunks * CHUNK, hd)), (0, 0, 0, 0), (n_v, 1, seq, hd)
@@ -1816,7 +1829,7 @@ class TTModel:
         # step: every device holds a partial sum until the all-reduce. Without it
         # each device saw only its own quarter of the DeltaNet output while the
         # recurrent state (which does not pass through ssm_out) stayed correct.
-        out = ttnn.linear(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
+        out = linear_rows(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
         return self.all_reduce(out)
     def _deltanet_scan(self, fronts, st: "LayerState"):
         """`prepare_device` + the fused op over one or more prepared chunks.
@@ -1884,12 +1897,16 @@ class TTModel:
             prepared.append(front)
             zs.append(z)
         out = self._deltanet_scan(prepared, st)
-        return [
-            self._deltanet_back(
-                ttnn.slice(out, (0, i, 0, 0), (n_v, i + 1, CHUNK, hd)), zs[i], layer, seq
-            )
-            for i, seq in enumerate(seqs)
-        ]
+        # Each entry may itself span several of the op's 128-wide chunks -- the
+        # prefill chunk is 512 by default -- so walk the chunk axis by each
+        # entry's own count rather than assuming one apiece.
+        outs, off = [], 0
+        for i, seq in enumerate(seqs):
+            nc = -(-seq // CHUNK)
+            piece = ttnn.slice(out, (0, off, 0, 0), (n_v, off + nc, CHUNK, hd))
+            outs.append(self._deltanet_back(piece, zs[i], layer, seq))
+            off += nc
+        return outs
 
 
     def _attention_chunk(
@@ -1908,18 +1925,18 @@ class TTModel:
         cfg = self.cfg
         hd, n_q, n_kv = cfg.head_dim, cfg.num_attention_heads, cfg.num_kv_heads
 
-        qg = ttnn.linear(mixed, self.w.blk(layer, "attn_q.weight"), compute_kernel_config=HIFI4)
+        qg = linear_rows(mixed, self.w.blk(layer, "attn_q.weight"), compute_kernel_config=HIFI4)
         qg = ttnn.reshape(qg, (1, seq, n_q, hd * 2))
         q = self._slice_last(qg, 0, hd)
         gate = self._slice_last(qg, hd, hd * 2)
         q = rms_norm(q, self.w.blk(layer, "attn_q_norm.weight"), cfg.rms_norm_eps)
 
         k = ttnn.reshape(
-            ttnn.linear(mixed, self.w.blk(layer, "attn_k.weight"), compute_kernel_config=HIFI4),
+            linear_rows(mixed, self.w.blk(layer, "attn_k.weight"), compute_kernel_config=HIFI4),
             (1, seq, n_kv, hd),
         )
         v = ttnn.reshape(
-            ttnn.linear(mixed, self.w.blk(layer, "attn_v.weight"), compute_kernel_config=HIFI4),
+            linear_rows(mixed, self.w.blk(layer, "attn_v.weight"), compute_kernel_config=HIFI4),
             (1, seq, n_kv, hd),
         )
         k = rms_norm(k, self.w.blk(layer, "attn_k_norm.weight"), cfg.rms_norm_eps)
@@ -1987,7 +2004,7 @@ class TTModel:
         out = ttnn.reshape(ttnn.permute(out, (0, 2, 1, 3)), (1, 1, seq, n_q * hd))
         gate = ttnn.reshape(gate, (1, 1, seq, n_q * hd))
         out = ttnn.multiply(out, ttnn.sigmoid(gate))
-        return ttnn.linear(out, self.w.blk(layer, "attn_output.weight"), compute_kernel_config=HIFI4)
+        return linear_rows(out, self.w.blk(layer, "attn_output.weight"), compute_kernel_config=HIFI4)
 
     def _prefill_ffn_half(self, hidden, layer: int, seq: int, moe_chunk: int):
         """The FFN half of one prefill chunk: mix, route, run experts, reinject.
@@ -2082,8 +2099,8 @@ class TTModel:
         return hidden
 
 
-    def prefill(self, token_ids: list[int], state: TTState, chunk: int = 128,
-                moe_chunk: int = 32, deltanet_batch: int = 4):
+    def prefill(self, token_ids: list[int], state: TTState, chunk: int = PREFILL_CHUNK,
+                moe_chunk: int = 32, deltanet_batch: int = 1):
         """Consume a prompt in chunks; returns the final hidden state for the last token.
 
         **Not verified yet -- do not wire this into the engine.** It runs, and it
@@ -2178,19 +2195,17 @@ class TTModel:
         # It must also be a whole number of tiles: `fill_cache` asserts
         # `update_idx % TILE_HEIGHT == 0`, and the attention chunk writes the K/V
         # cache at the chunk's absolute start.
-        # TWTEST_WIDE_PREFILL_CHUNK=1 lifts the CHUNK ceiling for measurement.
-        # The stated reason for it -- "a chunk larger than CHUNK would need the
-        # op's inter-chunk scan, which this path does not build here" -- is stale:
-        # `_linear_attention_chunk` computes `n_chunks` from `seq`, lays the heads
-        # out as [n_v, NC, CHUNK, width], and `gated_delta_attn_seq` carries the
-        # scan itself through initial_state/final_state. What a wider chunk really
-        # changes is the row count every dense linear sees, and that is not free:
-        # see `row_count_stability_check.py`.
-        ceiling = CHUNK * 64 if os.environ.get("TWTEST_WIDE_PREFILL_CHUNK") else CHUNK
-        if not 0 < chunk <= ceiling or chunk % ttnn.TILE_SIZE:
+        # The chunk used to be capped at CHUNK (128) because "a chunk larger than
+        # CHUNK would need the op's inter-chunk scan, which this path does not
+        # build here". That was stale: `_linear_attention_chunk` computes
+        # `n_chunks` from `seq`, lays the heads out as [n_v, NC, CHUNK, width],
+        # and `gated_delta_attn_seq` carries the scan through
+        # initial_state/final_state. What a wider chunk really changes is the row
+        # count the dense linears see, and that was measured before it was
+        # allowed: see `PREFILL_CHUNK`.
+        if chunk <= 0 or chunk % ttnn.TILE_SIZE:
             raise ValueError(
-                f"chunk must be a multiple of {ttnn.TILE_SIZE} in "
-                f"{ttnn.TILE_SIZE}..{CHUNK} (the op's chunk width), got {chunk}"
+                f"chunk must be a positive multiple of {ttnn.TILE_SIZE}, got {chunk}"
             )
         if not 0 < moe_chunk <= _MAX_MOE_CHUNK:
             raise ValueError(
@@ -2318,10 +2333,10 @@ class TTModel:
         emb = self._input(f"chunk{seq}_ngram", self.ngram_embed(per_token), ttnn.bfloat16)
 
         key = grouped_rms_norm(
-            ttnn.linear(emb, self.w.blk(layer, "ple_key.weight"), compute_kernel_config=HIFI4),
+            linear_rows(emb, self.w.blk(layer, "ple_key.weight"), compute_kernel_config=HIFI4),
             self.w.blk(layer, "ple_norm_key.weight"), cfg.rms_norm_eps, cfg.hidden_size, cfg.hc_count,
         )
-        value = ttnn.linear(emb, self.w.blk(layer, "ple_value.weight"), compute_kernel_config=HIFI4)
+        value = linear_rows(emb, self.w.blk(layer, "ple_value.weight"), compute_kernel_config=HIFI4)
         query = grouped_rms_norm(
             hidden, self.w.blk(layer, "ple_norm_query.weight"), cfg.rms_norm_eps,
             cfg.hidden_size, cfg.hc_count,

@@ -71,6 +71,38 @@ def swiglu(gate: ttnn.Tensor, up: ttnn.Tensor) -> ttnn.Tensor:
     return ttnn.multiply(ttnn.silu(gate), up)
 
 
+ROW_GROUP = 128
+
+
+def linear_rows(x, w, max_rows: int = ROW_GROUP, **kw):
+    """`ttnn.linear`, but never on more than `max_rows` rows at a time.
+
+    A row's result is not always independent of how many rows travel with it:
+    the op picks its blocking from the shape, and five of the ten dense shapes
+    this model uses change above 128 rows (`row_count_stability_check.py`). The
+    change is small and, on every shape measured, slightly *closer* to the exact
+    float64 product -- but it is a change, and the prefill chunk is 512 wide, so
+    without this a wider chunk would silently rewrite every prefill's arithmetic.
+
+    Grouping at 128 keeps each row in exactly the company it kept when the chunk
+    was 128, which is what makes a wide chunk bit-identical to a narrow one. The
+    slices and the concat cost a few dispatches; a chunk is 512 rows, so it is
+    four groups, not many.
+
+    Below the threshold this is `ttnn.linear` with one extra Python comparison.
+    """
+    m = x.shape[-2]
+    if m <= max_rows:
+        return ttnn.linear(x, w, **kw)
+    shape = list(x.shape)
+    outs = []
+    for lo in range(0, m, max_rows):
+        hi = min(lo + max_rows, m)
+        part = ttnn.slice(x, (0, 0, lo, 0), (shape[0], shape[1], hi, shape[3]))
+        outs.append(ttnn.linear(part, w, **kw))
+    return ttnn.concat(outs, dim=-2)
+
+
 def gated_residual_mix(
     hyper: ttnn.Tensor,
     norm_w: ttnn.Tensor,
@@ -90,8 +122,8 @@ def gated_residual_mix(
 
     # down_w and inject_w carry the 1/hc_count factor already (folded at
     # conversion; exact, since 1/4 only shifts the block-float exponent)
-    mix = ttnn.silu(ttnn.linear(normed, down_w, compute_kernel_config=HIFI4))
-    mix = ttnn.sigmoid(ttnn.linear(mix, up_w, compute_kernel_config=HIFI4))
+    mix = ttnn.silu(linear_rows(normed, down_w, compute_kernel_config=HIFI4))
+    mix = ttnn.sigmoid(linear_rows(mix, up_w, compute_kernel_config=HIFI4))
     gated = ttnn.multiply(mix, normed)
 
     # Mean over the hc_count streams. The flattened layout is stream-major, so a
@@ -116,7 +148,7 @@ def gated_residual_mix(
 
     inject = None
     if inject_w is not None:
-        inject = ttnn.linear(normed, inject_w, compute_kernel_config=HIFI4)
+        inject = linear_rows(normed, inject_w, compute_kernel_config=HIFI4)
         inject = ttnn.multiply(ttnn.sigmoid(inject), 2.0)
         # Hand it back channel-major, [.., hc, M, 1], so `reinject` can broadcast
         # against the branch without materialising anything. The permute is on a

@@ -31,9 +31,12 @@ torch.manual_seed(0)
 prompt = [(1000 + 7 * i) % 30000 for i in range(TOKENS)]
 
 
-def run(batch):
+def run(batch, chunk=None):
     st = m.new_state(batch=1)
-    h = m.prefill(prompt, st, deltanet_batch=batch)
+    kw = {"deltanet_batch": batch}
+    if chunk:
+        kw["chunk"] = chunk
+    h = m.prefill(prompt, st, **kw)
     logits = m.logits(h)[0].float().clone()
     toks = []
     for _ in range(8):
@@ -68,5 +71,18 @@ for b in BATCHES:
     med = statistics.median(ts)
     print(f"RESULT batch={b}: prefill {TOKENS} tokens median {med:7.1f} ms  "
           f"min {ts[0]:7.1f}   {med / TOKENS:.2f} ms/token", flush=True)
+
+# And the other axis: chunk width. This one is *not* bit-identical -- five of the
+# ten dense linear shapes change blocking above 128 rows -- so the check is that
+# the difference is the size of bf16 rounding rather than a bug, and that the
+# continuation still tracks.
+lg128, toks128, _ = run(1, chunk=128)
+lg512, toks512, _ = run(1, chunk=512)
+d = (lg512 - lg128).abs()
+agree = sum(int(a == b) for a, b in zip(toks128, toks512))
+print(f"RESULT chunk 128 vs 512: logit max diff {d.max().item():.3e}  "
+      f"mean {d.mean().item():.3e}  first-8 tokens agree {agree}/8", flush=True)
+print(f"RESULT   chunk128 {toks128}", flush=True)
+print(f"RESULT   chunk512 {toks512}", flush=True)
 
 ttnn.close_mesh_device(mesh)

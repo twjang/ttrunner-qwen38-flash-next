@@ -952,15 +952,27 @@ appears. Its masks are also already cached, and `block_diag_inverse_device` is 2
 ops for five algebraic levels (`017` picked that recursion over a cheaper
 unstable one). There is no dispatch fix in it.
 
-Which relocates the 10.9 % that a *wider* chunk buys (512 tokens, 3476 ->
-3135 ms): it is not dispatch amortisation, it is the dense matmuls getting wider.
-That changes their blocking and so their rounding -- a row's `ttnn.linear` result
-is identical at m = 32, 64 and 128, changes once at 256, then holds through 512
-(`row_count_stability_check.py`) -- and against an exact float64 product the two
-blockings are a wash, max 4.2164e-03 against 4.3247e-03 and mean 3.0179e-04
-against 3.0160e-04. So the 10.9 % is available behind
-`TWTEST_WIDE_PREFILL_CHUNK=1` and is not taken by default: it is speed for a
-rounding change that is not an improvement.
+Which relocates the 10.9 % that a *wider* chunk buys: it is not dispatch
+amortisation, it is the dense matmuls getting wider, and that changes their
+blocking and so their rounding. Measured across the ten dense shapes this path
+uses (`row_count_stability_check.py`), five are bit-identical at 512 rows and
+128, and the other five all land slightly *closer* to the exact float64 product
+at 512 -- five of five, none worse. So it is not an accuracy loss. It is still a
+change, and it cannot be validated end to end because the regime it applies to
+(prompts over 128 tokens) is the one section 4b says is broken.
+
+**So the chunk is wide and the linears are not.** `PREFILL_CHUNK = 512`, and every
+dense linear on the prefill path goes through `ops.linear_rows`, which never
+hands the op more than 128 rows. Each row keeps exactly the company it kept when
+the chunk was 128, so the arithmetic is untouched, while everything width-neutral
+-- the DeltaNet scan (NC=4 in one call), the expert FFN (per-token exact), PLE,
+the embedding, the elementwise work -- amortises over four times the tokens.
+
+    512 tokens: 3559.9 -> 3276.5 ms, 8.0 %, and bit-identical:
+    logit max diff 0.000e+00 against chunk=128, first 8 continuation tokens 8/8.
+
+`deltanet_batch` stays at 1 because a 512-wide chunk already gives the scan its
+four chunks; grouping further measured no gain.
 
 `--by-caller` attributes each call to the `twtest` line that issued it, which is
 what says where to cut; "multiply, 1993" does not. The distribution is flat --
