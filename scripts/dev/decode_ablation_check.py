@@ -11,7 +11,7 @@ component" is worth knowing on both, and only op counts were known for prefill.
            expertffn combine permute routing topk<N>
            qsa deltanet sdpa kvupdate gateup downproj
            prefill-only seams: applyexperts chunkattn chunkqsa chunkdeltanet
-                               routechunk gdas prepare
+                               routechunk gdas prepare grm reinjectp sharedp
 
 Note that the decode seams do nothing to a prefill: it takes the route/
 apply_experts split and `_attention_chunk`, not `moe_block` and
@@ -161,6 +161,33 @@ elif PART == "routechunk":
         return _rc[key]
 
     moe.route = _stub_route
+elif PART in ("grm", "reinjectp", "sharedp"):
+    # Seams that are shared by both paths, stubbed the shape-learning way so the
+    # first call per shape pays and nothing allocates in the timed region. These
+    # cover the two thirds of a prefill chunk that the component ablations above
+    # do not account for.
+    _seen = {}
+
+    def _stub(real):
+        def wrapper(*a, **kw):
+            key = tuple(tuple(t.shape) for t in a if hasattr(t, "shape"))
+            if key not in _seen:
+                out = real(*a, **kw)
+                items = out if isinstance(out, tuple) else (out,)
+                z = tuple(ttnn.zeros_like(t) if hasattr(t, "shape") else t for t in items)
+                _seen[key] = z if isinstance(out, tuple) else z[0]
+            return _seen[key]
+        return wrapper
+
+    import twtest.tt.ops as ops_mod
+    if PART == "grm":
+        ops_mod.gated_residual_mix = _stub(ops_mod.gated_residual_mix)
+        model_mod.gated_residual_mix = ops_mod.gated_residual_mix
+    elif PART == "reinjectp":
+        ops_mod.reinject = _stub(ops_mod.reinject)
+        model_mod.reinject = ops_mod.reinject
+    else:
+        moe.shared_expert = _stub(moe.shared_expert)
 elif PART in ("gdas", "prepare"):
     # Split the DeltaNet chunk into the fused ttnn op and the preparation this
     # project wrote. The stub learns the real output shapes from one call and

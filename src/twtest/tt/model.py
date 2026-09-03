@@ -1719,9 +1719,7 @@ class TTModel:
         # buffers where a captured trace expects them.
         return ttnn.silu(acc), self._ring_from_oldest_first(cols, new_step, into=state), new_step
 
-    def _linear_attention_chunk(
-        self, mixed: ttnn.Tensor, layer: int, st: LayerState, seq: int
-    ) -> ttnn.Tensor:
+    def _deltanet_front(self, mixed: ttnn.Tensor, layer: int, st: LayerState, seq: int):
         """Gated DeltaNet over a whole chunk via `gated_delta_attn_seq`.
 
         The op's eight inputs are prepared on device by `prepare_device`, so a
@@ -1785,28 +1783,20 @@ class TTModel:
             heads(qkv, 2 * kd, 2 * kd + self.value_dim_local),
         )
         hg, hb = heads(g, 0, n_v), heads(ttnn.sigmoid(b), 0, n_v)
-        dev = prepare_device(hq, hk, hv, hg, hb, mesh=self.mesh)
-        initial = None
-        if st.recurrent is not None:
-            initial = ttnn.reshape(st.recurrent, (n_v, hd, hd))
-        # HiFi4 with fp32 accumulation, for consistency with every other matmul
-        # in the model. Measured: it changes nothing here, bit for bit -- the
-        # op's inputs are already float32 and it does not appear to drop
-        # precision in the places this config controls. The intra-chunk error
-        # (0.36 % at position 0 of a 128-token chunk, 60 % by position 127,
-        # against the reference's own chunked delta rule) is not this.
-        out, final_state = ttnn.transformer.gated_delta_attn_seq(
-            dev["L_unit"], dev["v_beta_sc"], dev["k_bd_sc"], dev["intra_attn"],
-            dev["q_decay"], dev["k_decay_t"], dev["dl_exp"], dev["L_inv"],
-            initial_state=initial, compute_kernel_config=HIFI4,
-        )
-        if st.recurrent is None:
-            st.recurrent = ttnn.zeros(
-                (n_v, 1, hd, hd), dtype=self.state_dtype, layout=ttnn.TILE_LAYOUT,
-                device=self.mesh,
-            )
-        ttnn.copy(ttnn.reshape(final_state, (n_v, 1, hd, hd)), st.recurrent)
+        return (hq, hk, hv, hg, hb), z
 
+    def _deltanet_back(self, out, z, layer: int, seq: int) -> ttnn.Tensor:
+        """The per-chunk tail: reshape, norm, gate, project, all-reduce.
+
+        Runs on exactly the rows the chunk would have seen on its own, which is
+        what keeps `_linear_attention_multi` bit-identical to calling
+        `_linear_attention_chunk` per chunk.
+        """
+        from .deltanet import CHUNK
+
+        cfg = self.cfg
+        n_v, hd = self.n_v_local, cfg.linear_head_dim
+        n_chunks = 1
         # [BH, NC, C, Dv] -> [1, 1, seq*n_v, hd], on device and per device.
         out = ttnn.slice(
             ttnn.reshape(out, (n_v, 1, n_chunks * CHUNK, hd)), (0, 0, 0, 0), (n_v, 1, seq, hd)
@@ -1828,6 +1818,79 @@ class TTModel:
         # recurrent state (which does not pass through ssm_out) stayed correct.
         out = ttnn.linear(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
         return self.all_reduce(out)
+    def _deltanet_scan(self, fronts, st: "LayerState"):
+        """`prepare_device` + the fused op over one or more prepared chunks.
+
+        The chunk axis is NC, which both take vectorised, so N chunks cost the
+        same ~59 dispatches as one. That is the whole point of
+        `_linear_attention_multi`, and it is safe: prepared chunk 0 comes out
+        bit-identical whether NC is 1 or 4 -- all eight tensors, max diff
+        0.000e+00 (`prepare_nc_invariance_check.py`).
+        """
+        from .deltanet import prepare_device
+
+        cfg = self.cfg
+        n_v, hd = self.n_v_local, cfg.linear_head_dim
+        if len(fronts) == 1:
+            hq, hk, hv, hg, hb = fronts[0]
+        else:
+            hq, hk, hv, hg, hb = (
+                ttnn.concat([f[i] for f in fronts], dim=1) for i in range(5)
+            )
+        dev = prepare_device(hq, hk, hv, hg, hb, mesh=self.mesh)
+        initial = None
+        if st.recurrent is not None:
+            initial = ttnn.reshape(st.recurrent, (n_v, hd, hd))
+        out, final_state = ttnn.transformer.gated_delta_attn_seq(
+            dev["L_unit"], dev["v_beta_sc"], dev["k_bd_sc"], dev["intra_attn"],
+            dev["q_decay"], dev["k_decay_t"], dev["dl_exp"], dev["L_inv"],
+            initial_state=initial, compute_kernel_config=HIFI4,
+        )
+        if st.recurrent is None:
+            st.recurrent = ttnn.zeros(
+                (n_v, 1, hd, hd), dtype=self.state_dtype, layout=ttnn.TILE_LAYOUT,
+                device=self.mesh,
+            )
+        ttnn.copy(ttnn.reshape(final_state, (n_v, 1, hd, hd)), st.recurrent)
+        return out
+
+    def _linear_attention_chunk(
+        self, mixed: ttnn.Tensor, layer: int, st: "LayerState", seq: int
+    ) -> ttnn.Tensor:
+        """Gated DeltaNet over one chunk: front, scan, back."""
+        front, z = self._deltanet_front(mixed, layer, st, seq)
+        return self._deltanet_back(self._deltanet_scan([front], st), z, layer, seq)
+
+    def _linear_attention_multi(self, mixed_list, layer: int, st: "LayerState", seqs):
+        """The same over several chunks, with one scan instead of several.
+
+        Everything that depends on the row count -- the q/k/v/gate projections,
+        the causal convolution, the output norm and projection -- still runs per
+        chunk on exactly the rows it would have seen alone, so this is
+        bit-identical to calling `_linear_attention_chunk` once per chunk. Only
+        `prepare_device` and the fused op are batched, and they take the chunk
+        axis as a batch dimension.
+
+        Worth doing because `prepare_device` is 158.9 ms of a 922 ms prefill
+        chunk -- the largest single item -- and issues ~59 dispatches whatever
+        NC is.
+        """
+        from .deltanet import CHUNK
+
+        n_v, hd = self.n_v_local, self.cfg.linear_head_dim
+        prepared, zs = [], []
+        for mixed, seq in zip(mixed_list, seqs):
+            front, z = self._deltanet_front(mixed, layer, st, seq)
+            prepared.append(front)
+            zs.append(z)
+        out = self._deltanet_scan(prepared, st)
+        return [
+            self._deltanet_back(
+                ttnn.slice(out, (0, i, 0, 0), (n_v, i + 1, CHUNK, hd)), zs[i], layer, seq
+            )
+            for i, seq in enumerate(seqs)
+        ]
+
 
     def _attention_chunk(
         self, mixed: ttnn.Tensor, layer: int, st: LayerState, start: int, seq: int
@@ -1926,7 +1989,101 @@ class TTModel:
         out = ttnn.multiply(out, ttnn.sigmoid(gate))
         return ttnn.linear(out, self.w.blk(layer, "attn_output.weight"), compute_kernel_config=HIFI4)
 
-    def prefill(self, token_ids: list[int], state: TTState, chunk: int = 128, moe_chunk: int = 32):
+    def _prefill_ffn_half(self, hidden, layer: int, seq: int, moe_chunk: int):
+        """The FFN half of one prefill chunk: mix, route, run experts, reinject.
+
+        Split out of `prefill`'s loop so the single-chunk and the grouped path
+        share one body instead of two that can drift apart. It sees exactly the
+        rows of one chunk either way, which is what keeps the grouped path
+        bit-identical.
+        """
+        cfg = self.cfg
+        mixed, inject = gated_residual_mix(
+            hidden, self.w.blk(layer, "hc_ffn_norm.weight"),
+            self.w.blk(layer, "hc_ffn_down.weight"), self.w.blk(layer, "hc_ffn_up.weight"),
+            self.w.blk(layer, "hc_ffn_inject.weight"),
+            cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
+        )
+        pieces = []
+        # Same weight selection as decode. Naming the split halves here
+        # while the model is fused loads them lazily *on top of* the
+        # fused tensor -- another ~11 GB per device, which is an
+        # out-of-memory at the first MoE layer, not a slow path.
+        if self.fuse_expert_gate_up:
+            gate_w, up_w = self.w.fused_gate_up(layer), None
+        else:
+            gate_w = self.w.blk(layer, "ffn_gate_exps.weight")
+            up_w = self.w.blk(layer, "ffn_up_exps.weight")
+        # Route in `moe_chunk`-sized groups, compute the experts over the
+        # whole chunk. The two halves want different group sizes and only
+        # one of them is fussy: routing at a wider group changes the
+        # answer (bf16 moves the router's probabilities ~0.5 %, which
+        # reorders experts across the k-th boundary -- 5.8), while the
+        # expert FFN is exactly per-token at any width now that
+        # `sparse_program_config` gives it a single K block. Splitting
+        # them keeps this bit-identical to routing *and* computing at
+        # `moe_chunk`, for one `expert_ffn` dispatch set instead of
+        # `seq / moe_chunk` of them.
+        routes, keeps = [], []
+        for sub in range(0, seq, moe_chunk):
+            width = min(moe_chunk, seq - sub)
+            part = ttnn.slice(mixed, (0, 0, sub, 0), (1, 1, sub + width, cfg.hidden_size))
+            w_sub, k_sub = moe.route(
+                part, self.w.blk(layer, "ffn_gate_inp.weight"),
+                cfg.num_experts_per_tok,
+            )
+            routes.append(w_sub)
+            keeps.append(k_sub)
+        weights = routes[0] if len(routes) == 1 else ttnn.concat(routes, dim=-2)
+        keep = keeps[0] if len(keeps) == 1 else ttnn.concat(keeps, dim=-2)
+        routed = self.all_reduce(
+            moe.apply_experts(
+                mixed, weights, keep, gate_w, up_w,
+                self.w.blk(layer, "ffn_down_exps.weight"),
+                cfg.num_experts, cfg.hidden_size, cfg.expert_intermediate,
+            )
+        )
+        # The shared expert stays sub-chunked, and it is worth saying why
+        # because the opposite looks obviously right. It has no routing
+        # to broadcast -- four dense linears and a sigmoid gate -- so
+        # `moe_chunk`, which exists to bound the routed MoE's
+        # |union| x M waste, buys it nothing, and running it once on the
+        # whole chunk saves 1296 dispatches (9.5 % of the prefill's
+        # total, 1089 -> 1017 ms). It is also genuinely per-token:
+        # `shared_expert_rows_check.py` finds no row over 1 % at any
+        # group size up to 128, unlike `moe_block` (5.8).
+        #
+        # It still costs accuracy, because "per-token within 1 %" is not
+        # "identical": against the per-row answer a 32-row group is
+        # 0.000 % and a 128-row group 0.500 %, bf16 rounding that the
+        # sub-chunked form happens to avoid. Measured over 107 scored
+        # positions, whole-chunk is 20.6 % top-1 / NLL 6.389 against
+        # 24.3 % / 5.648 sub-chunked. 7 % of a prefill is not worth that
+        # here, so the dispatches stay. See handoff 5.7.
+        sub_pieces = []
+        for sub in range(0, seq, moe_chunk):
+            width = min(moe_chunk, seq - sub)
+            part = ttnn.slice(mixed, (0, 0, sub, 0), (1, 1, sub + width, cfg.hidden_size))
+            sub_pieces.append(
+                moe.shared_expert(
+                    part, self.w.blk(layer, "ffn_gate_shexp.weight"),
+                    self.w.blk(layer, "ffn_up_shexp.weight"),
+                    self.w.blk(layer, "ffn_down_shexp.weight"),
+                    self.w.blk(layer, "ffn_gate_inp_shexp.weight"),
+                )
+            )
+        shared = (
+            sub_pieces[0] if len(sub_pieces) == 1 else ttnn.concat(sub_pieces, dim=-2)
+        )
+        ffn = ttnn.add(routed, shared)
+        hidden = reinject(hidden, ffn, inject, cfg.hc_count)
+        if self.probe is not None:
+            self.probe(layer, hidden)
+        return hidden
+
+
+    def prefill(self, token_ids: list[int], state: TTState, chunk: int = 128,
+                moe_chunk: int = 32, deltanet_batch: int = 4):
         """Consume a prompt in chunks; returns the final hidden state for the last token.
 
         **Not verified yet -- do not wire this into the engine.** It runs, and it
@@ -2062,129 +2219,99 @@ class TTModel:
                 f"and this slot is at {base}"
             )
         final = None
-        for begin in range(0, len(token_ids), chunk):
-            ids = token_ids[begin : begin + chunk]
-            seq = len(ids)
-            state.histories[0].extend(ids)
-            hidden = ttnn.repeat(
-                self.to_dev(self.embed(ids), ttnn.bfloat16), (1, 1, 1, cfg.hc_count)
-            )
+        # Chunks run in groups of `deltanet_batch`. Inside a group each chunk still
+        # sees exactly its own rows for everything that depends on the row count --
+        # embedding, PLE, the hyper-connection mixes, QSA attention, the DeltaNet
+        # projections and convolution, the MoE -- so this is bit-identical to
+        # running them one at a time. The one batched thing is the DeltaNet scan,
+        # whose chunk axis is a batch dimension: `prepare_device` issues ~59
+        # dispatches whatever NC is, and it is 158.9 ms of a 922 ms chunk, the
+        # largest single item on a dispatch-bound path. Prepared chunk 0 is
+        # bit-identical at NC=1 and NC=4, all eight tensors
+        # (`prepare_nc_invariance_check.py`).
+        #
+        # deltanet_batch=1 reduces to the original chunk-at-a-time loop.
+        #
+        # It is worth 0.7 %, not the 10 % first estimated, and the gap is the
+        # useful part: `prepare_device` turns out to be compute-bound rather than
+        # dispatch-bound, so batching keeps its op count but quadruples the data
+        # each op moves and most of the saving never appears. The 10 % that a
+        # *wider* chunk buys comes from the dense matmuls getting wider, which
+        # changes their blocking and so their rounding -- a different trade, and
+        # not one this takes.
+        group = chunk * max(deltanet_batch, 1)
+        for gstart in range(0, len(token_ids), group):
+            gids = token_ids[gstart : gstart + group]
+            offs = list(range(0, len(gids), chunk))
+            subs = [gids[o : o + chunk] for o in offs]
+            seqs = [len(x) for x in subs]
+            hist_ends = []
+            for x in subs:
+                state.histories[0].extend(x)
+                hist_ends.append(len(state.histories[0]))
+            hiddens = [
+                ttnn.repeat(self.to_dev(self.embed(x), ttnn.bfloat16), (1, 1, 1, cfg.hc_count))
+                for x in subs
+            ]
             for layer in range(cfg.num_layers):
                 st = state[layer]
-                if layer in self._ple_layers:
-                    hidden = ttnn.add(hidden, self._ple_chunk(hidden, layer, st, state, begin, seq))
-                mixed, inject = gated_residual_mix(
-                    hidden, self.w.blk(layer, "hc_attn_norm.weight"),
-                    self.w.blk(layer, "hc_attn_down.weight"), self.w.blk(layer, "hc_attn_up.weight"),
-                    self.w.blk(layer, "hc_attn_inject.weight"),
-                    cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
-                )
-                branch = (
-                    self._attention_chunk(mixed, layer, st, base + begin, seq)
-                    if cfg.is_full_attention(layer)
-                    else self._linear_attention_chunk(mixed, layer, st, seq)
-                )
-                hidden = reinject(hidden, branch, inject, cfg.hc_count)
-
-                mixed, inject = gated_residual_mix(
-                    hidden, self.w.blk(layer, "hc_ffn_norm.weight"),
-                    self.w.blk(layer, "hc_ffn_down.weight"), self.w.blk(layer, "hc_ffn_up.weight"),
-                    self.w.blk(layer, "hc_ffn_inject.weight"),
-                    cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
-                )
-                pieces = []
-                # Same weight selection as decode. Naming the split halves here
-                # while the model is fused loads them lazily *on top of* the
-                # fused tensor -- another ~11 GB per device, which is an
-                # out-of-memory at the first MoE layer, not a slow path.
-                if self.fuse_expert_gate_up:
-                    gate_w, up_w = self.w.fused_gate_up(layer), None
-                else:
-                    gate_w = self.w.blk(layer, "ffn_gate_exps.weight")
-                    up_w = self.w.blk(layer, "ffn_up_exps.weight")
-                # Route in `moe_chunk`-sized groups, compute the experts over the
-                # whole chunk. The two halves want different group sizes and only
-                # one of them is fussy: routing at a wider group changes the
-                # answer (bf16 moves the router's probabilities ~0.5 %, which
-                # reorders experts across the k-th boundary -- 5.8), while the
-                # expert FFN is exactly per-token at any width now that
-                # `sparse_program_config` gives it a single K block. Splitting
-                # them keeps this bit-identical to routing *and* computing at
-                # `moe_chunk`, for one `expert_ffn` dispatch set instead of
-                # `seq / moe_chunk` of them.
-                routes, keeps = [], []
-                for sub in range(0, seq, moe_chunk):
-                    width = min(moe_chunk, seq - sub)
-                    part = ttnn.slice(mixed, (0, 0, sub, 0), (1, 1, sub + width, cfg.hidden_size))
-                    w_sub, k_sub = moe.route(
-                        part, self.w.blk(layer, "ffn_gate_inp.weight"),
-                        cfg.num_experts_per_tok,
-                    )
-                    routes.append(w_sub)
-                    keeps.append(k_sub)
-                weights = routes[0] if len(routes) == 1 else ttnn.concat(routes, dim=-2)
-                keep = keeps[0] if len(keeps) == 1 else ttnn.concat(keeps, dim=-2)
-                routed = self.all_reduce(
-                    moe.apply_experts(
-                        mixed, weights, keep, gate_w, up_w,
-                        self.w.blk(layer, "ffn_down_exps.weight"),
-                        cfg.num_experts, cfg.hidden_size, cfg.expert_intermediate,
-                    )
-                )
-                # The shared expert stays sub-chunked, and it is worth saying why
-                # because the opposite looks obviously right. It has no routing
-                # to broadcast -- four dense linears and a sigmoid gate -- so
-                # `moe_chunk`, which exists to bound the routed MoE's
-                # |union| x M waste, buys it nothing, and running it once on the
-                # whole chunk saves 1296 dispatches (9.5 % of the prefill's
-                # total, 1089 -> 1017 ms). It is also genuinely per-token:
-                # `shared_expert_rows_check.py` finds no row over 1 % at any
-                # group size up to 128, unlike `moe_block` (5.8).
-                #
-                # It still costs accuracy, because "per-token within 1 %" is not
-                # "identical": against the per-row answer a 32-row group is
-                # 0.000 % and a 128-row group 0.500 %, bf16 rounding that the
-                # sub-chunked form happens to avoid. Measured over 107 scored
-                # positions, whole-chunk is 20.6 % top-1 / NLL 6.389 against
-                # 24.3 % / 5.648 sub-chunked. 7 % of a prefill is not worth that
-                # here, so the dispatches stay. See handoff 5.7.
-                sub_pieces = []
-                for sub in range(0, seq, moe_chunk):
-                    width = min(moe_chunk, seq - sub)
-                    part = ttnn.slice(mixed, (0, 0, sub, 0), (1, 1, sub + width, cfg.hidden_size))
-                    sub_pieces.append(
-                        moe.shared_expert(
-                            part, self.w.blk(layer, "ffn_gate_shexp.weight"),
-                            self.w.blk(layer, "ffn_up_shexp.weight"),
-                            self.w.blk(layer, "ffn_down_shexp.weight"),
-                            self.w.blk(layer, "ffn_gate_inp_shexp.weight"),
+                mixes = []
+                for i in range(len(subs)):
+                    if layer in self._ple_layers:
+                        hiddens[i] = ttnn.add(
+                            hiddens[i],
+                            self._ple_chunk(hiddens[i], layer, st, state,
+                                            gstart + offs[i], seqs[i], hist_ends[i]),
                         )
+                    mixes.append(gated_residual_mix(
+                        hiddens[i], self.w.blk(layer, "hc_attn_norm.weight"),
+                        self.w.blk(layer, "hc_attn_down.weight"),
+                        self.w.blk(layer, "hc_attn_up.weight"),
+                        self.w.blk(layer, "hc_attn_inject.weight"),
+                        cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
+                    ))
+                if cfg.is_full_attention(layer):
+                    branches = [
+                        self._attention_chunk(mixes[i][0], layer, st,
+                                              base + gstart + offs[i], seqs[i])
+                        for i in range(len(subs))
+                    ]
+                else:
+                    branches = self._linear_attention_multi(
+                        [m for m, _ in mixes], layer, st, seqs
                     )
-                shared = (
-                    sub_pieces[0] if len(sub_pieces) == 1 else ttnn.concat(sub_pieces, dim=-2)
-                )
-                ffn = ttnn.add(routed, shared)
-                hidden = reinject(hidden, ffn, inject, cfg.hc_count)
-                if self.probe is not None:
-                    self.probe(layer, hidden)
+                for i in range(len(subs)):
+                    hiddens[i] = reinject(hiddens[i], branches[i], mixes[i][1], cfg.hc_count)
+                    hiddens[i] = self._prefill_ffn_half(hiddens[i], layer, seqs[i], moe_chunk)
+                    if self.probe is not None:
+                        self.probe(layer, hiddens[i])
 
             final, _ = gated_residual_mix(
-                hidden, self.w.get("output_hc_norm.weight"), self.w.get("output_hc_down.weight"),
+                hiddens[-1], self.w.get("output_hc_norm.weight"),
+                self.w.get("output_hc_down.weight"),
                 self.w.get("output_hc_up.weight"), None,
                 cfg.rms_norm_eps, cfg.hc_count, cfg.hidden_size,
             )
-            state.positions = [base + begin + seq]
+            state.positions = [base + gstart + len(gids)]
         # last position only
         last = ttnn.slice(final, (0, 0, final.shape[-2] - 1, 0), (1, 1, final.shape[-2], cfg.hidden_size))
         return last
 
     def _ple_chunk(
-        self, hidden: ttnn.Tensor, layer: int, st: LayerState, state: TTState, begin: int, seq: int
+        self, hidden: ttnn.Tensor, layer: int, st: LayerState, state: TTState, begin: int,
+        seq: int, hist_end: int | None = None,
     ) -> ttnn.Tensor:
-        """PLE over a chunk: per-token n-gram hashes, then the dilated conv."""
+        """PLE over a chunk: per-token n-gram hashes, then the dilated conv.
+
+        `hist_end` is where this chunk ends in the token history. It defaults to
+        the end of the history, which is right when chunks are appended and
+        consumed one at a time. The grouped prefill path appends a whole group
+        before running any layer, so it passes the chunk's own end and the
+        n-gram context stays causal.
+        """
         cfg = self.cfg
         hist = state.histories[0]
-        base = len(hist) - seq
+        base = (len(hist) if hist_end is None else hist_end) - seq
         per_token = [hist[: base + i + 1] for i in range(seq)]
         # Bound for the same reason as the chunk's rope table: host work is
         # invisible to a trace capture.

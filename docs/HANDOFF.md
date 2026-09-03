@@ -939,10 +939,28 @@ from the call counts below (`decode_ablation_check.py <part> 128`, baseline
 
 So prefill and decode are almost inverted: the MoE is 65 % of a traced step and
 7 % of a chunk, and the largest single item here is this project's own DeltaNet
-preparation, not a vendor op. Its masks are already cached and
-`block_diag_inverse_device` is 20 ops for five algebraic levels (`017` picked
-that recursion over a cheaper unstable one), so there is no small fix in it --
-which is the same conclusion this item reaches by the other route.
+preparation, not a vendor op.
+
+**And `prepare_device` is compute-bound, not dispatch-bound**, which was worth
+finding out the hard way. It is vectorised over the chunk axis, so N chunks cost
+the same ~59 dispatches as one; if its 158.9 ms were mostly launches, batching
+four chunks would have removed three quarters of it. `prefill(deltanet_batch=4)`
+does exactly that, is bit-identical (max diff 0.000e+00 on the logits, identical
+8-token continuations), and buys **0.7 %** -- 3735.2 -> 3710.3 ms on 512 tokens.
+The op count stays and the data each op moves quadruples, so the saving never
+appears. Its masks are also already cached, and `block_diag_inverse_device` is 20
+ops for five algebraic levels (`017` picked that recursion over a cheaper
+unstable one). There is no dispatch fix in it.
+
+Which relocates the 10.9 % that a *wider* chunk buys (512 tokens, 3476 ->
+3135 ms): it is not dispatch amortisation, it is the dense matmuls getting wider.
+That changes their blocking and so their rounding -- a row's `ttnn.linear` result
+is identical at m = 32, 64 and 128, changes once at 256, then holds through 512
+(`row_count_stability_check.py`) -- and against an exact float64 product the two
+blockings are a wash, max 4.2164e-03 against 4.3247e-03 and mean 3.0179e-04
+against 3.0160e-04. So the 10.9 % is available behind
+`TWTEST_WIDE_PREFILL_CHUNK=1` and is not taken by default: it is speed for a
+rounding change that is not an improvement.
 
 `--by-caller` attributes each call to the `twtest` line that issued it, which is
 what says where to cut; "multiply, 1993" does not. The distribution is flat --

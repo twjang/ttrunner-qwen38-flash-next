@@ -48,18 +48,48 @@ def test_ring_helpers_round_trip_in_both_modes() -> None:
             assert model._ring_oldest_first(ring, step) == cols, (trace_safe, step)
 
 
+def _prefill_source() -> str:
+    """`prefill` plus the FFN half it delegates to.
+
+    The MoE half moved into `_prefill_ffn_half` so the single-chunk and grouped
+    prefill paths share one body. These are invariants of the prefill path, so
+    they are checked against all of it.
+    """
+    return inspect.getsource(TTModel.prefill) + inspect.getsource(TTModel._prefill_ffn_half)
+
+
+def _deltanet_chunk_source() -> str:
+    """The chunk path is split across three methods, so read all of them.
+
+    `_linear_attention_chunk` was one function until the DeltaNet scan was
+    batched over chunks (`_linear_attention_multi`). The invariants below are
+    properties of the *path*, not of any one function, so they are checked
+    against the whole of it.
+    """
+    return "".join(
+        inspect.getsource(fn)
+        for fn in (
+            TTModel._deltanet_front,
+            TTModel._deltanet_scan,
+            TTModel._deltanet_back,
+            TTModel._linear_attention_chunk,
+            TTModel._linear_attention_multi,
+        )
+    )
+
+
 def test_a_chunk_advances_the_ring_counters() -> None:
     assert "new_step = step + seq" in inspect.getsource(TTModel._causal_conv_chunk)
     assert "st.ple_step += seq" in inspect.getsource(TTModel._ple_chunk)
     # and the DeltaNet caller stores it back
-    assert "st.conv_step = self._causal_conv_chunk(" in inspect.getsource(
-        TTModel._linear_attention_chunk
-    ).replace("conv_out, st.conv, ", "")
+    assert "st.conv_step = self._causal_conv_chunk(" in _deltanet_chunk_source().replace(
+        "conv_out, st.conv, ", ""
+    )
 
 
 def test_chunked_deltanet_uses_local_head_counts() -> None:
     """The DeltaNet weights are head-sharded; global counts prepare one device."""
-    src = inspect.getsource(TTModel._linear_attention_chunk)
+    src = _deltanet_chunk_source()
     assert "self.n_v_local" in src and "self.conv_dim_local" in src
 
 
@@ -77,7 +107,7 @@ def test_chunked_deltanet_never_leaves_the_device() -> None:
     with `prepare()` in the middle replays as garbage. Keep this path free of
     `to_torch`/`from_torch` or that comes back.
     """
-    src = inspect.getsource(TTModel._linear_attention_chunk)
+    src = _deltanet_chunk_source()
     # Positive anchor first: a test of "X is absent" passes on a gutted function,
     # so it has to prove it is reading the live path before the absence means
     # anything.
@@ -88,7 +118,7 @@ def test_chunked_deltanet_never_leaves_the_device() -> None:
 
 def test_prefill_selects_the_same_expert_weights_as_decode() -> None:
     """Naming the split halves while fused loads ~11 GB more and exhausts DRAM."""
-    src = inspect.getsource(TTModel.prefill)
+    src = _prefill_source()
     assert "fuse_expert_gate_up" in src and "fused_gate_up" in src
 
 
@@ -117,9 +147,12 @@ def test_prefill_leaves_the_last_prompt_token_to_the_decode_loop() -> None:
 
 def test_prefill_resumes_from_where_the_slot_already_is() -> None:
     """So it composes with prefix reuse instead of assuming position 0."""
-    src = inspect.getsource(TTModel.prefill)
+    src = _prefill_source()
     assert "base = state.positions[0]" in src
-    assert "base + begin" in src
+    # the chunk's absolute start is base plus its offset within the prompt; the
+    # loop variable is the group start since chunks run in groups
+    assert "base + gstart" in src
+    assert "state.positions = [base + gstart + len(gids)]" in src
 
 
 def test_chunk_rings_are_written_in_place() -> None:
@@ -138,7 +171,7 @@ def test_chunked_deltanet_reduces_the_sharded_output() -> None:
     Found by per-layer bisection: the recurrent state (which never passes through
     `ssm_out`) matched decode while the layer output did not.
     """
-    src = inspect.getsource(TTModel._linear_attention_chunk)
+    src = _deltanet_chunk_source()
     assert "self.all_reduce(" in src
 
 
@@ -230,7 +263,7 @@ def test_prefill_refuses_a_moe_chunk_past_the_cliff() -> None:
     import twtest.tt.model as model_mod
 
     assert model_mod._MAX_MOE_CHUNK == 32
-    src = inspect.getsource(TTModel.prefill)
+    src = _prefill_source()
     assert "_MAX_MOE_CHUNK" in src, "the cap must be enforced, not just recorded"
     assert "moe_chunk: int = 32" in src.split("\n")[0] or "moe_chunk: int = 32" in src, (
         "the default must sit inside the verified range"
@@ -249,7 +282,7 @@ def test_prefill_routes_in_groups_but_computes_experts_once() -> None:
     Collapsing these back into one `moe_block` call per sub-chunk is the
     regression this guards.
     """
-    src = inspect.getsource(TTModel.prefill)
+    src = _prefill_source()
     assert "moe.route(" in src, "routing must stay per sub-chunk"
     assert "moe.apply_experts(" in src, "the expert FFN must run once for the chunk"
     assert "moe.moe_block(" not in src, (
