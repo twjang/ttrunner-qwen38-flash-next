@@ -310,6 +310,7 @@ stack rather than only the harnesses:
 | prefill=128, 107 scored | 24.3 %, NLL 5.648 | **identical** |
 | chunk wall clock | 1060.5 ms | 1070.5 ms |
 | `TTEngine`, 48 tokens x 2 prompts | 240.1 / 240.5 ms/token | **239.6 / 240.4, same tokens** |
+| `TTEngine` + `chunked_prefill`, prefix reuse | — | **11.40 s cold, 2.27 s warm, warm == cold** |
 | traced step, 262144 ctx | 236 ms | **236.2 ms** |
 | traced step, QSA on at 8192 | 297 ms | **297.4 ms** |
 | decode with the **QSA indexer on** (8192) | 83.0 %, NLL 0.682 | **identical** |

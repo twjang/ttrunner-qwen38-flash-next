@@ -124,7 +124,12 @@ For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
 then costs ~513 ms). A 2000-token prompt with 200 output tokens is ~117 s that
 way against ~1047 s traced-and-stepped; short prompts invert it. Prefix reuse
 across chat turns is on unconditionally — a follow-up turn re-feeds only what it
-added, measured 7.49 s to first token cold against 2.07 s warm.
+added, measured **2.27 s** to first token warm. Cold depends on how the prompt is
+fed and the earlier figure here did not say: **11.40 s** with
+`chunked_prefill=True`, **41.31 s** without it, for the same 73-token prompt
+(`scripts/dev/prefix_reuse_check.py`, with and without `--chunked`). Both cases
+reuse exactly the 69 tokens they should, miss correctly on an unrelated prompt,
+and return token-identical output warm and cold.
 
 Throughput-oriented configurations (more slots, shorter context):
 
