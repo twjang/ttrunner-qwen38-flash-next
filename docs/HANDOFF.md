@@ -70,8 +70,8 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 
 | configuration | result |
 |---|---|
-| single user, 1 slot, 262144 ctx, traced | **236 ms/step**; eager 469 ms |
-| same, QSA selection on (context in (2048, 65536]) | 297 ms/step at 8192 |
+| single user, 1 slot, 262144 ctx, traced | **236 ms/step** (236.2 re-measured after the paged refactor); eager 486 ms |
+| same, QSA selection on (context in (2048, 65536]) | **297 ms/step** at 8192 (297.4 re-measured) |
 | same, eager, chunked prefill on | prompt at **7.2 ms/token** (was ~45) |
 | `step_n` verifying k tokens, traced | 255 ms at k=2, 276.6 at k=4, 323.9 at k=8 |
 | same, eager | 496 ms/step |
@@ -299,6 +299,8 @@ stack rather than only the harnesses:
 | prefill=128, 107 scored | 24.3 %, NLL 5.648 | **identical** |
 | chunk wall clock | 1060.5 ms | 1070.5 ms |
 | `TTEngine`, 48 tokens x 2 prompts | 240.1 / 240.5 ms/token | **239.6 / 240.4, same tokens** |
+| traced step, 262144 ctx | 236 ms | **236.2 ms** |
+| traced step, QSA on at 8192 | 297 ms | **297.4 ms** |
 
 The engine row is `speculation_check.py` with `TWTEST_SPEC_ONLY=0`, and it
 covers the paged *decode* path end to end. Chunked prefill is off in that
