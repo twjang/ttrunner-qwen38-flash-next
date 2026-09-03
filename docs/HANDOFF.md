@@ -185,6 +185,15 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
      (`moe_rows_check.py`), or token equality (`batch_equivalence_check.py`).
    * The observed spread is 5.6 points of top-1 and 0.73 of NLL. Treat any
      prefill difference smaller than that as unmeasured.
+
+   **It has not been shown in the engine.** `TTEngine` with
+   `chunked_prefill=True` returns token-identical output across separate
+   processes -- all three turns of `prefix_reuse_check.py --chunked`, run twice.
+   Its prompts prefill in **64-row** chunks (`take = available - available % 32`
+   on a 73-token prompt), where the 128-row harness call is what moves. So the
+   concern is scoped to the measurement until someone shows otherwise; a prompt
+   long enough for a full 128-row chunk is the case to try, and if it varies the
+   engine needs a notice like the batch one.
 9. **Instrumented profiles are inflated ~40 %** by per-section syncs; read the
    shares, not the totals.
 10. **V heads are tiled over K heads** -- v-head j reads k-head `j % n_k`, so
@@ -344,6 +353,7 @@ stack rather than only the harnesses:
 | chunk wall clock | 1060.5 ms | 1070.5 ms |
 | `TTEngine`, 48 tokens x 2 prompts | 240.1 / 240.5 ms/token | **239.6 / 240.4, same tokens** |
 | `TTEngine` + `chunked_prefill`, prefix reuse | — | **11.40 s cold, 2.27 s warm, warm == cold** |
+| the same, run twice in separate processes | — | **token-identical on all three turns** |
 | traced step, 262144 ctx | 236 ms | **236.2 ms** |
 | traced step, QSA on at 8192 | 297 ms | **297.4 ms** |
 | decode with the **QSA indexer on** (8192) | 83.0 %, NLL 0.682 | **identical** |
