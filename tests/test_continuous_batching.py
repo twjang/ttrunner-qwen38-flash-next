@@ -70,3 +70,21 @@ class _NoDeviceModel:
 
     def __getattr__(self, name):  # pragma: no cover - defensive
         raise AttributeError(name)
+
+
+def test_engine_warns_above_one_row_tile() -> None:
+    """A caller comparing a batched reply with a single-request one must be told.
+
+    Past 32 rows the ops tile differently, so the same sequence accumulates
+    differently and its output changes -- arithmetic, not a defect, and exact at
+    32 and below (`batch_equivalence_check.py`, handoff invariant 13). Before
+    `sparse_matmul`'s row bug was fixed it was worse than a difference: batch 64
+    corrupted half its rows outright.
+    """
+    import inspect
+
+    from twtest.tt.engine import TTEngine
+
+    src = inspect.getsource(TTEngine.__init__)
+    assert "max_concurrency > 32" in src, "the boundary must be checked"
+    assert "one row tile" in src, "and the notice must say why"

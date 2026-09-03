@@ -212,6 +212,21 @@ class TTEngine(Engine):
                 f"address it (limit {self.model.indexer_max_seq}); attention is "
                 "dense beyond the budget, which is not what the model does."
             )
+        # Above one row tile a sequence's output stops matching what it would
+        # be decoded alone -- ops tile differently past 32 rows, so the same row
+        # accumulates differently (handoff invariant 13,
+        # `scripts/dev/row_tile_boundary_check.py`). It is arithmetic rather
+        # than a defect, and up to 32 slots the match is exact
+        # (`batch_equivalence_check.py`), but a caller comparing a batched reply
+        # against a single-request one should be told rather than left to
+        # discover it. Same reasoning as the QSA notice above.
+        if max_concurrency > 32:
+            print(
+                f"[tt] max_concurrency {max_concurrency} exceeds one row tile: a "
+                "sequence's output will differ from the same sequence decoded "
+                "alone, because ops past 32 rows tile differently. Exact at 32 "
+                "and below."
+            )
         # Fused gate|up experts: one sparse_matmul instead of two, verified
         # token-for-token identical. Two runs per mode, 25 samples each:
         #
