@@ -985,6 +985,21 @@ changing the selection rule. The cap is set accordingly and should stay.
 
 ## 6. Recipes
 
+**Every environment switch**, because they are otherwise scattered through this
+file and several are undiscoverable:
+
+| variable | what it does |
+|---|---|
+| `TWTEST_GGUF_DIR`, `TWTEST_TT_CACHE`, `TWTEST_TOKENIZER` | where the weights, the converted cache and the tokenizer live |
+| `TWTEST_MAX_SEQ` | `max_seq_len` for the dev harnesses (default 512). **Above 2048 turns the QSA selection on**, which no other check here does |
+| `TWTEST_TRACE_REGION_MB` | `trace_region_size` for `spec_capture_ladder.py`; unset takes ttnn's default, which is what the working harnesses use |
+| `TWTEST_ALLOW_WIDE_STEP_N=1` | lifts `step_n`'s k≤32 guard for investigation. Does not make it correct (5.5) |
+| `TWTEST_ALLOW_SPECULATION=1` | lifts `TTEngine`'s speculation refusal. **Hangs the boards**; expect `tt-smi -r all` (5.6) |
+| `TWTEST_SPEC_ONLY=<k>` | `speculation_check.py` builds only that one engine, so a process holds one |
+| `TWTEST_STACK_DUMP=<s>` | dumps every thread's stack on a timer — what located the trace hang |
+| `TWTEST_SECOND_K`, `TWTEST_NEW_KERNEL`, `TWTEST_NO_DEC_REPLAY`, `TWTEST_SYNC_BETWEEN`, `TWTEST_EAGER_BETWEEN`, `TWTEST_RESET_STALL`, `TWTEST_STEPN_CQ` | `spec_capture_ladder.py` knobs, one per hypothesis it tests or excludes — see 5.6's exclusion list |
+| `TWTEST_MOE_CHUNK` *(none — use `--moe-chunk`)* | `device_quality.py --moe-chunk N` lifts `_MAX_MOE_CHUNK` for the measurement that decides whether the cap should move |
+
 **Judge a change to the model** — `scripts/dev/device_quality.py 48`
 (add `--prefill 32` for the chunked path, `--score-from N` for a matched
 control). Next-token top-1 and NLL against the text itself: absolute, one
