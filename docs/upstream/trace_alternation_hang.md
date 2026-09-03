@@ -1,5 +1,10 @@
 # Alternating replays of two captured traces hangs the device
 
+**Runnable code:** `ttnn_bug_report/` — `repro.py` (reproduces, needs the
+checkpoint), `minimal_attempt_does_not_reproduce.py` (self-contained, does not,
+kept as a negative control with the axes tried), and a `README.md` written for a
+tt-metal reader rather than for this repository.
+
 **Status:** ready to file. Not filed — that is the maintainer's call, and nothing
 here has been sent anywhere.
 

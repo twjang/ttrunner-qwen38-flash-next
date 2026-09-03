@@ -1117,6 +1117,10 @@ tests `pytest.importorskip("ttnn")`.
   validation table.
 * `docs/upstream/trace_alternation_hang.md` — filing-ready report for the one
   defect that blocks 5.2's step 5, 5.6 and (by consequence) 5.7.
+* `ttnn_bug_report/` — the runnable half of that report: `repro.py` hangs the
+  device in a few minutes and needs only the checkpoint, and
+  `minimal_attempt_does_not_reproduce.py` records the self-contained version
+  that does *not*, so the search is not repeated.
 * `docs/roadmap_low_batch.md` — what to do next and why, with the numbers.
 * `README.md` — measured performance tables and quick start.
 * `refs/qwen4_exp/` — vendored upstream HF modeling (ignores `mtp.*`).
