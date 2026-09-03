@@ -83,7 +83,7 @@ def test_step_n_is_single_sequence_and_bounded() -> None:
     """
     src = inspect.getsource(TTModel.step_n)
     assert 'raise NotImplementedError("step_n advances one sequence at a time")' in src
-    assert "0 < k <= 32" in src
+    assert "else 32" in src
 
 
 def test_step_n_grows_the_history_per_row() -> None:
@@ -136,5 +136,5 @@ def test_step_n_refuses_k_past_one_tile_of_rows() -> None:
     from twtest.tt.model import TTModel
 
     src = inspect.getsource(TTModel.step_n)
-    assert "0 < k <= 32" in src, "the guard must stop at one tile of rows"
-    assert "0 < k <= 64" not in src, "the old, half-wrong range must be gone"
+    assert "else 32" in src, "the guard must stop at one tile of rows by default"
+    assert "TWTEST_ALLOW_WIDE_STEP_N" in src, "with a documented escape for investigation"

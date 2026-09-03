@@ -446,12 +446,23 @@ with a different token stream, and the same figure at all three, so it is a
 structural break at one tile of rows rather than anything that accumulates. The
 guard now stops at 32 and says why.
 
-Not the MoE, despite the row count pointing there: `moe_rows_check.py` puts
-`moe_block` at 64 rows within one row of its per-row answer, and that row is
-5.8's routing tie. The candidates left are `_linear_attention_step_n`'s unrolled
-convolution and recurrence, and `_attention_step_n`'s per-row reads. Nothing
-needs k > 32 today -- speculation caps its widths at 17 -- so this is walled off
-rather than chased.
+**And it is the same boundary as everything else.** `step_n_layer_bisect.py`
+shows the divergence starting at 0.385 % in layer 0 and rising smoothly, not
+jumping -- so it is accumulation, not corruption -- and the boundary is exactly
+one row tile: k=32 is exact, k=33 is not. Past that, `per_core_M` exceeds 1 and
+`ttnn.sparse_matmul` is only correct with the single-K-block program config,
+which accumulates differently from the narrow one that k sequential steps use at
+m=1. The two sides cannot share a configuration, because one of them needs the
+wide one to be right at all, so this is not fixable here.
+
+`step_n` exists to reproduce k sequential steps *exactly*, so a path that cannot
+is no use to it whatever the cause. Nothing needs k > 32 -- speculation caps its
+widths at 17 -- so it refuses, with `TWTEST_ALLOW_WIDE_STEP_N=1` to lift the cap
+for investigation.
+
+One row tile turns out to be the reproducibility boundary throughout: it caps
+`moe_chunk` (5.8), it is why batch 64 decodes differently from batch 1, and it
+is why `step_n` stops at 32. Three findings, one cause.
 
 Warmed, against 517.8 ms for one eager step (`step_n_bench.py`):
 
@@ -857,6 +868,14 @@ it advertised. Batch 64 still does not reproduce a batch-1 run, because the
 single-K-block config accumulates in a different order, but the rows are now
 consistent and the difference is bf16 rather than corruption. Batch 32 was and
 remains exact.
+
+**One row tile is the reproducibility boundary throughout this engine.** It caps
+`moe_chunk` here, it is why batch 64 decodes differently from batch 1, and it is
+why `step_n` refuses past k=32 (5.5). All three are the same fact: past one row
+tile `per_core_M` exceeds 1, `ttnn.sparse_matmul` is only correct with the
+single-K-block config, and that config accumulates differently from the narrow
+one used below the boundary. Expect any *new* row-grouping knob to have the same
+ceiling.
 
 **Restoring batch invariance was attempted and abandoned.** Threading a
 `single_k_block` flag so decode's expert config no longer depends on the batch

@@ -21,6 +21,7 @@ Structure of the forward, and why it is shaped this way:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -1369,14 +1370,22 @@ class TTModel:
         # than anything that accumulates. The range said 1..64 and nothing
         # exercised past 8, so the broken half was reachable and unnoticed.
         #
-        # Not the MoE, whatever the row count suggests: `moe_rows_check.py` puts
-        # `moe_block` at 64 rows within one row of its per-row answer, and that
-        # one row is the routing tie of 5.8. The remaining candidates are
-        # `_linear_attention_step_n`'s unrolled convolution and recurrence, and
-        # `_attention_step_n`'s per-row reads. Nothing needs k > 32 today --
-        # speculation caps its widths at 17 -- so this refuses rather than
-        # shipping a range half of which is wrong.
-        if not 0 < k <= 32:
+        # The mechanism is the same one that caps `moe_chunk` and makes batch 64
+        # decode differently from batch 1: past one row tile `per_core_M`
+        # exceeds 1, and `ttnn.sparse_matmul` is only correct there with a
+        # single-K-block program config, which accumulates in a different order
+        # from the narrow one k sequential steps use at m=1. So this is not
+        # corruption -- `step_n_layer_bisect.py` shows 0.385 % at layer 0 rising
+        # smoothly, not a jump -- and it is not fixable here: the two sides
+        # cannot share a configuration, because one of them needs the wide one
+        # to be right at all.
+        #
+        # `step_n` exists to reproduce k sequential steps exactly, so a path
+        # that cannot is no use to it whatever the cause. Nothing needs k > 32
+        # today (speculation caps its widths at 17), so it refuses.
+        # `TWTEST_ALLOW_WIDE_STEP_N=1` lifts the cap so the break can be
+        # investigated (`step_n_layer_bisect.py`); it does not make it correct.
+        if not 0 < k <= (64 if os.environ.get("TWTEST_ALLOW_WIDE_STEP_N") else 32):
             raise ValueError(
                 f"k must be in 1..32, got {k}. step_n is wrong past one tile of "
                 "rows (35.68 % on the hidden at k=33); see the comment above."
