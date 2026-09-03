@@ -207,6 +207,12 @@ def shared_expert(
     return ttnn.multiply(out, ttnn.sigmoid(ttnn.linear(x, gate_vec, compute_kernel_config=HIFI4)))
 
 
+# Above this many rows the per-expert input copy is cheaper than making the op
+# broadcast one set of rows to every expert. 64 is the largest width measured to
+# win (2.35x); 128 loses in the model. See `expert_ffn`.
+_BROADCAST_MAX_M = 64
+
+
 def expert_ffn(
     x: ttnn.Tensor,
     gate_w: ttnn.Tensor,
@@ -224,15 +230,51 @@ def expert_ffn(
     returns [1, E, M, K]
     """
     m = x.shape[-2]
-    broadcast = ttnn.repeat(x, (1, num_experts, 1, 1))
     kw = {"sparsity": sparsity, "nnz": nnz, "is_input_a_sparse": True, "is_input_b_sparse": True}
+
+    # The gate/up matmuls take the *same* rows for every expert, so below
+    # `_BROADCAST_MAX_M` rows they use the op's (dense a, sparse b) mode -- a is
+    # [1, 1, M, K] against [1, E, K, N], output [1, 1, 1, E, M, N] -- instead of
+    # handing it E copies of x.
+    #
+    # At decode that copy is nearly all padding: M is 1, TILE_LAYOUT pads the row
+    # axis to 32, so `repeat(x, (1, E, 1, 1))` materialised [1, 512, 32, 2560] to
+    # carry 512 copies of a single row -- ~84 MB a layer, 48 layers a token, one
+    # row in 32 of it real. Dropping it takes the traced step 266.3 -> 238.4 ms.
+    #
+    # It reverses at a full prefill chunk, which is why this is a threshold and
+    # not a replacement. Measured in isolation at E=512 the broadcast mode wins
+    # 1.94x at M=1, 1.82x at M=32 and 2.35x at M=64; in the model at M=128 it
+    # *loses*, 919.5 -> 930.0 ms a chunk, where the rows are real data rather
+    # than padding and the op has to fan them out to every expert instead. Both
+    # forms are bit-identical (`sparse_broadcast_check.py` compares every
+    # element at each M), so this picks purely on measured speed.
+    #
+    # Only these two can use it either way. The down projection's `a` is the
+    # per-expert intermediate, which genuinely differs per expert.
+    kw_in = dict(kw)
+    if m <= _BROADCAST_MAX_M:
+        kw_in["is_input_a_sparse"] = False
+
+    def _broadcast_matmul(w, n_out):
+        """gate/up for every expert. -> [1, E, M, N]
+
+        In broadcast mode the op returns [1, 1, 1, E, M, N]; the reshape drops
+        leading unit dimensions only, so it is metadata.
+        """
+        a = x if kw_in["is_input_a_sparse"] is False else ttnn.repeat(x, (1, num_experts, 1, 1))
+        out = ttnn.sparse_matmul(
+            a, w, program_config=sparse_program_config(m, k_in, n_out),
+            compute_kernel_config=HIFI4, **kw_in,
+        )
+        return ttnn.reshape(out, (1, num_experts, m, n_out))
 
     # Both configs come from the tensors, not from the nominal sizes. The expert
     # weights are sharded, so this device's intermediate width is
     # `gate_w.shape[-1] // 2`, a quarter of `intermediate_size` -- passing the
     # nominal value asks for an `in0_block_w` the op rejects outright
     # ("Kt (5) must be divisible by in0_block_w (20)").
-    k_in = broadcast.shape[-1]
+    k_in = x.shape[-1]
 
     if up_w is None:
         # gate_w carries gate|up fused on the output axis: one sparse_matmul
@@ -242,17 +284,13 @@ def expert_ffn(
         # quantises the concatenation once; concatenating the quantised halves on
         # device requantises them and changes the output.
         n = gate_w.shape[-1] // 2
-        both = ttnn.sparse_matmul(
-            broadcast, gate_w, program_config=sparse_program_config(m, k_in, 2 * n),
-            compute_kernel_config=HIFI4, **kw,
-        )
+        both = _broadcast_matmul(gate_w, 2 * n)
         e = both.shape[1]
         gate = ttnn.slice(both, (0, 0, 0, 0), (1, e, m, n))
         up = ttnn.slice(both, (0, 0, 0, n), (1, e, m, 2 * n))
     else:
-        pc_in = sparse_program_config(m, k_in, gate_w.shape[-1])
-        gate = ttnn.sparse_matmul(broadcast, gate_w, program_config=pc_in, compute_kernel_config=HIFI4, **kw)
-        up = ttnn.sparse_matmul(broadcast, up_w, program_config=pc_in, compute_kernel_config=HIFI4, **kw)
+        gate = _broadcast_matmul(gate_w, gate_w.shape[-1])
+        up = _broadcast_matmul(up_w, up_w.shape[-1])
     hidden = ttnn.multiply(ttnn.silu(gate), up)
     pc_out = sparse_program_config(m, hidden.shape[-1], hidden_size)
     return ttnn.sparse_matmul(hidden, down_w, program_config=pc_out, compute_kernel_config=HIFI4, **kw)
