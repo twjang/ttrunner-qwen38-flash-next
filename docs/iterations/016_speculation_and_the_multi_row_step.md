@@ -83,6 +83,15 @@ back, which silently cost drafts -- the same bug was in the engine's copy.
 
 ## Observation 5 — one capture, because two corrupt each other
 
+> **Corrected in `018`.** Two captures do *not* corrupt each other: capturing
+> both is fine, and so is replaying either one repeatedly. What hangs is
+> replaying them **alternately**, when their operations differ in shape --
+> `spec_capture_ladder.py` keeps two live captures and replays the second alone
+> without trouble (`stepn_only`), and alternates two captures of the *same*
+> graph without trouble (`two_same`). The allocation warning quoted below is,
+> as Observation 7 correctly says, a red herring; it is not evidence of
+> corruption between captures.
+
 A partial acceptance wants to replay its prefix with `step_n(j+1)`, which means a
 capture per width. Capturing the second one warns:
 
@@ -127,6 +136,20 @@ checked only because it was cheap to check, and it failed. The check needed two
 separate processes, because two engines in one still hang (Observation 7).
 
 ## Observation 7 — the hang was two engines, not speculation
+
+> **Corrected in `018`.** The title is wrong, and the body below already
+> contradicts it ("a single engine hangs too"). It is not two engines: the hang
+> reproduces with the speculative engine as the *only* one in the process
+> (`TWTEST_SPEC_ONLY=2`). Nor is it the capture, which this observation assumes
+> throughout -- instrumenting `_device_loop` shows setup completing and a stack
+> dump lands in `ttnn.execute_trace` on the **first replay** of the verifier.
+> The cause is alternating replays of two traces whose operations differ in
+> shape; `docs/upstream/trace_alternation_hang.md` has the six configurations
+> that separate it and the five workarounds excluded since.
+>
+> Also superseded: `traced_step_n_check.py` no longer completes, so the 255 ms
+> at k=2 quoted below is historical. And `step_n` itself is only correct to
+> k=32, not the 1..64 its guard advertised -- see 5.5.
 
 Capturing inside the engine hangs it, and the boards come back only after
 `tt-smi -r` -- seven times over the session. It is still unexplained.
