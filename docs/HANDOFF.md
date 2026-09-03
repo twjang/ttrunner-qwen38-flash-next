@@ -301,6 +301,15 @@ stack rather than only the harnesses:
 | `TTEngine`, 48 tokens x 2 prompts | 240.1 / 240.5 ms/token | **239.6 / 240.4, same tokens** |
 | traced step, 262144 ctx | 236 ms | **236.2 ms** |
 | traced step, QSA on at 8192 | 297 ms | **297.4 ms** |
+| decode with the **QSA indexer on** (8192) | 83.0 %, NLL 0.682 | **identical** |
+| `step_n`, k = 1, 2, 4, 8 | 0.00 % on the hidden | **identical** |
+| prefix reuse over three turns | 69 of 73 reused, warm == cold | **identical** |
+| `snapshot`/`restore` after a discarded draft | rolled == clean | **identical** |
+
+The indexer row matters more than its size suggests: every other quality check
+here runs at `max_seq_len=512`, where the selection is **off**, so the branch
+that hands `paged_scaled_dot_product_attention_decode` an `attn_mask` was
+untested until it was run deliberately at 8192.
 
 The engine row is `speculation_check.py` with `TWTEST_SPEC_ONLY=0`, and it
 covers the paged *decode* path end to end. Chunked prefill is off in that
