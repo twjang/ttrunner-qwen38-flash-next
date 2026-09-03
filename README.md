@@ -84,8 +84,8 @@ in `(2048, 65536]` -- a step is 297.5 ms at 8192 tokens against 236.1 dense; the
 extra is almost all `ttnn.topk` at k=512, see `docs/iterations/015`.)
 
 For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
-**8.6 ms/token** instead of ~500, at the cost of the trace (each generated token
-then costs ~513 ms). A 2000-token prompt with 200 output tokens is ~120 s that
+**7.2 ms/token** instead of ~500, at the cost of the trace (each generated token
+then costs ~513 ms). A 2000-token prompt with 200 output tokens is ~117 s that
 way against ~1047 s traced-and-stepped; short prompts invert it. Prefix reuse
 across chat turns is on unconditionally — a follow-up turn re-feeds only what it
 added, measured 7.49 s to first token cold against 2.07 s warm.
@@ -97,8 +97,8 @@ Throughput-oriented configurations (more slots, shorter context):
 | 8 | 10.18 | 7.2× |
 | 32 | **37.84** | 30.5× |
 
-The server feeds prompts one token per step. `TTModel.prefill` is ~59× faster
-(8.6 vs 509.0 ms/token) and is on for one-slot engines; it is refused above that
+The server feeds prompts one token per step. `TTModel.prefill` is ~71× faster
+(7.2 vs 509.0 ms/token) and is on for one-slot engines; it is refused above that
 because it consumes a whole prompt before returning, which a shared lockstep
 batch cannot express.
 
@@ -178,11 +178,17 @@ text, not whether it matches decode token for token:
 
 | prefilled | scored | prefill | decode control |
 |---|---|---|---|
-| 128 | 32 | **53.1 %** top-1, NLL 3.11 | 51.6 %, NLL 3.25 |
+| 128 | 107 | **25.2 %** top-1, NLL 5.82 | 22.6 %, NLL 6.00 |
 | 32 | 128 | **71.9 %** top-1, NLL 1.43 | 71.7 %, NLL 1.48 |
 
-(Lower than the decode row above because the passage runs on into dates and
-proper nouns; both paths fall together, which is the point of a control.)
+Both rows score 100+ positions on purpose: at 32 positions this measurement is
+not repeatable (two runs of one configuration gave 50.0 % and 53.1 %), so a
+narrower sample cannot tell an effect from variance. See `docs/HANDOFF.md`
+invariant 8.
+
+(Absolutely lower than the decode row above because the passage runs on into
+dates and proper nouns; both paths fall together, which is the point of having a
+control rather than an absolute target.)
 
 QSA attends to 2048 *selected* tokens, not to the whole context. The selection
 runs on device and was verified against the reference past the budget --

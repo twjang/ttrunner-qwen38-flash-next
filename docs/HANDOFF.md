@@ -544,6 +544,9 @@ re-shapes every layer rather than adding anything.
 4. `MeshDevice.reset_sub_device_stall_group()` between the replays, since
    `enqueue_trace` updates worker state per sub-device (`TWTEST_RESET_STALL=1`)
    — still hangs.
+5. A 1 GB `trace_region_size`, against the 256–384 MB the two traces need, in
+   case they were colliding in an undersized region — still hangs, so it is not
+   region pressure.
 
 There is no host-side lever left that I can see. The one candidate that still
 fits — per-program config-buffer state — cannot be varied from Python; it needs

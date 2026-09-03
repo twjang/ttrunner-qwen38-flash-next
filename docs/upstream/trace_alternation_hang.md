@@ -101,6 +101,9 @@ model graphs are thousands of ops with hundreds of distinct kernels.
 * **`MeshDevice.reset_sub_device_stall_group()` between the replays**, since
   `enqueue_trace` takes per-sub-device ownership and updates worker state indexed
   by sub-device. Still hangs.
+* **A much larger `trace_region_size`** — 1 GB, against the 256–384 MB the two
+  traces need — on the theory that their buffers were colliding in an undersized
+  region. Still hangs, so it is not region pressure.
 * **Capture order and allocation.** Capturing both before replaying either,
   allocating all buffers before any capture, capturing on a worker thread,
   `max_seq_len` 512 vs 2048, and an explicit `trace_region_size` (default vs
