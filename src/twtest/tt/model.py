@@ -1973,8 +1973,13 @@ class TTModel:
             moe_chunk   64    936.1 ms   136.7 tok/s
             moe_chunk  128    998.7 ms   128.2 tok/s
 
-        The default had been 16, chosen from the waste figures alone; 32 is
-        1.85x faster.
+        Those are **one unwarmed draw each** -- the harness took a single
+        sample until it was fixed to warm twice and take the median of nine --
+        and they overstate the spread. Re-measured properly: 16 is 1214 ms and
+        32 is **919 ms** (min 915, max 997). So 1.32x, not the 1.85x the raw
+        draws implied. The ordering stands; the ratio did not.
+
+        The default had been 16, chosen from the waste figures alone.
 
         Past 32 the answer changes, and `_MAX_MOE_CHUNK` refuses rather than
         documents it. Most of that gap was a real defect and is gone:

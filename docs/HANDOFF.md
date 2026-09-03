@@ -853,12 +853,18 @@ q/k/v permute (360 fewer calls, 30 % slower) -- so start from `op_count.py
 `prefill(moe_chunk=)` groups rows for the MoE. Speed wants the biggest group;
 the answer changes past 32, which is one tile:
 
-| moe_chunk | wall clock | tok/s | logits vs 16 | argmax |
+| moe_chunk | wall clock (1 draw) | tok/s | logits vs 16 | argmax |
 |---|---|---|---|---|
 | 16 | 2032.6 ms | 63.0 | — | 1105 |
 | 32 | **1101.0 ms** | 116.3 | 0.0000 % | 1105 |
 | 64 | 936.1 ms | 136.7 | 55.9 % | 1154 |
 | 128 | 998.7 ms | 128.2 | 144.9 % | 50 |
+
+The wall-clock column is one unwarmed draw per row, taken before
+`moe_chunk_sweep.py` was fixed to warm twice and take a median of nine.
+Re-measured that way, 16 is 1214 ms and 32 is 919 ms — **1.32x**, not the 1.85x
+the raw draws implied. The ordering and the logits column stand; the ratio did
+not, and neither does any speed comparison drawn from the other rows.
 
 **Measure this on prefill's logits, not on next-token accuracy.** The cap was
 first set from one `device_quality.py --prefill 128` run per setting, and two

@@ -28,6 +28,12 @@ from _device_model import open_model
 args = [int(x) for x in sys.argv[1:]]
 CHUNK = args[0] if args else 128
 MOE = args[1:] or [8, 16, 32, 64, 128]
+# One timed run is not a measurement here: consecutive isolated runs of the same
+# configuration came back 925.6 and 1396.0 ms, and 1555.2 ms at the end of a
+# batch of six device processes. Invariant 7 asks for warmup plus samples, and
+# this harness did not do it -- which means the 1.85x and 13.6x it was quoted
+# for were single draws.
+WARM, ITERS = 2, 9
 
 mesh, cfg, m = open_model(max_seq_len=512)
 prompt = [1000] * CHUNK
@@ -37,16 +43,23 @@ for moe_chunk in MOE:
     if moe_chunk > CHUNK:
         continue
     try:
-        m.prefill(prompt, m.new_state(batch=1), chunk=CHUNK, moe_chunk=moe_chunk)  # warm
+        for _ in range(WARM):
+            m.prefill(prompt, m.new_state(batch=1), chunk=CHUNK, moe_chunk=moe_chunk)
     except ValueError as exc:
         print(f"RESULT moe_chunk {moe_chunk:4d}  refused: {exc}", flush=True)
         continue
-    st = m.new_state(batch=1)
-    t0 = time.perf_counter()
-    m.prefill(prompt, st, chunk=CHUNK, moe_chunk=moe_chunk)
-    ttnn.synchronize_device(mesh)
-    dt = (time.perf_counter() - t0) * 1000
-    print(f"RESULT moe_chunk {moe_chunk:4d}  {dt:8.1f} ms  "
+    runs = []
+    for _ in range(ITERS):
+        st = m.new_state(batch=1)
+        t0 = time.perf_counter()
+        m.prefill(prompt, st, chunk=CHUNK, moe_chunk=moe_chunk)
+        ttnn.synchronize_device(mesh)
+        runs.append((time.perf_counter() - t0) * 1000)
+        del st
+    runs.sort()
+    dt = runs[len(runs) // 2]
+    print(f"RESULT moe_chunk {moe_chunk:4d}  median {dt:8.1f} ms  "
+          f"min {runs[0]:8.1f}  max {runs[-1]:8.1f}  "
           f"{CHUNK / (dt / 1000):7.1f} tok/s", flush=True)
     if best is None or dt < best[1]:
         best = (moe_chunk, dt)
