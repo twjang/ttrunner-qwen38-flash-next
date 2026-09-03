@@ -842,6 +842,17 @@ single-K-block config accumulates in a different order, but the rows are now
 consistent and the difference is bf16 rather than corruption. Batch 32 was and
 remains exact.
 
+**Restoring batch invariance was attempted and abandoned.** Threading a
+`single_k_block` flag so decode's expert config no longer depends on the batch
+leaves batch 64 diverging from batch 1 by exactly as much, because the expert
+matmul is not the only batch-dependent op: the *router's* `ttnn.linear` moves
+its probabilities up to 0.53 % between groupings, which is enough to reorder
+experts at the k-th boundary (the same effect that caps `moe_chunk`). The change
+was neutral on quality (85.1 % / NLL 0.683 against 83.0 % / 0.682, one token on
+47) and on step time (234.4 ms against 236.2), so it bought a parameter and a
+comment that claimed something untrue, and was reverted. Above batch 32 a
+sequence's output depends on its batch; document that rather than chase it.
+
 **The residual is not a bug at all**, which took one more measurement to
 establish and is the reason this item can close. The last differing row is
 routing, and the cause is upstream of `topk`: `probs` themselves differ between

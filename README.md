@@ -73,6 +73,14 @@ tile, so batch 64 had **32 of its 64 rows corrupted** and the "bit-exact"
 claim above was simply false. See `docs/HANDOFF.md` 5.8. Batch 32 was and
 remains exact.
 
+Making batch 64 match batch 1 was tried and does not work: forcing the experts'
+program config to be batch-independent leaves the divergence exactly where it
+was, because the *router's* `ttnn.linear` is batch-dependent too — its
+probabilities move up to 0.53 % between groupings, which is enough to reorder
+experts at the top-k boundary. So a sequence's output does depend on how many
+others share its batch, above 32. That is a property to know about, not a bug to
+fix at this level.
+
 Trace capture replays a step with one dispatch. Through `TTModel` it is verified
 token-for-token against eager:
 
