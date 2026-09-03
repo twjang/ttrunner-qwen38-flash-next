@@ -29,6 +29,7 @@ The following all work, which is what makes it specific:
 | A and B the same graph, B with one extra op (kernel already present) | works |
 | A and B the same graph, B with one extra op introducing a **new** kernel | works |
 | two *small* traces, any program counts, alternated | works |
+| replay A many times, **release both traces**, capture C, replay C | **hangs** |
 
 | `step_n` at k=2 and k=**3** — adjacent widths | **hangs** |
 
@@ -104,6 +105,13 @@ model graphs are thousands of ops with hundreds of distinct kernels.
 * **A much larger `trace_region_size`** — 1 GB, against the 256–384 MB the two
   traces need — on the theory that their buffers were colliding in an undersized
   region. Still hangs, so it is not region pressure.
+* **`ttnn.release_trace` on the first trace before capturing and replaying the
+  second.** Still hangs, which is the strongest single hint we have: whatever
+  `enqueue_trace` leaves behind is not undone by releasing the trace that left
+  it. `scripts/dev/traced_step_n_check.py` is the case that shows this — it
+  replays a decode trace many times, releases it and the step_n capture, then
+  captures a fresh step_n and replays that. It reaches its k-loop and never
+  returns, at 40 minutes.
 * **Capture order and allocation.** Capturing both before replaying either,
   allocating all buffers before any capture, capturing on a worker thread,
   `max_seq_len` 512 vs 2048, and an explicit `trace_region_size` (default vs

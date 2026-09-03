@@ -471,8 +471,11 @@ is the **first replay of the verifier**, and a stack dump says so directly --
 
 **It is the interleaving, and it is general.** A speculating engine replays the
 decoder's trace on plain rounds and `step_n` on drafted ones.
-`traced_step_n_check.py` never does that -- it releases both captures before
-replaying `step_n` alone -- which is why no harness ever hung. The defect is not
+`traced_step_n_check.py` was thought not to do that -- it releases both captures
+before replaying `step_n` alone -- and that was the standing explanation for why
+no harness hung. The explanation was wrong: it *does* hang, in its k-loop, and
+releasing the earlier traces does not help (see the exclusions below). The defect
+is not
 about *which* two graphs, either: `spec_capture_ladder.py two_stepn` alternates
 two `step_n` captures (k=2 and k=4) with no decoder involved and hangs the same
 way. **Any two traces replayed alternately hang**, which is also what blocks
@@ -549,6 +552,21 @@ re-shapes every layer rather than adding anything.
 5. A 1 GB `trace_region_size`, against the 256–384 MB the two traces need, in
    case they were colliding in an undersized region — still hangs, so it is not
    region pressure.
+6. `ttnn.release_trace` on the first trace before capturing and replaying the
+   second — still hangs. This is the strongest hint available: what
+   `enqueue_trace` leaves behind is not undone by releasing the trace that left
+   it.
+
+**`traced_step_n_check.py` does not currently complete**, and this item cites it
+as the standalone measurement that works. It replays the decode trace many
+times, releases both captures, then captures a fresh `step_n` and replays it —
+which is the alternation, release or no release. It reaches its k-loop and hangs
+there, verified on a pre-paged worktree as well as on HEAD, so this is not the
+cache refactor. The numbers it produced (255 ms at k=2, 276.6 at k=4, 323.9 at
+k=8) were taken in an earlier session and cannot be reproduced by it today —
+treat them as historical. `step_n`'s *correctness* is unaffected and
+independently checked: `step_n_check.py` passes at k=1, 2, 4 and 8, 0.00 % on
+the hidden, tokens matching, positions right.
 
 There is no host-side lever left that I can see. The one candidate that still
 fits — per-program config-buffer state — cannot be varied from Python; it needs
