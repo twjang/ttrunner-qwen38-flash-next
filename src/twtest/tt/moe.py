@@ -88,6 +88,45 @@ def sparse_program_config(m: int, k: int, n: int, grid_x: int = 10, grid_y: int 
     )
 
 
+def _combine(per_expert, weights, num_experts: int, hidden_size: int):
+    """Weighted sum over the expert axis: [1, E, M, K] x [1, 1, M, E] -> [1, 1, M, K].
+
+    At M = 1 this is one matmul, and that is both the faster and the *more
+    accurate* of the two forms.
+
+    Faster because of the padding. TILE_LAYOUT pads the row axis to 32, so
+    [1, 512, 1, 2560] holds 84 MB to carry 2.6 MB of answer; the elementwise form
+    reads it, writes a product the same size and reads that back to reduce, about
+    254 MB a layer. Reshaping the expert axis into the row axis first packs it to
+    2.6 MB -- exact at M = 1, where each expert contributes one row -- and the
+    weighted sum becomes a matmul against the router weights in the very shape
+    routing produced them, so the permute goes too. 1.298 -> 0.481 ms a layer in
+    isolation, 55.1 -> ~15 ms across 48 layers.
+
+    More accurate because of where the rounding falls. The elementwise form
+    rounds all E products to bfloat16 before adding them; the matmul accumulates
+    them in fp32. Against the exact weighted sum in float64, computed from the
+    device's own operands (`tiny_tile_check.py`):
+
+        sum form     max abs 1.563e-03   mean abs 2.527e-04
+        matmul form  max abs 1.138e-03   mean abs 1.650e-04
+
+    So this is not a speed-for-accuracy trade; it is better on both counts. It is
+    *not* bit-identical to what it replaces, which is why the evidence is here.
+
+    Above M = 1 the packing would interleave (expert, row) and the gate would
+    have to become a mostly-zero [M, E*M] matrix, so those callers keep the
+    elementwise form -- where the row axis is full and the padding argument does
+    not apply anyway.
+    """
+    m = per_expert.shape[-2]
+    if m == 1:
+        packed = ttnn.reshape(per_expert, (1, 1, num_experts, hidden_size))
+        return ttnn.matmul(weights, packed, compute_kernel_config=HIFI4)
+    gate_per_expert = ttnn.permute(weights, (0, 3, 2, 1))
+    return ttnn.sum(ttnn.multiply(per_expert, gate_per_expert), dim=1, keepdim=True)
+
+
 def moe_block(
     x: ttnn.Tensor,
     router_w: ttnn.Tensor,
@@ -147,8 +186,7 @@ def moe_block(
     )                                                     # [1, E, M, K]
 
     # [1, 1, M, E] -> [1, E, M, 1] so it broadcasts over the hidden axis
-    gate_per_expert = ttnn.permute(weights, (0, 3, 2, 1))
-    return ttnn.sum(ttnn.multiply(per_expert, gate_per_expert), dim=1, keepdim=True)
+    return _combine(per_expert, weights, num_experts, hidden_size)
 
 
 def route(x, router_w, top_k: int):
@@ -187,8 +225,7 @@ def apply_experts(x, weights, keep, gate_w, up_w, down_w, num_experts: int,
     per_expert = expert_ffn(
         x, gate_w, up_w, down_w, sparsity, None, num_experts, hidden_size, intermediate_size
     )
-    gate_per_expert = ttnn.permute(weights, (0, 3, 2, 1))
-    return ttnn.sum(ttnn.multiply(per_expert, gate_per_expert), dim=1, keepdim=True)
+    return _combine(per_expert, weights, num_experts, hidden_size)
 
 
 def shared_expert(

@@ -3,7 +3,8 @@
     uv run python scripts/dev/decode_ablation_check.py <part>     (default none)
 
     parts: none moe shared allreduce attn reinject ple
-           expertffn combine routing topk<N>
+           expertffn combine permute routing topk<N>
+           qsa deltanet
 
 Invariant 19 says the eager prefill path is dispatch-bound, and 5.7 says the
 traced step is emphatically not -- removing 97 ops moved it 236.1 -> 236.0 ms.
@@ -45,6 +46,12 @@ elif PART == "allreduce":
 elif PART == "attn":
     model_mod.TTModel._attention_step = lambda self, mixed, *a, **kw: mixed
     model_mod.TTModel._linear_attention_step = lambda self, mixed, *a, **kw: mixed
+elif PART == "qsa":
+    # the 12 full-attention layers only
+    model_mod.TTModel._attention_step = lambda self, mixed, *a, **kw: mixed
+elif PART == "deltanet":
+    # the 36 gated-DeltaNet layers only
+    model_mod.TTModel._linear_attention_step = lambda self, mixed, *a, **kw: mixed
 elif PART == "reinject":
     # reinject(hidden, branch, inject, hc) -> [.., hc*hidden]; `hidden` already is
     model_mod.reinject = lambda hidden, branch, inject, hc: hidden
@@ -68,7 +75,7 @@ elif PART == "expertffn":
         return _ffn_stub[key]
 
     moe.expert_ffn = _stub_ffn
-elif PART in ("combine", "routing"):
+elif PART in ("combine", "routing", "permute"):
     # Split moe_block's non-FFN half. `combine` drops the weighted sum over the
     # expert axis -- [1, 512, 1, 2560], which TILE_LAYOUT pads to 32 rows, so it
     # is 84 MB a layer rather than 2.6. `routing` keeps the combine but feeds it
@@ -108,7 +115,17 @@ elif PART in ("combine", "routing"):
             # take one expert's slab instead of the weighted sum over all E
             return ttnn.reshape(ttnn.slice(per_expert, (0, 0, 0, 0), (1, 1, m, K)),
                                 (1, 1, m, K))
-        gate_per_expert = ttnn.permute(weights, (0, 3, 2, 1))
+        if PART == "permute":
+            key = ("g", E, m)
+            if key not in _cache:
+                import torch
+                _cache[key] = ttnn.from_torch(
+                    torch.full((1, E, m, 1), 1.0 / top_k), dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT, device=mesh,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+            gate_per_expert = _cache[key]
+        else:
+            gate_per_expert = ttnn.permute(weights, (0, 3, 2, 1))
         return ttnn.sum(ttnn.multiply(per_expert, gate_per_expert), dim=1, keepdim=True)
 
     moe.moe_block = _patched
