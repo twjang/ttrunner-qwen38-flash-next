@@ -1370,15 +1370,15 @@ class TTModel:
         # than anything that accumulates. The range said 1..64 and nothing
         # exercised past 8, so the broken half was reachable and unnoticed.
         #
-        # The mechanism is the same one that caps `moe_chunk` and makes batch 64
-        # decode differently from batch 1: past one row tile `per_core_M`
-        # exceeds 1, and `ttnn.sparse_matmul` is only correct there with a
-        # single-K-block program config, which accumulates in a different order
-        # from the narrow one k sequential steps use at m=1. So this is not
-        # corruption -- `step_n_layer_bisect.py` shows 0.385 % at layer 0 rising
-        # smoothly, not a jump -- and it is not fixable here: the two sides
-        # cannot share a configuration, because one of them needs the wide one
-        # to be right at all.
+        # The mechanism is one row tile, and it is not the MoE. A plain
+        # `ttnn.linear` returns a given row identically for any row count that
+        # fits in one 32-row tile and differently past it
+        # (`row_tile_boundary_check.py`), so by the time the experts are reached
+        # every op in the layer has already diverged. Not corruption --
+        # `step_n_layer_bisect.py` shows 0.385 % at layer 0 rising smoothly --
+        # and not fixable here: splitting `expert_ffn` into 32-row groups to
+        # keep `per_core_M` at 1 changes nothing. The same fact caps
+        # `moe_chunk` and makes batch 64 decode differently from batch 1.
         #
         # `step_n` exists to reproduce k sequential steps exactly, so a path
         # that cannot is no use to it whatever the cause. Nothing needs k > 32

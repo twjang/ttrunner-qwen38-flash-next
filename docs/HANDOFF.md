@@ -191,7 +191,18 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     Off *and* over the budget means the device is running a different model, and
     `TTEngine` prints a notice; do not quote a long-context result without
     checking which regime it came from.
-13. **A device matmul is not a float32 matmul.** `ttnn.matmul` on float32
+13. **One row tile is the reproducibility boundary.** A `ttnn.linear` returns a
+    given row *identically* for any row count that fits in one 32-row tile, and
+    differently past it — one bf16 ulp, the same at 33, 48, 64 and 128
+    (`scripts/dev/row_tile_boundary_check.py`). So a row computed among ≤ 32
+    rows and the same row computed among more cannot be compared for equality,
+    whatever the surrounding code does. This sits behind `moe_chunk`'s cap
+    (5.8), batch 64 decoding differently from batch 1, and `step_n` stopping at
+    k=32 (5.5). Do not try to remove it in the model: splitting `expert_ffn`
+    into 32-row groups so `per_core_M` stays 1 changes nothing, because the ops
+    before the experts have already diverged. Distinct from `sparse_matmul`
+    dropping rows past the first tile, which was a real defect and is fixed.
+14. **A device matmul is not a float32 matmul.** `ttnn.matmul` on float32
     inputs, at HiFi4 with `fp32_dest_acc_en`, is **0.16 %** off torch for a
     128x128 -- the Tensix multiplier decomposes fp32 into bf16 pieces. Every
     elementwise op measured is at ~1e-5. So an algorithm that is merely
@@ -204,12 +215,12 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     passed, and *magnitude alone does not reproduce the failure* -- random signs
     cancel inside the powers. Build the fixture the way the model builds the
     tensor (`test_block_inverse_survives_correlated_keys`).
-14. **A per-layer distance still cannot tell noise from a bug** (013's lesson,
+15. **A per-layer distance still cannot tell noise from a bug** (013's lesson,
     re-earned). Chunked prefill's hidden state is ~32 % from the reference by
     position 127 of a chunk and the *token* is fine: 128 tokens prefilled score
     53.1 % against 51.6 % for stepping the same ones. Judge prefill by a
     same-positions decode control, which is what `--score-from` is for.
-15. **Verification standard.** A change to the model is done when (a) unit
+16. **Verification standard.** A change to the model is done when (a) unit
     tests pass, (b) `device_quality.py` is run and next-token accuracy does not
     regress from 83 %, (c) the number it claims to move is measured with the
     hygiene in (7) and (8) -- repeat it, one run has no noise floor -- and
@@ -448,12 +459,12 @@ guard now stops at 32 and says why.
 
 **And it is the same boundary as everything else.** `step_n_layer_bisect.py`
 shows the divergence starting at 0.385 % in layer 0 and rising smoothly, not
-jumping -- so it is accumulation, not corruption -- and the boundary is exactly
-one row tile: k=32 is exact, k=33 is not. Past that, `per_core_M` exceeds 1 and
-`ttnn.sparse_matmul` is only correct with the single-K-block program config,
-which accumulates differently from the narrow one that k sequential steps use at
-m=1. The two sides cannot share a configuration, because one of them needs the
-wide one to be right at all, so this is not fixable here.
+jumping -- accumulation, not corruption -- and the boundary is exactly one row
+tile: k=32 is exact, k=33 is not. The cause is not the MoE: a plain
+`ttnn.linear` already returns a row identically at m <= 32 and differently past
+it (`row_tile_boundary_check.py`), so every op in the layer has diverged before
+the experts are reached. Splitting `expert_ffn` into 32-row groups to keep
+`per_core_M` at 1 was tried and changes nothing (35.68 % becomes 36.72 %).
 
 `step_n` exists to reproduce k sequential steps *exactly*, so a path that cannot
 is no use to it whatever the cause. Nothing needs k > 32 -- speculation caps its
@@ -869,13 +880,22 @@ single-K-block config accumulates in a different order, but the rows are now
 consistent and the difference is bf16 rather than corruption. Batch 32 was and
 remains exact.
 
-**One row tile is the reproducibility boundary throughout this engine.** It caps
-`moe_chunk` here, it is why batch 64 decodes differently from batch 1, and it is
-why `step_n` refuses past k=32 (5.5). All three are the same fact: past one row
-tile `per_core_M` exceeds 1, `ttnn.sparse_matmul` is only correct with the
-single-K-block config, and that config accumulates differently from the narrow
-one used below the boundary. Expect any *new* row-grouping knob to have the same
-ceiling.
+**One row tile is the reproducibility boundary throughout this engine**, and the
+cause is simpler than the MoE. A plain `ttnn.linear` returns a given row
+*identically* for any row count fitting in one 32-row tile and differently past
+it -- by one bf16 ulp, the same amount at 33, 48, 64 and 128
+(`scripts/dev/row_tile_boundary_check.py`). Nothing about the experts is
+involved.
+
+That one fact is behind three findings recorded separately: this cap, batch 64
+decoding differently from batch 1, and `step_n` refusing past k=32 (5.5). Each
+compares a row computed among <= 32 rows against the same row computed among
+more, and that comparison cannot come out equal.
+
+It is not fixable at the model level. Splitting `expert_ffn` into 32-row groups
+so `per_core_M` stays 1 was tried and changes nothing (`step_n` at k=33 goes
+from 35.68 % to 36.72 %), because the ops *before* the experts have already
+diverged. Expect any new row-grouping knob to have the same ceiling.
 
 **Restoring batch invariance was attempted and abandoned.** Threading a
 `single_k_block` flag so decode's expert config no longer depends on the batch
