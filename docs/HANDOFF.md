@@ -874,6 +874,25 @@ calls into `ttnn`, and an injected `reshape` measures **2.1 us**, i.e. it is a
 host-side view that never reaches the device. `reshape` alone is 1094 of that
 total.
 
+**Where a chunk's time actually goes**, measured by ablation rather than inferred
+from the call counts below (`decode_ablation_check.py <part> 128`, baseline
+922.5 ms):
+
+| component | cost | share |
+|---|---|---|
+| DeltaNet chunk, 36 layers | 229.5 ms | 25 % |
+| — of which `prepare_device` | **158.9 ms** | 17 % |
+| — of which `gated_delta_attn_seq` | 18.0 ms | 2 % |
+| the whole MoE compute half | 65.8 ms | 7 % |
+| QSA chunk, 12 layers | 18.5 ms | 2 % |
+
+So prefill and decode are almost inverted: the MoE is 65 % of a traced step and
+7 % of a chunk, and the largest single item here is this project's own DeltaNet
+preparation, not a vendor op. Its masks are already cached and
+`block_diag_inverse_device` is 20 ops for five algebraic levels (`017` picked
+that recursion over a cheaper unstable one), so there is no small fix in it --
+which is the same conclusion this item reaches by the other route.
+
 `--by-caller` attributes each call to the `twtest` line that issued it, which is
 what says where to cut; "multiply, 1993" does not. The distribution is flat --
 the largest single site is 4.2 % -- so expect many small wins rather than one

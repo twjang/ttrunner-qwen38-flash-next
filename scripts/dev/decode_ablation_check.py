@@ -1,10 +1,23 @@
 """Where does the *traced* decode step's 236 ms actually go?
 
-    uv run python scripts/dev/decode_ablation_check.py <part>     (default none)
+    uv run python scripts/dev/decode_ablation_check.py <part> [prefill_tokens]
+
+With a token count it ablates one *chunked prefill* of that many tokens instead
+of the traced step. Prefill is dispatch-bound where the traced step is not
+(invariants 19 and 21), so the two answer different questions -- but "which
+component" is worth knowing on both, and only op counts were known for prefill.
 
     parts: none moe shared allreduce attn reinject ple
            expertffn combine permute routing topk<N>
            qsa deltanet sdpa kvupdate gateup downproj
+           prefill-only seams: applyexperts chunkattn chunkqsa chunkdeltanet
+                               routechunk gdas prepare
+
+Note that the decode seams do nothing to a prefill: it takes the route/
+apply_experts split and `_attention_chunk`, not `moe_block` and
+`_attention_step`. Ablating `moe` on a prefill "saves" 3.5 ms of 922 for exactly
+that reason -- a stub that is never called measures nothing, and the giveaway is
+a component that appears to cost nothing at all.
 
 Invariant 19 says the eager prefill path is dispatch-bound, and 5.7 says the
 traced step is emphatically not -- removing 97 ops moved it 236.1 -> 236.0 ms.
@@ -33,7 +46,7 @@ from _device_model import open_model
 PART = sys.argv[1] if len(sys.argv) > 1 else "none"
 ITERS = 25
 
-mesh, cfg, m = open_model(max_seq_len=4096)
+mesh, cfg, m = open_model(max_seq_len=4096 if len(sys.argv) <= 2 else 512)
 
 # Each stand-in returns a tensor of the shape the real component returns, built
 # from an input that already has it, so the substitution costs nothing at all.
@@ -129,6 +142,59 @@ elif PART in ("combine", "routing", "permute"):
         return ttnn.sum(ttnn.multiply(per_expert, gate_per_expert), dim=1, keepdim=True)
 
     moe.moe_block = _patched
+elif PART == "applyexperts":
+    # the whole MoE compute half of a prefill chunk (routing kept)
+    moe.apply_experts = lambda x, *a, **kw: x
+elif PART == "routechunk":
+    _rc = {}
+
+    def _stub_route(x, router_w, top_k):
+        key = tuple(x.shape)
+        if key not in _rc:
+            import torch
+            E = router_w.shape[-1]
+            m = x.shape[-2]
+            w = ttnn.from_torch(torch.full((1, 1, m, E), 1.0 / top_k),
+                                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+            _rc[key] = (w, w)
+        return _rc[key]
+
+    moe.route = _stub_route
+elif PART in ("gdas", "prepare"):
+    # Split the DeltaNet chunk into the fused ttnn op and the preparation this
+    # project wrote. The stub learns the real output shapes from one call and
+    # then returns cached zeros, so only the first invocation per shape costs
+    # anything and no allocation happens in the timed region.
+    _learn = {}
+
+    def _shape_stub(real):
+        def wrapper(*a, **kw):
+            key = tuple(tuple(t.shape) for t in a if hasattr(t, "shape"))
+            if key not in _learn:
+                out = real(*a, **kw)
+                items = out if isinstance(out, tuple) else (out,)
+                zeros = tuple(ttnn.zeros_like(t) if hasattr(t, "shape") else t
+                              for t in items)
+                _learn[key] = zeros if isinstance(out, tuple) else zeros[0]
+            return _learn[key]
+        return wrapper
+
+    if PART == "gdas":
+        ttnn.transformer.gated_delta_attn_seq = _shape_stub(
+            ttnn.transformer.gated_delta_attn_seq)
+    else:
+        import twtest.tt.deltanet as dn
+        dn.prepare_device = _shape_stub(dn.prepare_device)
+        if getattr(model_mod, "prepare_device", None) is not None:
+            model_mod.prepare_device = dn.prepare_device
+elif PART == "chunkqsa":
+    model_mod.TTModel._attention_chunk = lambda self, mixed, *a, **kw: mixed
+elif PART == "chunkdeltanet":
+    model_mod.TTModel._linear_attention_chunk = lambda self, mixed, *a, **kw: mixed
+elif PART == "chunkattn":
+    model_mod.TTModel._attention_chunk = lambda self, mixed, *a, **kw: mixed
+    model_mod.TTModel._linear_attention_chunk = lambda self, mixed, *a, **kw: mixed
 elif PART == "sdpa":
     # the attention itself, not the projections around it
     _z = {}
@@ -190,22 +256,37 @@ elif PART.startswith("topk"):
 elif PART != "none":
     raise SystemExit(f"unknown part {PART}")
 
-from twtest.tt.traced import TracedDecoder  # noqa: E402
+PREFILL = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 
-state = m.new_state(batch=1)
-dec = TracedDecoder(m, state)
-dec.reset()
-for _ in range(5):
-    dec.step([1000])
+if PREFILL:
+    prompt = [1000] * PREFILL
+
+    def work():
+        st = m.new_state(batch=1)
+        m.prefill(prompt, st)
+else:
+    from twtest.tt.traced import TracedDecoder  # noqa: E402
+
+    state = m.new_state(batch=1)
+    dec = TracedDecoder(m, state)
+    dec.reset()
+
+    def work():
+        dec.step([1000])
+
+ITERS = 7 if PREFILL else ITERS
+for _ in range(2 if PREFILL else 5):
+    work()
 ttnn.synchronize_device(mesh)
 
 samples = []
 for _ in range(ITERS):
     t0 = time.perf_counter()
-    dec.step([1000])
+    work()
     ttnn.synchronize_device(mesh)
     samples.append(1000 * (time.perf_counter() - t0))
 samples.sort()
 med = samples[len(samples) // 2]
-print(f"RESULT ablate={PART:10s} median {med:7.2f} ms  min {samples[0]:7.2f}  "
+what = f"prefill{PREFILL}" if PREFILL else "step"
+print(f"RESULT {what} ablate={PART:10s} median {med:7.2f} ms  min {samples[0]:7.2f}  "
       f"max {samples[-1]:7.2f}", flush=True)

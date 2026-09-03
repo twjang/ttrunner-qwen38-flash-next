@@ -137,6 +137,42 @@ mask computed replicated, which is a collective per layer. Both are real work
 with real risk, and rebuilding a 60 GB cache is not a thing to start without
 asking.
 
+## Observation 6 — prefill is a different machine, and now it is mapped
+
+The same ablation run against a 128-token chunk gives an almost inverted answer,
+which is worth having: 5.7 has priced prefill work off op counts alone since 012.
+
+| ablated | median | its cost |
+|---|---|---|
+| none | 922.5 ms | — |
+| **DeltaNet chunk, 36 layers** | 693.0 | **229.5 ms (25 %)** |
+| of which `prepare_device` | 763.6 | **158.9 ms** |
+| of which `gated_delta_attn_seq` | 904.5 | 18.0 ms |
+| the whole MoE compute half | 856.7 | 65.8 ms (7 %) |
+| QSA chunk, 12 layers | 904.1 | 18.5 ms |
+
+The MoE is 65 % of a decode step and 7 % of a prefill chunk. The DeltaNet
+preparation -- this project's own ttnn port, not a vendor op -- is the largest
+single item at 158.9 ms, and the fused op it feeds is 18. That is the dispatch
+regime doing what invariant 21 says: `prepare_device` issues on the order of
+1500-2000 calls a chunk, and at ~57 us that is most of its cost.
+
+It has no cheap fix. The masks are already cached for the life of the process
+(`_CONSTS`), and `block_diag_inverse_device` is 20 ops for five algebraic levels,
+which is what the blocked recursion costs -- `017` chose it over the telescoping
+form precisely because the cheap-looking one was unstable. Cutting it means
+either fewer, larger ops in the preparation, or capturing the chunk, which is
+5.7's standing answer and is blocked upstream.
+
+**A methodological trap worth recording.** The first prefill ablation reported
+that removing the entire MoE saved 3.5 ms of 922 and removing attention saved
+nothing. Both numbers were real and both were meaningless: prefill takes the
+`route`/`apply_experts` split and `_attention_chunk`, so stubs patched onto
+`moe_block` and `_attention_step` were never called. A stub that is never reached
+measures nothing, and it reports that as *zero cost* rather than as an error. The
+giveaway is a component that appears to cost nothing at all -- when an ablation
+says that, check the seam before believing it.
+
 ## The lesson
 
 Three ideas in this iteration were killed by measurement before being built —
