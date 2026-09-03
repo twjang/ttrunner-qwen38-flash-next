@@ -1362,8 +1362,25 @@ class TTModel:
         k = len(tokens)
         if state.batch != 1:
             raise NotImplementedError("step_n advances one sequence at a time")
-        if not 0 < k <= 64:
-            raise ValueError(f"k must be in 1..64 (the batch cliff), got {k}")
+        # 32, not the batch cliff of 64: `step_n` is exact to k=16 (0.00 % on the
+        # hidden, tokens matching, `step_n_check.py`) and wrong from k=33 --
+        # 35.68 % on the hidden and a different token stream, *identically* at
+        # 33, 48 and 64, which is a structural break at one tile of rows rather
+        # than anything that accumulates. The range said 1..64 and nothing
+        # exercised past 8, so the broken half was reachable and unnoticed.
+        #
+        # Not the MoE, whatever the row count suggests: `moe_rows_check.py` puts
+        # `moe_block` at 64 rows within one row of its per-row answer, and that
+        # one row is the routing tie of 5.8. The remaining candidates are
+        # `_linear_attention_step_n`'s unrolled convolution and recurrence, and
+        # `_attention_step_n`'s per-row reads. Nothing needs k > 32 today --
+        # speculation caps its widths at 17 -- so this refuses rather than
+        # shipping a range half of which is wrong.
+        if not 0 < k <= 32:
+            raise ValueError(
+                f"k must be in 1..32, got {k}. step_n is wrong past one tile of "
+                "rows (35.68 % on the hidden at k=33); see the comment above."
+            )
         if self.use_indexer:
             # `_attention_step_n` reads with `sdpa_decode` per row, which leaves
             # room for a per-row selection mask, but the selection is not wired

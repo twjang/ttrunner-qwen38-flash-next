@@ -74,10 +74,16 @@ def test_step_n_refuses_while_it_lacks_the_sparse_selection() -> None:
     assert "does not carry the QSA selection yet" in src
 
 
-def test_step_n_is_single_sequence_and_bounded_by_the_batch_cliff() -> None:
+def test_step_n_is_single_sequence_and_bounded() -> None:
+    """One sequence, and k bounded by correctness rather than by the batch cliff.
+
+    The bound used to be 64 -- "65 rows pad to 96 tiles and overflow L1" -- which
+    is a real limit but not the binding one: `step_n` is wrong from k=33. See
+    `test_step_n_refuses_k_past_one_tile_of_rows`.
+    """
     src = inspect.getsource(TTModel.step_n)
     assert 'raise NotImplementedError("step_n advances one sequence at a time")' in src
-    assert "0 < k <= 64" in src, "65 rows pad to 96 tiles and overflow L1"
+    assert "0 < k <= 32" in src
 
 
 def test_step_n_grows_the_history_per_row() -> None:
@@ -111,3 +117,24 @@ def test_the_capture_warms_the_single_token_step_too() -> None:
     warm = src[: src.index("begin_trace_capture")]
     assert "model.step([warmup_token] * state.batch, state)" in warm
     assert "model.logits(" in warm
+
+
+def test_step_n_refuses_k_past_one_tile_of_rows() -> None:
+    """`step_n` is wrong from k=33, so the guard stops at 32, not the batch cliff.
+
+    Measured by `scripts/dev/step_n_check.py`: exact at k=1, 2, 4, 8 and 16
+    (0.00 % on the hidden, tokens matching, positions right) and 35.68 % out at
+    k=33, 48 and 64 — the same figure at all three, so it is a structural break
+    at one tile of rows rather than something that accumulates. The range had
+    said 1..64 while nothing exercised past 8.
+
+    Not the MoE: `moe_rows_check.py` puts `moe_block` at 64 rows within one row
+    of its per-row answer, and that row is 5.8's routing tie.
+    """
+    import inspect
+
+    from twtest.tt.model import TTModel
+
+    src = inspect.getsource(TTModel.step_n)
+    assert "0 < k <= 32" in src, "the guard must stop at one tile of rows"
+    assert "0 < k <= 64" not in src, "the old, half-wrong range must be gone"

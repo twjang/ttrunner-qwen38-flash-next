@@ -430,13 +430,28 @@ tuned for -- slot reuse already covers that case, because an idle engine does
 not step and the state simply stays.
 
 
-### 5.5 Short multi-row step — **done** (`step_n`)
+### 5.5 Short multi-row step — **done** (`step_n`), but only to k = 32
 
 `TTModel.step_n(tokens, state)` advances one sequence by k tokens in a single
 step and returns the mixed hidden at all k positions. The k tokens ride the
 batch axis for everything per-token; only the DeltaNet convolution and the
 recurrence are unrolled. Verified to reproduce k sequential steps **exactly**
-(0.00 % at k = 1, 2, 4, 8) with `scripts/dev/step_n_check.py`.
+(0.00 % on the hidden, tokens matching, positions right) at k = 1, 2, 4, 8 and
+16, with `scripts/dev/step_n_check.py`.
+
+**Half its advertised range was wrong.** The guard read `1..64` -- the batch
+cliff, where 65 rows pad to 96 tiles and overflow L1 -- and nothing had ever
+exercised it past 8. At k = 33, 48 and 64 it is **35.68 % out on the hidden**
+with a different token stream, and the same figure at all three, so it is a
+structural break at one tile of rows rather than anything that accumulates. The
+guard now stops at 32 and says why.
+
+Not the MoE, despite the row count pointing there: `moe_rows_check.py` puts
+`moe_block` at 64 rows within one row of its per-row answer, and that row is
+5.8's routing tie. The candidates left are `_linear_attention_step_n`'s unrolled
+convolution and recurrence, and `_attention_step_n`'s per-row reads. Nothing
+needs k > 32 today -- speculation caps its widths at 17 -- so this is walled off
+rather than chased.
 
 Warmed, against 517.8 ms for one eager step (`step_n_bench.py`):
 
@@ -607,7 +622,8 @@ those once showed a *plain* round costing 487.5 ms against a traced 236 because 
 harness was disabling the trace, and the third ended this hunt in one run.
 
 Verified independently and worth keeping: `step_n` reproduces k sequential steps
-(0.00 % on the hidden), `TracedStepN` replays at 255 ms for k=2 against 472 for
+for **k up to 32** (0.00 % on the hidden; it is 35.68 % out from k=33 and the
+guard now refuses that -- see 5.5), `TracedStepN` replays at 255 ms for k=2 against 472 for
 two traced steps, `snapshot`/`restore` roll a discarded draft back identically,
 and the drafter and accept rule are unit-tested. Offline pricing says
 1.70-2.14x on prompts that quote their context, so the ceiling is real.
