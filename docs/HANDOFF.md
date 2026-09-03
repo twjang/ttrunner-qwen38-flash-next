@@ -1040,10 +1040,17 @@ tests `pytest.importorskip("ttnn")`.
 
 ## 7. Where things are written down
 
-* `docs/iterations/NNN_*.md` — the observation → remedy → result log. 012 is
-  the single-user work (trace root cause, op-count floor); 011 is continuous
-  batching, expert fusion, the tile cliff; 009/010 the device bring-up;
-  008 the precision policy; 007 the op validation table.
+* `docs/iterations/NNN_*.md` — the observation → remedy → result log. Read
+  **014** first (why the metric was the bug), then **020** (what the record had
+  drifted from) if you are about to trust a number in here. 019 is the MoE
+  row-group cliff and the `sparse_matmul` row defect; 018 the trace-alternation
+  hang; 017 the DeltaNet inverse and the on-device prepare; 015 the QSA
+  selection; 013 the four correctness bugs; 012 the single-user work (trace root
+  cause, op-count floor); 011 continuous batching, expert fusion, the tile
+  cliff; 009/010 the device bring-up; 008 the precision policy; 007 the op
+  validation table.
+* `docs/upstream/trace_alternation_hang.md` — filing-ready report for the one
+  defect that blocks 5.2's step 5, 5.6 and (by consequence) 5.7.
 * `docs/roadmap_low_batch.md` — what to do next and why, with the numbers.
 * `README.md` — measured performance tables and quick start.
 * `refs/qwen4_exp/` — vendored upstream HF modeling (ignores `mtp.*`).
