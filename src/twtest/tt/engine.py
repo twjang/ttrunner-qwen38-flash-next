@@ -146,18 +146,16 @@ class TTEngine(Engine):
         # acceptance replays 1..speculate-1. Powers of two plus the verify width
         # cover any prefix by composition, so a replay of 5 is 4 then 1.
         # Concurrent captures are fine -- a second live trace was measured not to
-        # slow the first one's replay at all (236.1 vs 236.3 ms) -- but they are
-        # large, so the region is sized for them here, before the mesh opens.
-        # Replaying them *alternately* is a different matter, and it is what
-        # blocks speculation; see the refusal below.
-        self._widths = (
-            sorted({w for w in (2, 4, 8, 16) if w < speculate} | {speculate})
-            if speculate else []
-        )
-        if self._widths:
-            trace_region_bytes = max(
-                trace_region_bytes, (len(self._widths) + 1) * (128 << 20)
-            )
+        # slow the first one's replay at all (236.1 vs 236.3 ms). Replaying two
+        # *alternately* is not, which is why the verifier is eager and this
+        # engine holds exactly one trace; see `_device_loop`.
+        #
+        # Widths the rounds can use: `speculate` to verify, and 2..speculate-1
+        # when a partial acceptance replays j+1 tokens. Each is warmed before
+        # the decoder is captured; none is captured itself.
+        self._widths = list(range(2, speculate + 1)) if speculate else []
+        # No extra trace region for speculation any more: the verifier is eager,
+        # so the decoder's capture is the only one.
         # The trace region has to be reserved at open time; a decode step records
         # on the order of 5 000 ops, so it needs real space.
         self.mesh = ttnn.open_mesh_device(
@@ -352,56 +350,15 @@ class TTEngine(Engine):
                     f"speculate is the tokens fed per verify, 2..17 (it drafts "
                     f"speculate - 1); got {speculate}"
                 )
-            # Refused, and not for performance. The *capture* is fine -- that
-            # was the standing diagnosis for four board resets and it was
-            # wrong. Both traces capture cleanly here; what hangs is replaying
-            # them alternately, which is exactly what a speculating engine does
-            # (plain rounds replay the decoder, drafted rounds replay step_n).
-            # The stack dump lands on `ttnn.execute_trace` in
-            # `TracedStepN.step_n`, and the boards come back only after
-            # `tt-smi -r`; they have done so seven times. A flag that bricks the
-            # accelerators is worse than no flag.
+            # Runs, since the verifier stopped being a second capture. The
+            # hang this used to refuse over needed two traces replayed
+            # alternately; with an eager verifier the decoder's trace is the
+            # only one and is never alternated against anything
+            # (`ttnn_bug_report/`, handoff 5.6).
             #
-            # `scripts/dev/spec_capture_ladder.py` is the sixty-line
-            # reproduction -- no engine, no asyncio, no admission loop:
-            #
-            #   cq 0, replay step_n alone            correct, 265 ms
-            #   cq 0, replay decoder then step_n     HANGS in execute_trace
-            #   cq 1, replay decoder then step_n     returns in 12 ms, WRONG
-            #                                        tokens ([201058, 0] for
-            #                                        [75, 220])
-            #
-            # A second command queue therefore trades the hang for silent
-            # corruption, which is worse, and is not taken. Nor is it a missing
-            # sync: `synchronize_device` with no cq_id already waits on every
-            # queue, and inserting one changes nothing. Nor an intervening eager
-            # program. The mechanism is *not* settled -- a program-count
-            # mismatch fits the model-scale evidence but tiny traces of
-            # differing counts alternate fine, so binary residency is as likely.
-            # See docs/iterations/018.
-            #
-            # Everything else the scheme needs is built and verified on its own.
-            # It is also *not* identical to stepping token by token -- the
-            # verifier batches k rows where the stepper runs one -- so even once
-            # the hang is fixed, "exact" is the wrong word for it.
-            # `TWTEST_ALLOW_SPECULATION=1` lifts the refusal. It exists so the
-            # bisection in 5.6 can drive the *real* engine rather than a
-            # reconstruction of it -- the harnesses never hang, which is the
-            # whole difficulty -- and because two of the excluded causes
-            # produced fixes that are now in place, so the hang has to be
-            # re-tested rather than assumed. Not for serving: if it hangs, the
-            # boards need `tt-smi -r all`.
-            if not os.environ.get("TWTEST_ALLOW_SPECULATION"):
-                raise NotImplementedError(
-                    "speculation is built and verified but not wired: the "
-                    "decoder's trace and the verifier's cannot be replayed "
-                    "alternately. On one command queue the step_n replay hangs "
-                    "in ttnn.execute_trace and the boards need tt-smi -r; on a "
-                    "second queue it returns wrong tokens in 12 ms. See "
-                    "docs/iterations/018, scripts/dev/spec_capture_ladder.py "
-                    "for the sixty-line reproduction, and set "
-                    "TWTEST_ALLOW_SPECULATION=1 to work on it."
-                )
+            # `TWTEST_ALLOW_SPECULATION` is no longer required. It is kept as a
+            # no-op switch name in the ladder harnesses, which still capture two
+            # traces deliberately to reproduce the defect.
             if self.model.use_indexer:
                 raise NotImplementedError(
                     "step_n does not carry the QSA selection yet, so speculation "
@@ -475,6 +432,19 @@ class TTEngine(Engine):
             # run and there is nothing to snapshot.
             mark("warmup step")
             self.model.step([0] * B, state)     # token 0: a harmless warmup
+            # Warm every `step_n` width the rounds can use, *before* the decoder
+            # is captured. Each width is a different set of kernel shapes and
+            # allocates its own 48-layer graph; doing that after a capture
+            # exists is the "Allocating device buffers is unsafe due to the
+            # existence of an active trace" hazard, and it hangs. This is the
+            # same reason `TracedStepN.__init__` warms the single-token step
+            # before capturing -- the eager verifier needs the mirror of it.
+            #
+            # Widths: `speculate` for the verify, and 2..speculate-1 for a
+            # partial acceptance replaying j+1 tokens in one call.
+            for width in range(2, self._speculate + 1):
+                mark(f"warming eager step_n width={width}")
+                self.model.step_n([0] * width, state)
             mark("allocating snapshot buffers")
             snap_buf["s"] = self.model.snapshot(state)
             mark("snapshot buffers allocated")
@@ -507,54 +477,26 @@ class TTEngine(Engine):
                 self._decoder = None
                 print(f"[tt] trace capture failed, falling back to eager: {exc}")
 
-        # k is a *shape* in the step_n graph -- it carries k unrolled convolution
-        # and recurrence steps -- so the verify needs its own capture, and so
-        # does the replay of an accepted prefix, whose length is 1..k.
+        # The verifier runs **eagerly**, and that is the whole reason
+        # speculation works at all on this build. A captured `step_n` would be a
+        # second trace, and replaying two traces alternately -- which is exactly
+        # what a speculating engine does, the decoder on plain rounds and the
+        # verifier on drafted ones -- hangs the device
+        # (`ttnn_bug_report/`, handoff 5.6). One trace, replayed only ever
+        # against itself, is safe.
         #
-        # Capturing every width is too much of both: seven captures for k=8
-        # wanted 145 MB of trace region against the 128 MB allocated, and cost
-        # ~40 s each to compile. A ladder of powers of two plus k covers any
-        # prefix by composition -- a replay of 5 is 4 then 1 -- for four captures
-        # instead of seven. Composing costs a little (4+1 is 513 ms where a
-        # captured 5 would be 288) and only on partial acceptance.
-        verifiers: dict[int, object] = {}
-        widths = self._widths
+        # It costs less than it sounds. Warmed eager `step_n`
+        # (`step_n_bench.py`) is 636 ms at k=2, 816 at k=4, 1197 at k=8 and
+        # 1948 at k=16 -- so per token verified, 318 / 204 / 150 / 122 ms
+        # against a traced step's 236. From k=4 up it is ahead *if the draft is
+        # accepted*, and the drafter earns that on text that quotes itself.
+        #
+        # Going eager also removes the width ladder the captured version
+        # needed: with nothing to compile, any width is free, so a partial
+        # acceptance replays in one `step_n(j+1)` instead of composing powers of
+        # two.
         if self._speculate:
-            try:
-                from .traced import TracedStepN
-
-                for width in widths:
-                    mark(f"capturing step_n width={width}")
-                    verifiers[width] = TracedStepN(self.model, state, width)
-                    mark(f"step_n width={width} captured")
-                self._verifiers = verifiers
-                if self._decoder is not None:
-                    mark("resetting the decoder after the step_n captures")
-                    self._decoder.reset()
-                # rewind what the warmups and the capture consumed. The
-                # decoder's own reset does this too, so it runs only when there
-                # is no decoder.
-                for st_ in ([] if self._decoder is not None else state.layers):
-                    for name in ("recurrent", "conv", "ple_conv", "keys", "values"):
-                        buf = getattr(st_, name)
-                        if buf is None:
-                            continue
-                        for entry in (buf if isinstance(buf, list) else [buf]):
-                            ttnn.copy(
-                                ttnn.zeros(list(entry.shape), dtype=entry.dtype,
-                                           layout=entry.layout, device=self.mesh),
-                                entry,
-                            )
-                    st_.conv_step = 0
-                    st_.ple_step = 0
-                state.positions = [0] * B
-                state.histories = [[] for _ in range(B)]
-                mark("rewound; entering the serve loop")
-            except Exception as exc:
-                for v in verifiers.values():
-                    v.release()
-                verifiers = {}
-                print(f"[tt] speculation capture failed, decoding normally: {exc}")
+            mark("verifier is eager -- no second capture")
 
         def advance(tokens: list[int]):
             if self._decoder is not None:
@@ -589,8 +531,6 @@ class TTEngine(Engine):
 
             feed = [seq.next_token] + draft
             k = len(feed)
-            if k not in verifiers:
-                return False
 
             # Row i predicts the token that follows feed[i], so rows 0..k-2 are
             # predictions of the draft and row k-1 is a genuinely new token.
@@ -600,7 +540,7 @@ class TTEngine(Engine):
             st_["snapshot_s"] += time.perf_counter() - t0
             t0 = time.perf_counter()
             try:
-                verified = self.model.greedy_tokens(verifiers[k].step_n(feed))[:k]
+                verified = self.model.greedy_tokens(self.model.step_n(feed, state))[:k]
                 st_["verify_s"] += time.perf_counter() - t0
             except Exception as exc:
                 seq.out_queue.put(exc)
@@ -622,16 +562,12 @@ class TTEngine(Engine):
                 self.model.restore(state, snap)
                 st_["restore_s"] += time.perf_counter() - t0
                 t0 = time.perf_counter()
-                # compose the replay from the captured widths, largest first
-                pos, remaining = 0, j + 1
-                while remaining:
-                    width = max((w for w in verifiers if w <= remaining), default=1)
-                    if width == 1:
-                        advance(feed[pos : pos + 1])
-                    else:
-                        verifiers[width].step_n(feed[pos : pos + width])
-                    pos += width
-                    remaining -= width
+                # One call, whatever the width: an eager `step_n` needs no
+                # capture, so there is nothing to compose around.
+                if j + 1 == 1:
+                    advance(feed[:1])
+                else:
+                    self.model.step_n(feed[: j + 1], state)
                 st_["replay_s"] += time.perf_counter() - t0
             if prefix[0] is not None:
                 prefix[0].extend(feed[: j + 1])
@@ -726,7 +662,7 @@ class TTEngine(Engine):
             # k tokens for one `step_n` instead of one per step; the accept rule
             # is greedy, so what comes out is exactly what one-at-a-time decoding
             # would have produced.
-            if verifiers and speculate_round(slots[0]):
+            if self._speculate and speculate_round(slots[0]):
                 continue
 
             # One token per slot: the next prompt token while the prompt is still

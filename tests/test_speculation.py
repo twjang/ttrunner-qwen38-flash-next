@@ -170,19 +170,35 @@ def test_speculate_counts_tokens_fed_not_tokens_drafted() -> None:
     assert "and not self._speculate" not in src
 
 
-def test_the_replay_widths_are_a_ladder() -> None:
-    """The verify needs `speculate`; a partial acceptance replays 1..speculate-1.
-    Powers of two plus the verify width cover any prefix by composition, and a
-    second live capture was measured not to slow the first one's replay."""
+def test_the_verifier_is_eager_and_needs_no_capture() -> None:
+    """The verifier must not be a second trace, and the replay needs no ladder.
+
+    Two traces replayed alternately hang this build (`ttnn_bug_report/`), and a
+    speculating engine alternates by construction -- the decoder on plain
+    rounds, the verifier on drafted ones. Running the verifier eagerly leaves
+    the decoder's capture as the only trace, never alternated against anything.
+
+    It also removes the width ladder the captured version needed: with nothing
+    to compile, any width is free, so a partial acceptance replays in one
+    `step_n(j+1)` rather than composing powers of two.
+    """
     import inspect
 
     from twtest.tt.engine import TTEngine
 
-    src = inspect.getsource(TTEngine.__init__)
-    assert "sorted({w for w in (2, 4, 8, 16) if w < speculate}" in src
-    assert "(len(self._widths) + 1) * (128 << 20)" in src
     loop = inspect.getsource(TTEngine._device_loop)
-    assert "max((w for w in verifiers if w <= remaining), default=1)" in loop
+    # Comments stripped: the code explains *why* the verifier is eager by naming
+    # the captured class it replaced, and matching raw source would make that
+    # explanation fail the test it exists for. Same precedent as
+    # `test_prefill_contract._code_of`.
+    code = "\n".join(line.split("#", 1)[0] for line in loop.split("\n"))
+    assert "TracedStepN" not in code, "the verifier must not be captured"
+    assert "self.model.step_n(feed, state)" in code, "it must verify eagerly"
+    assert "self.model.step_n(feed[: j + 1], state)" in code, "and replay in one call"
+    assert "self.model.step_n([0] * width, state)" in code, (
+        "every width must be warmed before the decoder is captured: allocating "
+        "a step_n graph while a trace is live hangs the device"
+    )
 
 
 def test_speculation_snapshots_before_it_verifies() -> None:
@@ -194,7 +210,7 @@ def test_speculation_snapshots_before_it_verifies() -> None:
 
     src = inspect.getsource(TTEngine._device_loop)
     block = src[src.index("def speculate_round("):]
-    assert block.index("self.model.snapshot(state") < block.index("step_n(feed)")
+    assert block.index("self.model.snapshot(state") < block.index("step_n(feed, state)")
     assert "self.model.restore(state, snap)" in block
     # and the buffers are reused, not reallocated every round: ~200 allocations
     # per round is slow, and allocating while a trace is live is the hazard
@@ -212,9 +228,10 @@ def test_close_releases_every_capture_before_closing_the_mesh() -> None:
     src = inspect.getsource(TTEngine.close)
     assert "trace.release()" in src
     assert src.index("trace.release()") < src.index("close_mesh_device")
-    assert "self._verifiers" in src
-    # and the engine keeps hold of them so close can find them
-    assert "self._verifiers = verifiers" in inspect.getsource(TTEngine._device_loop)
+    assert "self._verifiers" in src, (
+        "close must still sweep them: the verifier is eager now, but `close` is "
+        "what stopped a second engine in one process hanging on its own capture"
+    )
 
 
 def test_snapshot_buffers_are_allocated_before_any_capture() -> None:
@@ -228,4 +245,3 @@ def test_snapshot_buffers_are_allocated_before_any_capture() -> None:
     src = inspect.getsource(TTEngine._device_loop)
     alloc = src.index('snap_buf["s"] = self.model.snapshot(state)')
     assert alloc < src.index("TracedDecoder"), "must precede the decoder capture"
-    assert alloc < src.index("TracedStepN"), "must precede the step_n capture"
