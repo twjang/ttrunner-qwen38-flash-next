@@ -8,7 +8,7 @@ n-gram embedding, and hyper-connections in place of every layer norm).
 |---|---|---|
 | 1 | download the 4-bit checkpoint | **done** — UD-IQ4_XS, 93.68 GB, verified |
 | 2 | plain PyTorch CPU reference engine | **done** — token-exact vs llama.cpp |
-| 3 | ttnn engine + custom kernels + async core | **done** — 107.6 tok/s at batch 64, bit-exact vs single-sequence |
+| 3 | ttnn engine + custom kernels + async core | **done** — 107.6 tok/s at batch 64; bit-exact vs single-sequence up to batch 32 |
 | 4 | OpenAI-compatible server | **done** — streaming, continuous batching, 69.3 tok/s at 32 concurrent |
 
 ## Measured performance
@@ -59,6 +59,19 @@ cache above one sequence:
 | 8 | 521.9 | 15.33 |
 | 32 | 517.1 | 61.88 |
 | 64 | 594.8 | **107.59** |
+
+A sequence decodes bit-identically in a batch as it does alone **up to batch
+32**, checked by `scripts/dev/batch_equivalence_check.py` (8/8 and 32/32 rows).
+At batch 64 the rows all agree with each other but not with a batch-1 run: 64
+rows put `per_core_M` at 2 in the experts' `sparse_matmul`, which needs the
+single-K-block program config to be correct at all, and that config accumulates
+in a different order. It is a bf16 difference, not a defect.
+
+It *was* a defect until recently, and a bad one: with the narrow config at
+`per_core_M = 2`, `sparse_matmul` silently drops rows past the first 32-row
+tile, so batch 64 had **32 of its 64 rows corrupted** and the "bit-exact"
+claim above was simply false. See `docs/HANDOFF.md` 5.8. Batch 32 was and
+remains exact.
 
 Trace capture replays a step with one dispatch. Through `TTModel` it is verified
 token-for-token against eager:

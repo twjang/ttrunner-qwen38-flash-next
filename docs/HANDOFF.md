@@ -824,6 +824,24 @@ Result: `moe_block` at 64 rows goes from **33 of 64 rows wrong (worst 102.9 %) t
 1 of 64 (worst 6.8 %)**, with decode (83.0 % / NLL 0.682) and prefill (24.3 % /
 5.648) bit-identical to before.
 
+**It fixed the decode path too, which was not the point of it.** `per_core_M`
+exceeds 1 for decode as soon as the batch does 32, so batch 64 was running its
+experts through the broken configuration. `batch_equivalence_check.py`, same
+prompt in every row:
+
+| | rows agreeing with row 0 | matching a batch-1 run |
+|---|---|---|
+| batch 64, before | **32/64** | 0/64 |
+| batch 64, after | **64/64** | 0/64 |
+| batch 32, either | 32/32 | **32/32** |
+
+So batch 64 was silently corrupting half its rows, and the README's "bit-exact
+vs single-sequence" claim was false there -- including for the 97.4 tok/s figure
+it advertised. Batch 64 still does not reproduce a batch-1 run, because the
+single-K-block config accumulates in a different order, but the rows are now
+consistent and the difference is bf16 rather than corruption. Batch 32 was and
+remains exact.
+
 **The residual is not a bug at all**, which took one more measurement to
 establish and is the reason this item can close. The last differing row is
 routing, and the cause is upstream of `topk`: `probs` themselves differ between
