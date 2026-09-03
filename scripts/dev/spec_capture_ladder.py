@@ -294,6 +294,12 @@ def plus_one():
     try:
         tid = ttnn.begin_trace_capture(mesh, cq_id=0)
         m.step_n(warm, st)
+        # TWTEST_EXTRA_OPS=N appends N ops instead of one, so the two traces'
+        # program counts differ by a lot while B still contains A's programs
+        # unchanged. If that alternates cleanly, appending is safe at any size
+        # and the trigger really is *re-shaping* an operation, not the delta.
+        for _ in range(int(os.environ.get("TWTEST_EXTRA_OPS", "0"))):
+            ttnn.add(pad, pad)
         if os.environ.get("TWTEST_NEW_KERNEL"):
             ttnn.atan(pad)                       # +1 program, and a *new* binary
         else:

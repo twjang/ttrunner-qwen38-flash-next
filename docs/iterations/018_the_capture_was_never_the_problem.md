@@ -133,10 +133,10 @@ A does not). Both alternate cleanly. Nor is it the *size* of the difference,
 which was the next thing written down and also wrong: k=2 against k=3 hangs.
 
 The line the controls draw is narrower and more interesting. Trace B may be
-trace A *plus appended operations* -- new kernels included -- and the pair
-alternates. If the two traces hold differently-shaped versions of the same
-operations, they hang. Changing k re-shapes every layer rather than appending to
-it. Per-program config-buffer state is the candidate that fits, and is untested;
+trace A *plus appended operations* -- one or fifty, new kernels included -- and
+the pair alternates. If the two traces hold differently-shaped versions of the
+same operations, they hang. **B superset of A is safe; B and A disagreeing about
+a shape is not.** Changing k re-shapes every layer rather than appending to it. Per-program config-buffer state is the candidate that fits, and is untested;
 `docs/upstream/trace_alternation_hang.md` carries the whole control set.
 
 ## What is actually established

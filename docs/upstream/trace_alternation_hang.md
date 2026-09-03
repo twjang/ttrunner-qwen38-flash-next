@@ -28,17 +28,21 @@ The following all work, which is what makes it specific:
 | capture the *same graph* twice as A and B, replay A, B, A | works |
 | A and B the same graph, B with one extra op (kernel already present) | works |
 | A and B the same graph, B with one extra op introducing a **new** kernel | works |
+| A and B the same graph, B with **50** extra ops appended | works |
 | two *small* traces, any program counts, alternated | works |
 | replay A many times, **release both traces**, capture C, replay C | **hangs** |
 
 | `step_n` at k=2 and k=**3** — adjacent widths | **hangs** |
 
 The controls draw a sharp line, and it is not about how *different* the graphs
-are. Trace B may be trace A **plus appended operations** — even ones introducing
-a kernel A never uses — and the pair alternates fine. But if the two traces'
-own operations differ in shape or program config, they hang, and k=2 against
-k=3 is enough. `k` is unrolled into the recurrence and convolution, so changing
-it re-shapes every layer rather than adding anything.
+are or by how much. Trace B may be trace A **plus appended operations** — one or
+fifty, including ones that introduce a kernel A never uses — and the pair
+alternates fine. What hangs is the two traces holding **differently-shaped
+versions of the same operations**, and k=2 against k=3 is enough of a difference
+to do it: `k` is unrolled into the recurrence and convolution, so changing it
+re-shapes every layer rather than appending to it.
+
+Put the other way: **B ⊇ A is safe; B and A disagreeing about a shape is not.**
 
 ## Reproduction
 
@@ -64,6 +68,10 @@ PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
 # ... and with that op introducing a new kernel binary: also clean
 PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
   TWTEST_NEW_KERNEL=1 uv run python scripts/dev/spec_capture_ladder.py plus_one 2
+
+# ... and with fifty appended ops, so the counts differ a lot: also clean
+PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
+  TWTEST_EXTRA_OPS=50 uv run python scripts/dev/spec_capture_ladder.py plus_one 2
 
 # adjacent widths, k=2 against k=3: hangs, so magnitude is not the variable
 PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
@@ -142,6 +150,10 @@ further controls separate them, and both pass:
 * `plus_one`: A and B are the same graph, B with one extra `ttnn.add` recorded
   inside the capture. Program counts differ by one, binaries identical.
   Alternates cleanly.
+* `plus_one` with `TWTEST_EXTRA_OPS=50`: fifty appended ops rather than one, so
+  the program counts differ substantially while B still contains A's programs
+  unchanged. Alternates cleanly, ruling out the *size* of the difference as well
+  as its existence.
 * `plus_one` with `TWTEST_NEW_KERNEL=1`: the extra op is `ttnn.atan`, which the
   model never uses, so trace B references a kernel binary trace A does not.
   (It is warmed before capture, since a capture cannot load a new binary.)

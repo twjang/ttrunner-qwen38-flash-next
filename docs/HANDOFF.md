@@ -623,9 +623,11 @@ kernel trace A does not, also alternates cleanly. And magnitude is not it either
 k=2 against **k=3** hangs.
 
 The line the controls actually draw: trace B may be trace A *plus appended
-operations* and the pair alternates fine; if the two traces hold
-differently-shaped versions of the same operations, they hang. Changing k
-re-shapes every layer rather than adding anything.
+operations* -- one or fifty of them (`TWTEST_EXTRA_OPS=50`), new kernels
+included -- and the pair alternates fine; if the two traces hold
+differently-shaped versions of the same operations, they hang. **B superset of A
+is safe; B and A disagreeing about a shape is not.** Changing k re-shapes every
+layer rather than adding anything.
 `docs/upstream/trace_alternation_hang.md` has the full control set.
 
 **What is actually established**, and all of it at model scale:
