@@ -8,8 +8,8 @@ n-gram embedding, and hyper-connections in place of every layer norm).
 |---|---|---|
 | 1 | download the 4-bit checkpoint | **done** — UD-IQ4_XS, 93.68 GB, verified |
 | 2 | plain PyTorch CPU reference engine | **done** — token-exact vs llama.cpp |
-| 3 | ttnn engine + custom kernels + async core | **done** — 97.4 tok/s at batch 64, bit-exact vs single-sequence |
-| 4 | OpenAI-compatible server | **done** — streaming, continuous batching, 37.84 tok/s at 32 concurrent |
+| 3 | ttnn engine + custom kernels + async core | **done** — 107.6 tok/s at batch 64, bit-exact vs single-sequence |
+| 4 | OpenAI-compatible server | **done** — streaming, continuous batching, 69.3 tok/s at 32 concurrent |
 
 ## Measured performance
 
@@ -21,7 +21,7 @@ measured window.
 | | before | after |
 |---|---|---|
 | weight load | 2373 s | **6.0 s** (395×) |
-| decode, batch 64 | 0.75 tok/s | **97.4 tok/s** (130×) |
+| decode, batch 64 | 0.75 tok/s | **107.6 tok/s** (143×) |
 | decode, batch 1 (eager) | 1338 ms | **518 ms** (2.6×) |
 
 ```
@@ -35,7 +35,7 @@ measured window.
 Batch 64 is the last valid step: batch pads to multiples of 32, so 65..96 all
 allocate as 96 and overflow L1 by ~22 %. The table above is the split-expert path;
 fusing the experts' gate and up projections into one `sparse_matmul` (built by
-`scripts/fuse_expert_gate_up.py`) gives **97.4 tok/s** at batch 64 with identical
+`scripts/fuse_expert_gate_up.py`) gives **107.6 tok/s** at batch 64 with identical
 tokens, and is neutral-to-better at every batch size, so the engine uses it
 whenever the prebuilt weights are present:
 
@@ -44,6 +44,21 @@ whenever the prebuilt weights are present:
 | 1 | 522.4 / 520.3 ms | 504.8 / 523.0 ms |
 | 32 | 57.57 / 57.97 tok/s | 59.51 / 58.49 tok/s |
 | 64 | 86.66 / 86.60 tok/s | **97.47 / 97.36 tok/s** |
+
+(That comparison is from before `docs/iterations/013`-`014`; what it establishes
+is the split-vs-fused *relationship*, which is why it is kept. The absolute
+figures on the fixed model are below.)
+
+Re-measured on the model that works, 5 warmup + 25 samples
+(`scripts/dev/bench_batch.py`), which is also the first run of the paged K/V
+cache above one sequence:
+
+| batch | ms/step | tok/s |
+|---|---|---|
+| 1 | 479.0 | 2.09 |
+| 8 | 521.9 | 15.33 |
+| 32 | 517.1 | 61.88 |
+| 64 | 594.8 | **107.59** |
 
 Trace capture replays a step with one dispatch. Through `TTModel` it is verified
 token-for-token against eager:
@@ -92,10 +107,17 @@ added, measured 7.49 s to first token cold against 2.07 s warm.
 
 Throughput-oriented configurations (more slots, shorter context):
 
-| concurrency | tok/s | vs single |
+| concurrency | sustained generation | end to end, 128 tokens out |
 |---|---|---|
-| 8 | 10.18 | 7.2× |
-| 32 | **37.84** | 30.5× |
+| 32 | **69.3 tok/s** | 46.9 tok/s |
+
+Two numbers because they answer different questions. *Sustained generation* is
+tokens over the span in which generation is actually running, which is what a
+loaded server settles at; *end to end* divides by the whole wall clock, so it
+carries prompt ingestion and is a function of how long the prompts are. The
+earlier figure here was 37.84 tok/s with no recorded methodology and was taken
+before the correctness fixes in `docs/iterations/013`-`014`, so it is not
+directly comparable to either. `scripts/dev/bench_server.py` is the harness.
 
 The server feeds prompts one token per step. `TTModel.prefill` is ~71× faster
 (7.2 vs 509.0 ms/token) and is on for one-slot engines; it is refused above that
