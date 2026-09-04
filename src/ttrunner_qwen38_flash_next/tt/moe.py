@@ -215,10 +215,19 @@ def moe_block(
     if WIDE_EXPERTS and up_w is None:
         # Two gathers and two wide matmuls, the second of which also combines.
         # Falls back below if anything about the shapes is unexpected.
+        # Not a silent fallback: swallowing the exception here would leave the
+        # old path running while every measurement above claimed the new one, and
+        # that is exactly the kind of thing that goes unnoticed. Report once.
         try:
             return wide_expert_ffn(x, gate_w, down_w, weights, WIDE_EXPERTS, hidden_size)
-        except Exception:                                   # noqa: BLE001
-            pass
+        except Exception as exc:                            # noqa: BLE001
+            global _WIDE_FELL_BACK
+            if not _WIDE_FELL_BACK:
+                _WIDE_FELL_BACK = True
+                import warnings
+                warnings.warn(
+                    f"wide expert path unavailable, using sparse_matmul: "
+                    f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
 
     per_expert = expert_ffn(
         x, gate_w, up_w, down_w, sparsity, None, e_local, hidden_size, intermediate_size
@@ -416,6 +425,7 @@ _READ_BATCH = 8
 # the worst case for top-10 over four devices and therefore the exact one;
 # smaller values would drop a routed expert when the routing clusters.
 WIDE_EXPERTS = 10
+_WIDE_FELL_BACK = False
 
 
 def _buf(key, shape, dtype, device):

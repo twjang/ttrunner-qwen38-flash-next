@@ -2992,3 +2992,40 @@ isolation and the whole block moved 1.10x, because a new path brings its own
 glue. Price the block, not the piece.
 
 Session: **146.18 -> 91.22 ms**, 1.60x.
+
+### 10.2 What MoE routing costs, op by op
+
+`scripts/dev/route_cost.py`, at the real shapes, inside a trace:
+
+| op | us a layer | over 48 |
+|----|-----------:|--------:|
+| **topk k=10 of 512 (global)** | **94.52** | **4.54 ms** |
+| router linear `[2560, 512]` fp32 | 36.54 | 1.75 ms |
+| topk k=10 of 128 (local -- the wide path added this) | 33.23 | 1.59 ms |
+| divide by sum over 512 | 16.19 | 0.78 ms |
+| softmax over 512 | 9.65 | 0.46 ms |
+| ge over 512 | 5.95 | 0.29 ms |
+| mesh_partition 512 -> 128 | 2.08 | 0.10 ms |
+| **total** | **198.2** | **9.51 ms** |
+
+The global `topk` alone is half the routing, and it exists only to find the
+k-th largest probability as an inclusion threshold. Replacing it with four local
+topks plus a collective prices out at roughly the same (33 + 40 us), so it is
+not obviously improvable without changing what the router selects.
+
+The router's fp32 dtype is not the problem: `[2560, 512]` times identically at
+bfloat16 (36.8 us against 36.9), which is the same finding as section 5.3 -- it
+is not bandwidth-bound.
+
+The 33.23 us local topk is the wide path's own glue, and it is the concrete
+content of invariant 53: 1.59 ms a token added to buy the gathers.
+
+CAUTION on a measurement that did not work: an ablation stubbing out the router
+chain measured **117.98 ms against a 91.09 baseline** -- slower with work
+removed, which cannot be right, so the stub differs from the real path in some
+way that was not chased down. The op-by-op numbers above stand on their own; the
+`wroute` seam does not, and should not be trusted until that is explained.
+
+Also fixed while here: the wide path's fallback to `sparse_matmul` was a silent
+`except: pass`, which would have left the old path running while every
+measurement claimed the new one. It now warns once. Checked: it does not fire.

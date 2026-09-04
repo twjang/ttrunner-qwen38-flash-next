@@ -186,6 +186,27 @@ elif PART == "expertffn":
         return _ffn_stub[key]
 
     moe.expert_ffn = _stub_ffn
+elif PART == "wroute":
+    # The router chain only, on the *wide* expert path: linear, softmax, the
+    # global topk, the threshold, ge, multiply, divide, sum, mesh_partition, max,
+    # to_layout and the local topk -- roughly fourteen ops a layer. moe_block
+    # still measures 42.2 ms with the wide path in place, and the gathers and
+    # matmuls account for about 19 of that, so this is where the rest should be.
+    import ttrunner_qwen38_flash_next.tt.moe as _moe
+    _wc = {}
+
+    def _patched(x, router_w, gate_w, up_w, down_w, top_k, E, K, I):
+        key = (gate_w.shape[1], x.shape[-2])
+        if key not in _wc:
+            import torch
+            w = torch.zeros(1, 1, x.shape[-2], gate_w.shape[1])
+            w[..., : _moe.WIDE_EXPERTS] = 0.1        # a plausible constant gate
+            _wc[key] = ttnn.from_torch(
+                w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=x.device(),
+                mesh_mapper=ttnn.ReplicateTensorToMesh(x.device()))
+        return _moe.wide_expert_ffn(x, gate_w, down_w, _wc[key], _moe.WIDE_EXPERTS, K)
+
+    _moe.moe_block = _patched
 elif PART in ("combine", "routing", "permute"):
     # Split moe_block's non-FFN half. `combine` drops the weighted sum over the
     # expert axis -- [1, 512, 1, 2560], which TILE_LAYOUT pads to 32 rows, so it
