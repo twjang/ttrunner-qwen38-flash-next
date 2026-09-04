@@ -640,6 +640,23 @@ class TTModel:
         state[pos] = x_col
         return ttnn.silu(acc), state
 
+    _FUSED_PAIRS: dict = {}
+
+    def _fused_pair(self, layer: int, left: str, right: str) -> ttnn.Tensor:
+        """Two same-input projections concatenated on their output axis.
+
+        Built once per layer at first use. Cost here follows output *width* and
+        only once the grid is full, so two narrow matmuls against one input are
+        strictly worse than one wider one -- see invariant 55, and
+        `scripts/dev/narrow_linear_cost.py` for the measurements.
+        """
+        key = (layer, left, right)
+        got = self._FUSED_PAIRS.get(key)
+        if got is None:
+            got = ttnn.concat([self.w.blk(layer, left), self.w.blk(layer, right)], dim=-1)
+            self._FUSED_PAIRS[key] = got
+        return got
+
     def _linear_attention_step(self, mixed: ttnn.Tensor, layer: int, st: LayerState) -> ttnn.Tensor:
         cfg = self.cfg
         # local (per-device) head count: q, k and v are all sharded to the same
@@ -678,8 +695,15 @@ class TTModel:
         q = self._l2norm(q, scale=hd**-0.5)
         k = self._l2norm(k)
 
-        a = linear_rows(mixed, self.w.blk(layer, "ssm_alpha.weight"), compute_kernel_config=HIFI4)
-        b = linear_rows(mixed, self.w.blk(layer, "ssm_beta.weight"), compute_kernel_config=HIFI4)
+        # `ssm_alpha` and `ssm_beta` are [2560, 48] each and take the same input,
+        # so they are one matmul with a wider output. Width costs nothing until
+        # it fills the grid -- [2560, 48] and [2560, 96] both measure 31.6 us --
+        # so this halves 2.28 ms a token to 1.14 (invariant 55).
+        ab = self._fused_pair(layer, "ssm_alpha.weight", "ssm_beta.weight")
+        both_ab = linear_rows(mixed, ab, compute_kernel_config=HIFI4)
+        half = both_ab.shape[-1] // 2
+        a = self._slice_last(both_ab, 0, half)
+        b = self._slice_last(both_ab, half, 2 * half)
         dt = self.w.blk(layer, "ssm_dt.bias")
         a_decay = self.w.blk(layer, "ssm_a")
         # g = A * softplus(a + dt_bias); A is stored already negated (= -exp(A_log))

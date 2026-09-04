@@ -3109,3 +3109,38 @@ because cost here follows output *width* and not size. Look for narrow outputs,
 not big tensors -- and prefer widening an existing matmul over adding one.
 
 Session: **146.18 -> 84.01 ms**, 1.74x.
+
+### 12.1 The rest of the narrow outputs, ranked and fused
+
+Every linear weight in the model, sorted by output width (`_exps` excluded):
+
+| tensor | K | N | tiles | calls a token |
+|--------|--:|--:|------:|--------------:|
+| `hc_*_inject` | 10240 | 4 | 0.1 | 96 (fixed, section 12) |
+| `ssm_alpha`, `ssm_beta` | 2560 | 48 | 1.5 | 36 each |
+| `hc_*_down` | 10240 | 320 | 10 | 96 |
+| `ffn_gate_inp` | 2560 | 512 | 16 | 48 |
+| `ffn_gate_shexp`, `ffn_up_shexp` | 2560 | 640 | 20 | 48 each |
+
+The measurement that makes the rule concrete: **`[2560, 48]` and `[2560, 96]`
+cost the same 31.6 us.** Width is free until it fills the grid, so two narrow
+matmuls against one input are strictly worse than one wider one.
+
+Two pairs qualified -- same input, adjacent outputs -- and both are now one
+matmul:
+
+| | before | fused | predicted saving |
+|---|------:|------:|-----------------:|
+| `ssm_alpha` + `ssm_beta` | 2.28 ms | 1.14 | 1.13 |
+| `ffn_gate_shexp` + `ffn_up_shexp` | 3.48 ms | 1.93 | 1.55 |
+
+**84.01 -> 82.73 ms.** Predicted 2.68, measured 1.28, and the difference is
+invariant 53 again: each fusion adds two slices to split the result, 72 and 96
+calls a token, about 0.93 ms of new glue. Quality unchanged -- top-1 85.1 %,
+top-5 97.9 %, NLL 0.662, all identical.
+
+So the rule has a threshold worth stating: fusing two same-input matmuls trades
+one matmul call for two slices, and only pays when the matmul costs more than
+about 11 us. At 31.5 it pays comfortably; at 8 it would not.
+
+Session: **146.18 -> 82.73 ms**, 1.77x.

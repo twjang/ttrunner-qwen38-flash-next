@@ -544,6 +544,9 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size):
     return ttnn.linear(scaled, dw, compute_kernel_config=HIFI4)
 
 
+_SHEXP_GU: dict = {}
+
+
 def shared_expert(
     x: ttnn.Tensor,
     gate_w: ttnn.Tensor,
@@ -552,9 +555,19 @@ def shared_expert(
     gate_vec: ttnn.Tensor,
 ) -> ttnn.Tensor:
     """The always-on expert, with its own sigmoid gate."""
+    # gate and up take the same input, so they are one matmul with a wider
+    # output: 3.48 ms a token becomes 1.93 (invariant 55).
+    key = (id(gate_w), id(up_w))
+    fused = _SHEXP_GU.get(key)
+    if fused is None:
+        fused = ttnn.concat([gate_w, up_w], dim=-1)
+        _SHEXP_GU[key] = fused
+    both = ttnn.linear(x, fused, compute_kernel_config=HIFI4)
+    n = gate_w.shape[-1]
+    e, mrows = both.shape[1], both.shape[2]
     hidden = ttnn.multiply(
-        ttnn.silu(ttnn.linear(x, gate_w, compute_kernel_config=HIFI4)),
-        ttnn.linear(x, up_w, compute_kernel_config=HIFI4),
+        ttnn.silu(ttnn.slice(both, (0, 0, 0, 0), (1, e, mrows, n))),
+        ttnn.slice(both, (0, 0, 0, n), (1, e, mrows, 2 * n)),
     )
     out = ttnn.linear(hidden, down_w, compute_kernel_config=HIFI4)
     return ttnn.multiply(out, ttnn.sigmoid(ttnn.linear(x, gate_vec, compute_kernel_config=HIFI4)))
