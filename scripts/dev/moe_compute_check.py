@@ -42,19 +42,140 @@ w0 = torch.randn(1, E_LOCAL, K, N) * 0.05     # gate, [L, E, K, N]
 w1 = torch.randn(1, E_LOCAL, K, N) * 0.05     # up
 w2 = torch.randn(1, E_LOCAL, N, K) * 0.05     # down, [L, E, N, K]
 
-try:
-    w0w1 = u.prepare_w0_w1_tensor_for_moe_compute(w0, w1, 1, E_LOCAL, K, N, maps[0])
-    print(f"RESULT packed w0w1: {tuple(w0w1.shape)}", flush=True)
-except Exception as exc:                                        # noqa: BLE001
-    print(f"RESULT prepare_w0_w1 rejected: {type(exc).__name__}: "
-          f"{str(exc).splitlines()[0][:200]}", flush=True)
-    raise SystemExit(0)
+w0_w1_map, w2_map, dram_cores = maps
+
+w0w1 = u.prepare_w0_w1_tensor_for_moe_compute(w0, w1, 1, E_LOCAL, K, N, w0_w1_map)
+w2p = u.prepare_w2_tensor_for_moe_compute(w2, 1, E_LOCAL, N, K, w2_map, w0_w1_map)
+print(f"RESULT packed w0w1 {tuple(w0w1.shape)}  w2 {tuple(w2p.shape)}", flush=True)
+
+mem = u.get_weight_mem_configs(1, E_LOCAL, K, N, w0_w1_map, w2_map, dram_cores)
+print(f"RESULT weight mem configs: {len(mem) if hasattr(mem, '__len__') else mem}", flush=True)
+
+rep = ttnn.ReplicateTensorToMesh(mesh)
+shard1 = ttnn.ShardTensorToMesh(mesh, dim=0)          # per-core axis is already 8 == ring
+
+
+def dev(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mapper=rep, mc=None):
+    kw = {"memory_config": mc} if mc is not None else {}
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=mesh, mesh_mapper=mapper, **kw)
+
 
 try:
-    w2p = u.prepare_w2_tensor_for_moe_compute(w2, 1, E_LOCAL, N, K, maps[1], maps[0])
-    print(f"RESULT packed w2: {tuple(w2p.shape)}", flush=True)
+    w0w1_d = dev(w0w1, ttnn.bfloat4_b, mc=mem[0] if hasattr(mem, "__getitem__") else None)
+    w2_d = dev(w2p, ttnn.bfloat4_b, mc=mem[1] if hasattr(mem, "__getitem__") else None)
+    print(f"RESULT weights on device: {tuple(w0w1_d.shape)} {tuple(w2_d.shape)}", flush=True)
 except Exception as exc:                                        # noqa: BLE001
-    print(f"RESULT prepare_w2 rejected: {type(exc).__name__}: "
+    print(f"RESULT weight upload rejected: {type(exc).__name__}: "
           f"{str(exc).splitlines()[0][:200]}", flush=True)
+    ttnn.close_mesh_device(mesh)
+    raise SystemExit(0)
+
+# --- the four dispatch inputs, for a single decode token ---------------------
+B, S = 1, 1
+HEIGHT_SHARD = 1
+# `Silu` is the standard SwiGLU the model uses -- silu(W0.x) * (W1.x) --
+# applied between the W0/W1 and W2 projections. `SwiGluOai` is the OpenAI
+# variant and is not what this checkpoint does.
+_AF = ttnn.operations.ccl.MoEActivationFunction
+ACT = getattr(_AF, 'Silu', None) or getattr(_AF, 'SILU', None) or list(
+    v for k, v in vars(_AF).items() if not k.startswith('_'))[0]
+tok = torch.randn(B, S, 1, K) * 0.1
+sel = torch.randperm(E_TOTAL)[:TOPK].sort().values
+idx = sel.reshape(1, 1, 1, TOPK).to(torch.int32)
+sc = torch.softmax(torch.randn(1, 1, 1, TOPK), dim=-1).to(torch.bfloat16)
+# expert e lives on device e // E_LOCAL -- exactly what the reshard produced
+# The docstring says [1, 1, E, D] with experts on rows. The op asserts rank 2
+# *and* `mapping_shape[0] == num_devices`, so it is [D, E]: row per device,
+# one-hot over the experts resident on it. Expert e lives on device
+# e // E_LOCAL, which is exactly what the expert-axis reshard produced.
+mapping = torch.zeros(NDEV, E_TOTAL, dtype=torch.int32)
+for e in range(E_TOTAL):
+    mapping[e // E_LOCAL, e] = 1
+
+rm = ttnn.ROW_MAJOR_LAYOUT
+try:
+    d_in = dev(tok, ttnn.bfloat16, rm)
+    d_idx = dev(idx, ttnn.uint16, rm)
+    d_sc = dev(sc, ttnn.bfloat16, rm)
+    d_map = dev(mapping, ttnn.uint16, rm)
+    # cluster_axis is required (the op asserts without it) and is the 4-device
+    # axis of the (1, 4) mesh -- the same one the model's all_reduce uses.
+    width_dim = u.auto_output_width_shard_dim(K, matmul_ring_size=ring)
+    drain = ttnn.experimental.get_moe_tilize_drain_core(mesh, HEIGHT_SHARD, width_dim, K)
+    print(f"RESULT width_shard_dim={width_dim} drain_core={drain}", flush=True)
+    # the helper hands back a CoreCoord; the op wants a plain (x, y)
+    drain_xy = (drain.x, drain.y) if hasattr(drain, "x") else tuple(drain)
+    out = ttnn.experimental.all_to_all_dispatch_metadata(
+        d_in, d_idx, d_sc, d_map, cluster_axis=1, drain_sync_tilizer_core=drain_xy,
+    )
+    print(f"RESULT dispatch -> {len(out)} tensors: "
+          f"{[tuple(t.shape) for t in out]}", flush=True)
+except Exception as exc:                                        # noqa: BLE001
+    msg = str(exc) or repr(exc)
+    print(f"RESULT dispatch rejected: {type(exc).__name__}: {msg[:600]}", flush=True)
+    ttnn.close_mesh_device(mesh)
+    raise SystemExit(0)
+
+# --- the fused expert compute ------------------------------------------------
+tok_d, idx_d, sc_d = out
+try:
+    res = ttnn.experimental.moe_compute(
+        tok_d, idx_d, sc_d, d_map, w0w1_d, w2_d,
+        layer_id=0,
+        output_height_shard_dim=HEIGHT_SHARD,
+        intermediate_size=N,
+        activation_type=ACT,
+        compute_only=True,
+    )
+    shapes = [tuple(t.shape) for t in res] if isinstance(res, (list, tuple)) else [tuple(res.shape)]
+    print(f"RESULT moe_compute -> {len(shapes)} tensors: {shapes}", flush=True)
+
+    # Time dispatch + compute together, re-running the dispatch each round.
+    #
+    # Calling `moe_compute` twice on one dispatch hangs the device: the first
+    # call returns, the second never does, with the process idle rather than
+    # spinning. Freeing the first call's five outputs first does not change it,
+    # so it is not output lifetime -- the dispatch outputs are L1-sharded to
+    # specific cores and the compute consumes them. Re-dispatching per round is
+    # also what a real layer does, so this is the honest thing to measure.
+    def round_trip():
+        d = ttnn.experimental.all_to_all_dispatch_metadata(
+            d_in, d_idx, d_sc, d_map, cluster_axis=1, drain_sync_tilizer_core=drain_xy,
+        )
+        r = ttnn.experimental.moe_compute(
+            d[0], d[1], d[2], d_map, w0w1_d, w2_d,
+            layer_id=0, output_height_shard_dim=HEIGHT_SHARD, intermediate_size=N,
+            activation_type=ACT, compute_only=True,
+        )
+        return d, r
+
+    def free(*groups):
+        for g in groups:
+            for t in (g if isinstance(g, (list, tuple)) else [g]):
+                try:
+                    ttnn.deallocate(t)
+                except Exception:
+                    pass
+
+    free(res)
+    del res
+
+    for i in range(3):
+        print(f"RESULT round {i} starting", flush=True)
+        t0 = time.perf_counter()
+        d, r = round_trip()
+        ttnn.synchronize_device(mesh)
+        print(f"RESULT round {i} -> {1000 * (time.perf_counter() - t0):.2f} ms", flush=True)
+        free(d, r)
+        del d, r
+
+    print("RESULT   (current sparse_matmul path at E=128 measured 2.78 ms a layer)",
+          flush=True)
+except Exception as exc:                                        # noqa: BLE001
+    msg = str(exc) or repr(exc)
+    import traceback
+    print(f"RESULT moe_compute rejected: {type(exc).__name__}: {msg[:400]}", flush=True)
+    sig = [l for l in traceback.format_exc().splitlines() if "moe_compute(tilize_input" in l]
+    print("RESULT SIG " + (sig[0][:1500] if sig else "n/a"), flush=True)
 
 ttnn.close_mesh_device(mesh)
