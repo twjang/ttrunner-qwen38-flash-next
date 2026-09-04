@@ -1614,10 +1614,12 @@ its own tokens against its own experts. Build the sparse buffer locally, call
 `moe_compute` per device with `cluster_axis=None`, combine locally, and keep the
 existing all-reduce. No fabric, no semaphore, no drain core.
 
-INVARIANT 28: no multi-device CCL op (`all_to_all_dispatch*`, `all_to_all_combine`,
-`moe_compute` with a `cluster_axis`) works on this Blackhole box. They do not
-error -- they hang at the next synchronisation point, which makes them look like
-a bug in whatever ran afterwards. Keep `cluster_axis=None` and stay local.
+INVARIANT 28 (corrected -- see §4c.3): what hangs is `all_to_all_dispatch`,
+not CCL. `ttnn.all_reduce(cluster_axis=1, topology=Linear)` runs in every layer
+of the live model, and `moe_compute` with a `cluster_axis` runs too once given
+mux cores. The general claim first recorded here was wrong. What does hold is
+the failure *mode*: a broken CCL op does not error, it hangs at the next
+synchronisation point, which makes it look like a bug in whatever ran after.
 
 ### 4c.1 What `moe_compute` costs, and the two constraints that shape the port
 
@@ -1706,20 +1708,58 @@ Our build predates `FullLocal`. The failure we saw quoted
 `moe_compute_device_operation.cpp:473`, which on current main is the 1x1-mesh
 assert; on ours that line was still the unconditional "requires cluster_axis".
 
-INVARIANT 30: `ttnn.experimental.moe_compute` cannot implement `moe_block` on
-the build we run. The usable output requires a combine, and both combines are
-closed to us: FullCcl needs CCL, which hangs here, and FullLocal does not exist
-in this build. The 1.47 ms/layer measured in §4c.1 was a kernel whose result
-cannot be read back.
+INVARIANT 30 (corrected -- see §4c.3): `compute_only=True` has no consumable
+output, and that part stands. But the conclusion drawn from it here -- that the
+port was closed -- did not: `FullCcl` runs on this box and its combine output is
+exactly what we need.
 
-Two things could reopen it, in increasing order of speculation. A tt-metal
-release that fixes all-to-all on Blackhole (tt-metal#27859, #30030) restores
-FullCcl directly. Failing that, a build new enough to have `FullLocal`, driven
-per card through a 1x1 submesh (`create_submesh`), would give a fused combine
-with no fabric at all -- but whether a submesh satisfies `num_devices == 1` and
-whether the surrounding 1x4 tensors can meet it there is unverified, and is the
-first thing to check before spending more on this. The wiring in
-`scripts/dev/moe_compute_check.py` is correct up to the combine and is what to
-restart from either way.
+### 4c.3 The port is open: FullCcl works
 
-The hand-rolled `sparse_matmul` path stays. Decode remains 109.2 ms/token.
+Two earlier conclusions in this section were wrong, and the correction matters
+more than either of them.
+
+CCL is not broken here. The evidence was in our own model the whole time:
+`model.py` calls `ttnn.all_reduce(t, cluster_axis=1, topology=ttnn.Topology.Linear)`
+in every one of the 48 layers, and decode runs. Reading two upstream issues about
+all-to-all and generalising them to "no CCL on Blackhole" was unfounded -- both
+issues are in fact closed, and #30030 records Quietbox and Deskbox passing.
+
+What hangs is `all_to_all_dispatch_metadata` specifically, and the reason is
+almost certainly topology. It takes no topology argument, so it uses whatever
+`get_usable_topology()` resolves, and that helper marks any tensor spanning a
+full mesh row as Ring. Four p150a cards are physically a *line*, so the traffic
+is forwarded across a wrap edge that does not exist and waits forever. The op's
+own source says so and names the workaround:
+
+    // BH LB callers must pass topology=Linear explicitly; the kernel-side
+    // `Topology` template ... multicast through the line-aware code path.
+
+We do not need that op anyway -- the inputs are built locally (§4c).
+
+And the combine kernel supports both topologies, so the guess that MoE was
+Ring-only is not it either:
+
+    TT_FATAL(resolved_topology == Topology::Linear || resolved_topology == Topology::Ring,
+             "moe_compute: combine kernel only supports Topology::Linear or Topology::Ring")
+
+**FullCcl, fed by locally-built inputs, measured 1.86 ms/layer at M=32** (6
+outputs, 1578 ms on the first call for JIT). Three things it needs that the
+local path does not:
+
+- `mux_core_range_set` is **not** optional. Passing None gets you
+  "Not enough mux cores! Needed: 1 (num_links=1 * neighbors.size()=1),
+  Available: 0". `((1,1),(3,3))` is the upstream default.
+- The same mux set must go to `get_moe_tilize_drain_core`, which places the
+  drain core around the mux workers.
+- A global semaphore, and `topology=Linear` passed explicitly.
+
+INVARIANT 31: on this box `moe_compute` runs as FullCcl -- `compute_only=False`,
+`cluster_axis=1`, `topology=Linear`, a mux core range set, and a global
+semaphore -- with inputs built locally rather than dispatched. Never call
+`all_to_all_dispatch*`; it cannot be told the topology and hangs on a line mesh.
+
+Open before this replaces `moe_block`: the combine output is
+`[k, tokens_per_device, hidden]`, **token-sharded across the mesh** -- M=32 came
+back as `(10, 8, 2560)` per device. Our hidden state is replicated and reduced
+with all-reduce, so the data flow changes: sum over k, then all-gather on the
+token axis instead. That plus a float64 numerics check is what remains.

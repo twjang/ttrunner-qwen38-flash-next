@@ -40,6 +40,11 @@ E_LOCAL = E_TOTAL // NDEV
 HEIGHT_SHARD = 4
 ROUNDS = 4
 
+# Fabric is only needed by the FullCcl path, and must be set before the mesh
+# opens. The local paths deliberately run without it.
+if len(sys.argv) > 1 and sys.argv[1] == "ccl":
+    ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+
 mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, NDEV))
 u = ttnn.experimental.moe_compute_utils
 torch.manual_seed(0)
@@ -64,7 +69,16 @@ w0w1_d = ttnn.from_torch(w0w1, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
 w2_d = ttnn.from_torch(w2p, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                        device=mesh, memory_config=w2_mc, mesh_mapper=rep)
 
-drain = ttnn.experimental.get_moe_tilize_drain_core(mesh, HEIGHT_SHARD, width_dim, K)
+# FullCcl carries the combine over fabric through mux workers, which need cores
+# of their own -- "Not enough mux cores! Needed: 1 ... Available: 0" is what
+# passing None gets you. ((1,1),(3,3)) is the upstream default. The drain core is
+# placed around them, so the same set has to go to both.
+MUX = (ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(1, 1), ttnn.CoreCoord(3, 3))])
+       if len(sys.argv) > 1 and sys.argv[1] == "ccl" else None)
+
+drain = ttnn.experimental.get_moe_tilize_drain_core(
+    mesh, HEIGHT_SHARD, width_dim, K,
+    **({"mux_core_range_set": MUX} if MUX is not None else {}))
 drain_crs = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(drain.x, drain.y),
                                               ttnn.CoreCoord(drain.x, drain.y))})
 mapping = (torch.arange(E_TOTAL) // E_LOCAL).to(torch.uint16).unsqueeze(0).repeat(NDEV, 1)
@@ -100,18 +114,62 @@ def build(m):
     return (d_in, d_idx, d_sc), tokens, idx, scores
 
 
-def call(inputs, compute_only=True, out_tensor=None):
+def call(inputs, compute_only=True, out_tensor=None, ccl=None):
+    """`ccl` carries the FullCcl options, or None for the purely local path.
+
+    Topology is forced to Linear rather than left to `get_usable_topology()`,
+    which marks any tensor spanning a full mesh row as Ring. Four p150a cards
+    are physically a line, so the auto-detected Ring sends traffic across a wrap
+    edge that does not exist -- which is what hung the first attempt, since
+    `all_to_all_dispatch_metadata` takes no topology argument at all.
+    """
     return ttnn.experimental.moe_compute(
         inputs[0], inputs[1], inputs[2], d_map, w0w1_d, w2_d,
         layer_id=0, output_height_shard_dim=HEIGHT_SHARD, intermediate_size=N,
-        cluster_axis=None, topology=None, num_links=None,
-        mux_core_range_set=None, optional_cross_device_semaphore=None,
+        cluster_axis=None if ccl is None else 1,
+        topology=None if ccl is None else ttnn.Topology.Linear,
+        num_links=None if ccl is None else 1,
+        mux_core_range_set=None if ccl is None else MUX,
+        optional_cross_device_semaphore=ccl,
         optional_output_tensor=out_tensor,
         activation_type=ttnn.operations.ccl.MoEActivationFunction.SILU,
         compute_only=compute_only)
 
 
 arg = sys.argv[1] if len(sys.argv) > 1 else "combine"
+
+# --- 3. FullCcl: the fused combine over fabric, fed by locally-built inputs ---
+# Never tried in this combination. The earlier full-mode attempt hung, but it
+# also ran `all_to_all_dispatch_metadata` in the same round, and that is the op
+# with no topology argument. `ttnn.all_reduce(cluster_axis=1, Linear)` runs in
+# every layer of the live model, so fabric itself works on this box.
+if arg == "ccl":
+    M = 32
+    inputs, tokens, idx, scores = build(M)
+    grid = mesh.compute_with_storage_grid_size()
+    sem = ttnn.create_global_semaphore(
+        mesh, ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0),
+                                                ttnn.CoreCoord(grid.x - 1, grid.y - 1))}), 0)
+    print("RESULT semaphore created", flush=True)
+    out_t = ttnn.from_torch(torch.zeros(TOPK, M, K, dtype=torch.bfloat16),
+                            dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+                            device=mesh, mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=1))
+    print(f"RESULT combine output allocated {tuple(out_t.shape)}", flush=True)
+    t0 = time.perf_counter()
+    outs = call(inputs, compute_only=False, out_tensor=out_t, ccl=sem)
+    ttnn.synchronize_device(mesh)
+    print(f"RESULT FullCcl ran: {len(outs)} outputs in "
+          f"{1000 * (time.perf_counter() - t0):.1f} ms (incl. JIT)", flush=True)
+    print(f"RESULT combine slot = {tuple(outs[-1].shape)}", flush=True)
+    best = float("inf")
+    for _ in range(ROUNDS):
+        t0 = time.perf_counter()
+        call(inputs, compute_only=False, out_tensor=out_t, ccl=sem)
+        ttnn.synchronize_device(mesh)
+        best = min(best, 1000 * (time.perf_counter() - t0))
+    print(f"RESULT FullCcl steady state: {best:.2f} ms/layer", flush=True)
+    ttnn.close_mesh_device(mesh)
+    raise SystemExit(0)
 
 # --- 1. cost at the row counts we run ---------------------------------------
 if arg != "combine":
