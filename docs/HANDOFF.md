@@ -3299,3 +3299,30 @@ Deployed for the hyper-connection `down|inject` matmul: **~83 -> 82.25 ms**,
 about 1 ms where 1.6 was predicted, with quality inside the run-to-run spread
 (top-1 83.0 %, NLL 0.666). The guard is `groups >= 2`, so a shape whose output
 already fills the grid falls through to `ttnn.linear`.
+
+### 14.1 The k-split does not generalise on a `groups >= 2` guard
+
+Routing every narrow linear in the model through `ksplit_linear` -- one change in
+`linear_rows`, so it would apply everywhere at once -- measured **82.25 ->
+83.68 ms** and moved NLL from 0.666 to 0.691. Reverted.
+
+The guard is the problem. Two or three reduction groups do not earn back the
+kernel launch and the `ttnn.sum`, and the shapes with few groups are also the
+ones where the split's pairwise summation has nothing to pair. The three shapes
+measured say where the line is:
+
+| shape | output tiles | groups | ratio |
+|-------|-------------:|-------:|------:|
+| hc_down `[2560, 320]` | 11 | 10 | 2.12x |
+| router `[2560, 512]` | 16 | 6 | 1.49x |
+| qsa out `[1536, 2560]` | 80 | 1 | 0.79x |
+
+So it wants roughly six groups or more, which on a 110-core grid means an output
+of about sixteen tiles or fewer. That is a per-shape decision made where it has
+been measured, not a rule to apply from `linear_rows`, and the call site now
+says so.
+
+INVARIANT 58: a kernel that beats a stock op on one shape is not an improvement
+to the op. `ksplit_linear` is 2.12x where it was measured and a net loss applied
+generally, because its win depends on how many reduction groups the grid affords
+-- which is a property of the shape, not of the kernel.

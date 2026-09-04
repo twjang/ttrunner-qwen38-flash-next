@@ -97,6 +97,12 @@ def linear_rows(x, w, max_rows: int = ROW_GROUP, **kw):
     """
     m = x.shape[-2]
     if m <= max_rows:
+        # Deliberately *not* routed through `ksplit_linear` here. Applying the
+        # split to every narrow linear in the model measured **82.25 -> 83.68 ms**
+        # and moved NLL from 0.666 to 0.691: a `groups >= 2` guard is too loose,
+        # and the shapes with only two or three reduction groups pay the kernel
+        # launch and the `ttnn.sum` without earning them back. It is a per-shape
+        # decision, made at the call site where it has been measured.
         return ttnn.linear(x, w, **kw)
     shape = list(x.shape)
     outs = []
@@ -298,11 +304,12 @@ def _ksplit_build(a, w, out, groups: int, kt: int, nt: int):
 
 
 def ksplit_linear(x, w):
-    """`x @ w` with the reduction split across cores, or `ttnn.linear` if it would not pay.
+    """`x @ w` with the reduction split across cores, or None if it would not pay.
 
     Only worth it while the output cannot fill the grid on its own: at
-    `[1536, 2560]` the split measured 0.79x and less accurate, so the guard is
-    that the split has to buy at least two reduction groups.
+    `[1536, 2560]` the split measured 0.79x and *less* accurate, so the guard is
+    that the split has to buy at least two reduction groups. Returns None rather
+    than falling back itself, so the caller keeps its own kwargs.
     """
     dev = x.device()
     kt, nt = w.shape[-2] // 32, w.shape[-1] // 32
@@ -310,7 +317,7 @@ def ksplit_linear(x, w):
     n_cores = grid.x * grid.y
     groups = max(1, min(kt, n_cores // max(nt, 1)))
     if groups < 2 or x.shape[-2] > 32:
-        return linear_rows(x, w, compute_kernel_config=HIFI4)
+        return None
 
     key = (id(w), x.shape[-2], groups)
     got = _KSPLIT.get(key)
@@ -401,7 +408,12 @@ def gated_residual_mix(
         part = linear_rows(local, down_w, compute_kernel_config=HIFI4)
     else:
         # One matmul for both: see `down_inject_weight`.
-        part = ksplit_linear(local, down_inject_weight(down_w, inject_w, span))
+        # Measured here: 2.12x and more accurate than `ttnn.linear` (invariant
+        # 57). `ksplit_linear` returns None if the split would not pay.
+        fused_w = down_inject_weight(down_w, inject_w, span)
+        part = ksplit_linear(local, fused_w)
+        if part is None:
+            part = linear_rows(local, fused_w, compute_kernel_config=HIFI4)
     whole = ttnn.all_reduce(part, cluster_axis=1, topology=ttnn.Topology.Linear)
     mix = ttnn.silu(
         whole if inject_w is None
