@@ -20,7 +20,20 @@ import ttnn
 
 from ttrunner_qwen38_flash_next.tt.ops import HIFI4
 
-SHAPES = [("qsa q|gate", 2560, 3072), ("qsa out", 1536, 2560), ("deltanet qkv", 2560, 2048)]
+# The original three all have N >= 2048, and invariant 23 called DRAM sharding a
+# wash on them. That was the wrong sample: `gemv_saturation.py` shows achieved
+# bandwidth tracking the output width, and those three already run at 70-128
+# GB/s. The narrow-output projections are the ones at 5-7 % -- hc_down runs 96
+# times a token and costs 18.77 ms of the step by itself -- and they are exactly
+# what a config "for very narrow tensors stored in DRAM" is for. Added here.
+SHAPES = [
+    ("qsa q|gate", 2560, 3072),
+    ("qsa out", 1536, 2560),
+    ("deltanet qkv", 2560, 2048),
+    ("hc_down  (96/tok)", 10240, 640),      # 26.6 GB/s interleaved -- 7 % of peak
+    ("router   (48/tok)", 2560, 512),       # 19.7 GB/s -- 5 %
+    ("hc_up    (96/tok)", 640, 10240),      # 167.9 GB/s -- the wide control
+]
 BANKS = 8
 TILE = 32
 import os

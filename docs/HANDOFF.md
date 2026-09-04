@@ -2127,3 +2127,40 @@ The stand-in returned a `ttnn.slice` view where the real function returns a
 fresh tensor, and the downstream matmuls appear to have paid for that -- its
 samples spread 135-145 ms where every other ablation held within 2 ms. Prefer
 the narrower ablation, and distrust any delta whose spread is wide.
+
+### 5.1 DRAM sharding does not fix the narrow-output matmuls either
+
+Invariant 23 called `MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig` a
+wash, but it sampled only N >= 2048 -- the shapes already running at 70-128
+GB/s. Re-run with the narrow ones added:
+
+| shape | interleaved | dram-sharded | ratio |
+|-------|-------------|--------------|-------|
+| qsa q\|gate 2560x3072 | 0.060 ms | 0.053 | 1.12x |
+| qsa out 1536x2560 | 0.033 | 0.036 | 0.94x |
+| deltanet qkv 2560x2048 | 0.048 | 0.049 | 0.99x |
+| **router 2560x512** | 0.043 | 0.053 | **0.81x** |
+| **hc_down 10240x640** | 0.139 | rejected (TT_FATAL, tensor spec) | -- |
+| **hc_up 640x10240** | 0.051 | rejected | -- |
+
+So the config that exists "for very narrow tensors stored in DRAM" is *worse*
+on the narrowest shape we have and refuses the two that cost the most. Invariant
+23 stands and now extends: DRAM sharding is not the lever at any N.
+
+`hc_down` reads 0.139 ms here and 0.1387 in `gemv_saturation.py`, so that number
+is solid: 96 calls a token is >= 13.3 ms, and ablating it measured 18.77.
+
+INVARIANT 39: `gated_residual_mix` is the largest single addressable cost in the
+step. It runs 96 times a token (twice a layer) and reads ~9.4 MB of replicated
+weight per call -- hc_norm 1.3, hc_down 3.4, hc_up 3.4, hc_inject 1.3 -- which is
+902 MB/device/token, 3.3 ms at 273 GB/s against the ~19 ms it costs now. The gap
+is scheduling, not bytes: 10240x640 is too narrow to fill the grid and DRAM
+sharding is refused for it. Fusing the whole function into one `generic_op`
+kernel that streams all four weights is the shape of the fix, and the tooling is
+proven (invariant 37).
+
+Do NOT reach for sharding the `hc_*` weights across devices instead: it would cut
+each device's read 4x but add an all_reduce to all 96 calls, and at 3.77 ms per
+48 all_reduces today that is ~7.5 ms of new cost against ~10 ms saved. Measure
+it before believing either number, but it is marginal by construction and it
+does nothing about the narrow output.
