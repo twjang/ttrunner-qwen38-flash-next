@@ -31,7 +31,7 @@ import ttnn
 from ..reference.config import Qwen4ExpConfig
 from ..reference.weights import WeightStore
 from . import linear_attn, moe
-from .ops import linear_rows, HIFI4, gated_residual_mix, grouped_rms_norm, reinject, rms_norm
+from .ops import linear_rows, HIFI4, ksplit_linear, gated_residual_mix, grouped_rms_norm, reinject, rms_norm
 from .weights import TTWeights
 
 
@@ -709,7 +709,11 @@ class TTModel:
         # it fills the grid -- [2560, 48] and [2560, 96] both measure 31.6 us --
         # so this halves 2.28 ms a token to 1.14 (invariant 55).
         ab = self._fused_pair(layer, "ssm_alpha.weight", "ssm_beta.weight")
-        both_ab = linear_rows(mixed, ab, compute_kernel_config=HIFI4)
+        # Three output tiles, the narrowest in the model after the fusion above,
+        # so the grid affords more reduction groups here than anywhere else.
+        both_ab = ksplit_linear(mixed, ab)
+        if both_ab is None:
+            both_ab = linear_rows(mixed, ab, compute_kernel_config=HIFI4)
         half = both_ab.shape[-1] // 2
         a = self._slice_last(both_ab, 0, half)
         b = self._slice_last(both_ab, half, 2 * half)

@@ -3326,3 +3326,24 @@ INVARIANT 58: a kernel that beats a stock op on one shape is not an improvement
 to the op. `ksplit_linear` is 2.12x where it was measured and a net loss applied
 generally, because its win depends on how many reduction groups the grid affords
 -- which is a property of the shape, not of the kernel.
+
+### 14.2 Applied to the two other shapes that qualify
+
+The rule from 14.1 -- roughly six reduction groups or more, so an output of
+about sixteen tiles or fewer on a 110-core grid -- admits exactly two more
+call sites, and both now use it:
+
+- the MoE router, `[2560, 512]`, sixteen output tiles, six groups, measured
+  1.49x standalone
+- the fused `ssm_alpha|beta`, `[2560, 96]`, three output tiles and therefore the
+  most reduction groups of anything in the model
+
+**82.69 -> 82.41 ms**, which is inside the run-to-run spread against 1.15 ms
+predicted, so the honest reading is that the timing gain is not resolvable here.
+Quality moved the other way -- top-1 85.1 % against 83.0, NLL 0.663 against
+0.666 -- which is consistent with the split being the better-conditioned
+summation (invariant 57), and is the reason to keep it rather than the time.
+
+Everything else in the model is either already wide enough that the split
+declines, or has too few calls a token to matter. The narrow-output work is
+finished at this grid size.

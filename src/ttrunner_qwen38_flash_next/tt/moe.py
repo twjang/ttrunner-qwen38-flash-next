@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 import ttnn
 
-from .ops import HIFI4
+from .ops import HIFI4, ksplit_linear
 
 TILE = 32
 _MM1D = ttnn._ttnn.operations.matmul.MatmulMultiCoreReuseMultiCast1DProgramConfig
@@ -189,7 +189,13 @@ def moe_block(
     genuinely reorders two experts across the k-th boundary. So scatter buys
     nothing here. See handoff 5.8.
     """
-    logits = ttnn.linear(x, router_w, compute_kernel_config=HIFI4)
+    # [2560, 512] is sixteen output tiles, so a 110-core grid affords six
+    # reduction groups -- measured 1.49x and more accurate than `ttnn.linear`
+    # (invariant 57). Six is about where the split starts paying; the guard in
+    # `ksplit_linear` declines anything narrower in groups than that pays for.
+    logits = ksplit_linear(x, router_w)
+    if logits is None:
+        logits = ttnn.linear(x, router_w, compute_kernel_config=HIFI4)
     probs = ttnn.softmax(logits, dim=-1, compute_kernel_config=HIFI4)
 
     values, _ = ttnn.topk(probs, k=top_k, dim=-1, largest=True, sorted=True)
