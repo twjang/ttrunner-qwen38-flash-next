@@ -130,44 +130,21 @@ try:
     shapes = [tuple(t.shape) for t in res] if isinstance(res, (list, tuple)) else [tuple(res.shape)]
     print(f"RESULT moe_compute -> {len(shapes)} tensors: {shapes}", flush=True)
 
-    # Time dispatch + compute together, re-running the dispatch each round.
-    #
-    # Calling `moe_compute` twice on one dispatch hangs the device: the first
-    # call returns, the second never does, with the process idle rather than
-    # spinning. Freeing the first call's five outputs first does not change it,
-    # so it is not output lifetime -- the dispatch outputs are L1-sharded to
-    # specific cores and the compute consumes them. Re-dispatching per round is
-    # also what a real layer does, so this is the honest thing to measure.
-    def round_trip():
-        d = ttnn.experimental.all_to_all_dispatch_metadata(
-            d_in, d_idx, d_sc, d_map, cluster_axis=1, drain_sync_tilizer_core=drain_xy,
-        )
-        r = ttnn.experimental.moe_compute(
-            d[0], d[1], d[2], d_map, w0w1_d, w2_d,
-            layer_id=0, output_height_shard_dim=HEIGHT_SHARD, intermediate_size=N,
-            activation_type=ACT, compute_only=True,
-        )
-        return d, r
-
-    def free(*groups):
-        for g in groups:
-            for t in (g if isinstance(g, (list, tuple)) else [g]):
-                try:
-                    ttnn.deallocate(t)
-                except Exception:
-                    pass
-
-    free(res)
-    del res
-
-    for i in range(3):
-        print(f"RESULT round {i} starting", flush=True)
-        t0 = time.perf_counter()
-        d, r = round_trip()
+    # What actually breaks is narrower than "calling it twice". After the first
+    # `moe_compute` returns, the *next device operation of any kind* hangs -- the
+    # run below never reached even a `deallocate`, spinning at ~120 % CPU with the
+    # log frozen. So the question is whether the first call leaves the device in a
+    # state nothing else survives, and the cheapest probe is a trivial op.
+    print("RESULT probing: a plain add after moe_compute", flush=True)
+    t0 = time.perf_counter()
+    try:
+        probe = ttnn.add(d_in, d_in)
         ttnn.synchronize_device(mesh)
-        print(f"RESULT round {i} -> {1000 * (time.perf_counter() - t0):.2f} ms", flush=True)
-        free(d, r)
-        del d, r
+        print(f"RESULT plain add after moe_compute: OK in "
+              f"{1000 * (time.perf_counter() - t0):.1f} ms", flush=True)
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"RESULT plain add rejected: {type(exc).__name__}: "
+              f"{(str(exc) or repr(exc))[:300]}", flush=True)
 
     print("RESULT   (current sparse_matmul path at E=128 measured 2.78 ms a layer)",
           flush=True)

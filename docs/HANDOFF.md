@@ -1561,3 +1561,60 @@ tests `pytest.importorskip("ttnn")`.
 * Upstream's HF source is evidence, not authority: the GGUF converter permutes
   and folds things (the head order, a `+1` in the norm weights, `A = -exp(A_log)`).
   Where they disagree, measure.
+
+## 4c. Why the `moe_compute` port hangs: CCL-on-Blackhole is not functional
+
+Found by reading upstream rather than by bisecting the device, after four runs
+that each wedged the card.
+
+**Symptom.** The first `all_to_all_dispatch_metadata` + `moe_compute` pair
+appears to succeed -- it returns five tensors with plausible shapes -- and then
+the *next device operation of any kind* hangs. Not the second `moe_compute`:
+a bare `ttnn.add` hangs too, at ~120 % CPU with the log frozen. The reason the
+first pair "succeeds" is that ttnn is asynchronous, and reading a shape does not
+synchronise. Nothing had actually run yet. The first genuine synchronisation
+point is where the already-broken dispatch surfaces.
+
+**Cause.** `all_to_all_dispatch` is known-broken on Blackhole upstream:
+
+- tenstorrent/tt-metal#27859, *All to all dispatch not functional on blackhole* --
+  "both 2D and 1D fabric fail, either with a hang or with an error reporting that
+  the node does not contain any neighbours", specifically on 4-device configs.
+- tenstorrent/tt-metal#30030, the same for all-to-all combine.
+- The official single-card test says so in its own header: it exists to be the
+  regression net "without requiring a 6U Galaxy host **or working CCL-on-BH**".
+
+So the hang is not in our wiring. Every multi-device CCL path through this op is
+unsupported on our hardware, and #41827's note that only DeepSeek V3 and Kimi K2.5
+are tested end-to-end means our shapes are untested territory besides.
+
+**What was ruled out along the way**, so nobody re-runs these:
+
+- *Ring size.* `effective_matmul_ring_size()` returns a hardcoded 8 without
+  querying the device, while the op auto-detects from the live DRAM-bank count
+  ("7/8 on BH"). A mismatch would corrupt both the weight layout and the drain
+  core. Measured on our p150a: `get_optimal_dram_bank_to_logical_worker_assignment`
+  gives **8**, so ring 8 and `output_width_shard_dim` 4 were right all along.
+- *Output lifetime.* Freeing the outputs first changes nothing. (Note for later:
+  slots 3 and 4 share a backing buffer -- deallocate 0, 1, 2, 4 only, never 3.)
+- *Input consumption.* Re-dispatching each round changes nothing.
+- *`compute_only` being a partial mode.* Full mode hangs earlier, not later.
+
+**The supported shape of the port.** `tests/ttnn/nightly/unit_tests/operations/
+experimental/test_moe_compute_single_card.py` runs the op with no CCL at all:
+it builds the four inputs directly on device -- `gen_sparse_buffer_and_indices`
+exists precisely to simulate "output from all_to_all_dispatch" -- and passes
+`cluster_axis=None, topology=None, num_links=None, mux_core_range_set=None,
+optional_cross_device_semaphore=None`.
+
+That fits our layout rather than fighting it. We already shard the 512 experts
+across the four cards (`Shard.EXPERT`, 128 local each) and all-reduce afterwards,
+so there is nothing for a device-to-device dispatch to do: each card needs only
+its own tokens against its own experts. Build the sparse buffer locally, call
+`moe_compute` per device with `cluster_axis=None`, combine locally, and keep the
+existing all-reduce. No fabric, no semaphore, no drain core.
+
+INVARIANT 28: no multi-device CCL op (`all_to_all_dispatch*`, `all_to_all_combine`,
+`moe_compute` with a `cluster_axis`) works on this Blackhole box. They do not
+error -- they hang at the next synchronisation point, which makes them look like
+a bug in whatever ran afterwards. Keep `cluster_axis=None` and stay local.
