@@ -49,7 +49,7 @@ def split_work(total: int, n: int):
     return [((total * c) // n, (total * (c + 1)) // n) for c in range(n)]
 
 
-def build_gather(weights, indices, out, grid, k_sel: int, wide: bool = True):
+def build_gather(weights, indices, out, grid, k_sel: int, wide: int = 1):
     cores = core_list(grid)
     crs = ttnn.CoreRangeSet(
         [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
@@ -87,7 +87,7 @@ def build_gather(weights, indices, out, grid, k_sel: int, wide: bool = True):
     # K_SEL also separates program-cache entries: generic_op hashes compile-time
     # args by value but runtime args only by count (handoff 4g).
     ct_args = [tiles_per_expert, tile_bytes, READ_BATCH, idx_bytes,
-               weights.shape[1], k_sel, nt, 1 if wide else 0]
+               weights.shape[1], k_sel, nt, wide]
     ct_args += accessors["w"] + accessors["i"] + accessors["o"]
 
     addrs = (weights.buffer_address(), indices.buffer_address(), out.buffer_address())
@@ -134,14 +134,22 @@ def main() -> None:
                                    layout=ttnn.TILE_LAYOUT, device=mesh,
                                    mesh_mapper=replicate)
 
-        prog = build_gather(w, idx_dev, gathered, grid, K_SEL)
+        WIDE = int(__import__("os").environ.get("TT_GATHER_WIDE", "1"))
+        prog = build_gather(w, idx_dev, gathered, grid, K_SEL, WIDE)
+        print(f"RESULT layout WIDE={WIDE}", flush=True)
 
         # --- correctness first ---------------------------------------------
         ttnn.generic_op([w, idx_dev, gathered], prog)
         ttnn.synchronize_device(mesh)
         got = ttnn.to_torch(gathered, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
         ref_full = ttnn.to_torch(w, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
-        want = torch.cat([ref_full[:, e, :, :] for e in ids], dim=-1).unsqueeze(1)
+        if WIDE == 2:
+            half = N // 2
+            want = torch.cat(
+                [ref_full[:, e, :, :half] for e in ids]
+                + [ref_full[:, e, :, half:] for e in ids], dim=-1).unsqueeze(1)
+        else:
+            want = torch.cat([ref_full[:, e, :, :] for e in ids], dim=-1).unsqueeze(1)
         err = (got.to(torch.float64) - want.to(torch.float64)).abs().max().item()
         print(f"RESULT gather vs torch index: max abs err {err:.3e} "
               f"{'EXACT' if err == 0.0 else 'MISMATCH'}", flush=True)

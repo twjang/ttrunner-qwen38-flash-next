@@ -39,8 +39,15 @@
 // combine, for free. Stacking [N, K] slabs on rows is exactly `dst = w`, the
 // straightforward compact layout, so one flag covers both:
 //
-//   WIDE=1 (gate/up):  dst = kt * (K_SEL * NT) + slot * NT + nt
-//   WIDE=0 (down):     dst = w
+//   WIDE=1 (plain wide):  dst = kt * (K_SEL * NT) + slot * NT + nt
+//   WIDE=0 (down):        dst = w
+//   WIDE=2 (gate|up):     as 1, but with every expert's gate half moved ahead of
+//                         every expert's up half, so the fused SwiGLU kernel --
+//                         which splits its input down the middle -- works on the
+//                         result unchanged. With HALF = NT/2:
+//                           nt <  HALF: dst = kt*(K_SEL*NT) + slot*HALF + nt
+//                           nt >= HALF: dst = kt*(K_SEL*NT) + K_SEL*HALF
+//                                             + slot*HALF + (nt - HALF)
 //
 // Positional compile-time args, in the order the host appends them:
 //   0: TILES_PER_EXPERT   (Kt*Nt)
@@ -142,7 +149,13 @@ void kernel_main() {
                 // columns at offset slot * NT within a row of OUT_ROW_TILES.
                 const uint32_t ti = tt + i;
                 uint32_t dst;
-                if (WIDE) {
+                if (WIDE == 2) {
+                    constexpr uint32_t HALF = NT / 2;
+                    const uint32_t kt = ti / NT;
+                    const uint32_t nt = ti - kt * NT;
+                    dst = kt * OUT_ROW_TILES + slot * HALF
+                          + (nt < HALF ? nt : (K_SEL * HALF) + (nt - HALF));
+                } else if (WIDE == 1) {
                     const uint32_t kt = ti / NT;
                     const uint32_t nt = ti - kt * NT;
                     dst = kt * OUT_ROW_TILES + slot * NT + nt;

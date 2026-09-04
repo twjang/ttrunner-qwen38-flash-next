@@ -2906,9 +2906,33 @@ kernel. Priced separately at 0.0411 ms a layer.
 
 So the whole MoE becomes: gather gate|up, one wide matmul, SwiGLU over a
 `[1, 1, 1, K_SEL*2N]` tensor instead of `[1, 128, 1, 1280]`, scale by the router
-weights, gather down, one wide matmul that also combines. Roughly **9 ms a token
-against the ~40 that `expert_ffn` plus its SwiGLU chain plus `_combine` cost
-now**, and it removes the 1.51 GB zero-fill (invariant 40) on the way.
+weights, gather down, one wide matmul that also combines -- and it removes the
+1.51 GB zero-fill (invariant 40) on the way.
+
+**Correction to the headline above: 4.48 ms is K_SEL=3, which is the expected
+per-device count and not a safe one.** Ten experts scattered over four devices
+put more than three on one device often, and truncating would drop a routed
+expert. The exact worst case is K_SEL=10, and the cost scales with it:
+
+| K_SEL | gather | matmul | over 48 layers |
+|-------|-------:|-------:|---------------:|
+| 3 (expected) | 0.0465 | 0.0478 | 4.48 ms |
+| 6 | 0.0907 | 0.0558 | 6.97 ms |
+| **10 (exact)** | 0.1503 | 0.0719 | **10.60 ms** |
+
+All three bit-exact against torch. At the safe width the gate/up half is 10.60
+against 30.83 for *both* projections today, so the honest projection for the
+whole MoE is **~19 ms against ~33**, about **14 ms a token** -- still the largest
+single item left, but not the 24 the K_SEL=3 number implied.
+
+The gather dominates at large K_SEL (0.150 against 0.072 for the matmul) because
+it copies the weights before the matmul reads them. Removing that copy needs a
+matmul kernel that reads scattered experts directly, which is the fused kernel
+this approach was chosen to avoid.
+
+A third layout, `WIDE=2`, puts every expert's gate half ahead of every expert's
+up half, so the fused SwiGLU kernel -- which splits its input down the middle --
+works on the result unchanged. Bit-exact, and free: 0.0466 ms against 0.0465.
 
 INVARIANT 52: at M=1 the layout of a gather decides whether it is worth doing.
 The same bytes, gathered into an expert *batch*, lose to `sparse_matmul`;
