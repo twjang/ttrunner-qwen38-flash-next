@@ -344,34 +344,40 @@ def test_reinject_broadcast_equals_the_slice_form() -> None:
     assert torch.equal(broadcast_form, reference)
 
 
-def test_the_hyper_connection_mix_averages_by_slicing_not_reshaping() -> None:
-    """Four tile-aligned slices, not a reshape plus `mean`.
+def test_the_hyper_connection_mix_averages_in_one_fused_kernel() -> None:
+    """One `generic_op` pass, not `mean` and not a slice chain.
 
-    This test used to assert the opposite, and the reason it flipped is worth
-    keeping. `mean` over a reshaped stream axis is one op against nine, and one
-    op was the right call while the win being chased was *dispatch*: it was
-    worth 29.6 ms eager (498.7 -> 469.1) and nothing traced, because a trace
-    replays with a single dispatch.
+    This assertion has now moved twice, and the sequence is the useful part
+    because each step was a measurement rather than a preference:
 
-    But the op is not free on the device either. Splitting the last dimension in
-    TILE layout re-tiles the tensor rather than relabelling it, and
-    `reshape [1,1,32,10240] -> [1,32,4,2560]` measures **92.30 us** a call
-    against 4.43 for a tile-aligned slice on the same tensor
-    (`tiny_op_cost.py`). At 97 calls a token that is 8.95 ms of a 104 ms step,
-    and the nine-op form is ~40 us.
+    1. `reshape` + `ttnn.mean` -- one op, chosen when the win being chased was
+       host dispatch (29.6 ms eager, nothing traced).
+    2. Four tile-aligned slices plus three adds -- because splitting the last
+       dimension in TILE layout re-tiles rather than relabels. That is 92.30 us
+       a call at M=32... but only 4.43 at the M=1 decode actually runs, which is
+       why replacing it measured 0.23 ms where 5.3 was predicted. Benchmark at
+       the shape the model uses.
+    3. One fused kernel. The nine ops round-trip ~11 MB a call and each pays
+       ~5.5 us of fixed per-op cost whatever it touches, so the chain is 45.62 us
+       against 8.12 for a `generic_op` launch that reads eight tiles per output
+       tile and keeps the products in registers -- **5.62x, 3.64 ms a token**.
 
-    The arithmetic is identical -- the flattened layout is stream-major, so
-    stream h is columns [h*hidden, (h+1)*hidden), and a mean over four elements
-    is their sum over four.
+    The fallback path stays in `fused_gated_mean` and is what these last two
+    assertions pin: if `generic_op` is ever unavailable the slice form must still
+    be there, and it must still be a sum scaled by 1/hc rather than a `mean` over
+    a reshape.
     """
     import inspect
 
-    from ttrunner_qwen38_flash_next.tt.ops import gated_residual_mix
+    from ttrunner_qwen38_flash_next.tt import ops
 
-    src = inspect.getsource(gated_residual_mix).split("inject = None")[0]
-    assert "ttnn.mean(" not in src, "the reshape+mean form costs 92.3 us a call"
-    assert "1.0 / hc_count" in src, "the sum still has to be scaled"
-    assert "for h in range(hc_count)" in src, "one slice per stream"
+    src = inspect.getsource(ops.gated_residual_mix).split("inject = None")[0]
+    assert "fused_gated_mean(" in src, "the tail is one kernel pass"
+    assert "ttnn.mean(" not in src
+
+    fallback = inspect.getsource(ops.fused_gated_mean)
+    assert "1.0 / hc_count" in fallback, "the fallback still has to scale the sum"
+    assert "ttnn.mean(" not in fallback, "the reshape+mean form re-tiles; do not go back"
 
 
 def test_sparse_matmul_uses_one_k_block_past_a_row_tile() -> None:

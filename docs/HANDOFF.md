@@ -2525,3 +2525,40 @@ launch is not cheaper than that.
 
 Session so far: **146.18 -> 99.38 ms**, 1.47x, no precision spent that the
 quality harness could see.
+
+### 7.1 Deployed: a fused gate-and-average for the hyper-connection block
+
+`scripts/kernels/gated_mean_{reader,compute,writer}.cpp`, wired into
+`ops.gated_residual_mix` as `fused_gated_mean`. **99.38 -> 96.67 ms a token.**
+
+It replaces the tail of that function -- `multiply(mix, normed)` over a
+10240-wide pair, four tile-aligned slices to pull out the hc streams, three adds
+and a scale. Nine ops, ~11 MB round-tripped between them, and each paying ~5.5 us
+of fixed per-op cost whatever it touches.
+
+| | us/call | over 97 calls |
+|---|-------:|--------------:|
+| multiply + 4 slices + 3 adds + scale | 45.62 | 4.42 ms |
+| **fused kernel** | **8.12** | **0.79 ms** |
+
+**5.62x** standalone, 2.71 ms in the model. One output tile reads eight input
+tiles and writes one; the four products and three adds stay in the destination
+registers. Quality held: top-1 85.1 % against 83.0, top-5 97.9 % both, NLL 0.675
+against 0.663 -- all inside the spread of a 47-token sample, and well clear of
+the float32 reference's 80.9 % / 0.703. The fused form accumulates in fp32
+registers where the chain wrote bfloat16 between every step, so it is if anything
+the better-conditioned of the two.
+
+The averaging assertion in `tests/test_tt_plan.py` has now moved twice and the
+sequence is worth keeping: `reshape`+`mean` (chosen for host dispatch) ->
+four slices (because a TILE-layout reshape re-tiles) -> one fused kernel. Each
+step was a measurement, and the middle one taught the lesson about benchmarking
+at M=1.
+
+INVARIANT 47: a `generic_op` launch costs ~8.1 us here, against ~5.5 for a ttnn
+op. So fusing pays from **two** ops upward on the launch count alone, and more
+where the ops round-trip a real intermediate. That is a much lower bar than it
+looked: the two kernels deployed so far replaced four ops and nine.
+
+Session: **146.18 -> 96.67 ms, 1.51x**, with no precision the quality harness
+can see.

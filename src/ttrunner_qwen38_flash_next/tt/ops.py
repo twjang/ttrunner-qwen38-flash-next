@@ -17,6 +17,10 @@ Two ttnn facts shape this file:
 
 from __future__ import annotations
 
+import struct
+from pathlib import Path
+
+import torch
 import ttnn
 
 # Blackhole prefers fp32 accumulation for anything that feeds a norm or a
@@ -103,6 +107,123 @@ def linear_rows(x, w, max_rows: int = ROW_GROUP, **kw):
     return ttnn.concat(outs, dim=-2)
 
 
+# --- fused gate-and-average --------------------------------------------------
+#
+# The tail of `gated_residual_mix` was nine ttnn ops: multiply(mix, normed) over
+# a 10240-wide pair, four tile-aligned slices to pull out the hc streams, three
+# adds and a scale. They round-trip ~11 MB a call between them, and each pays
+# ~5.5 us of fixed per-op cost whatever it touches (invariant 42) -- ~50 us
+# before any data moves, against a `generic_op` launch measured at 8.1.
+#
+# Fused, one output tile reads eight input tiles and writes one, and the four
+# products and three adds live in the destination registers:
+# **45.62 -> 8.12 us a call, 5.62x, 3.64 ms a token**
+# (`scripts/stage4_gated_mean.py`). The fused form also accumulates in fp32
+# registers where the chain wrote bfloat16 between every step, so if anything it
+# is the better-conditioned of the two.
+_KDIR = Path(__file__).resolve().parents[3] / "scripts" / "kernels"
+_GM_OUT: dict = {}
+
+
+def _gated_mean_output(src, hidden_size: int):
+    """The persistent output, one per (device, shape, dtype).
+
+    `generic_op` needs its output pre-allocated, and allocating inside a trace
+    capture corrupts the replay. One buffer serves every call because each is
+    consumed before the next runs and a trace replays in order.
+    """
+    key = (id(src.device()), src.shape[1], src.shape[2], hidden_size, str(src.dtype))
+    out = _GM_OUT.get(key)
+    if out is None:
+        out = ttnn.from_torch(
+            torch.zeros(1, src.shape[1], src.shape[2], hidden_size),
+            dtype=src.dtype, layout=ttnn.TILE_LAYOUT, device=src.device(),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(src.device()),
+        )
+        _GM_OUT[key] = out
+    return out
+
+
+def _gated_mean_program(a, b, out, hc_count: int):
+    """Descriptors for this call's buffer addresses.
+
+    Rebuilt per call because `a` and `b` are fresh allocations and their
+    addresses are runtime args. The cost is host-side and paid at trace capture,
+    not at replay.
+    """
+    grid = a.device().compute_with_storage_grid_size()
+    cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
+    crs = ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
+    )
+    acc = {}
+    for tag, t in (("a", a), ("b", b), ("o", out)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError("fused gated-mean wants interleaved tensors")
+        acc[tag] = ct
+    tile_bytes = acc["a"][1]
+
+    nt_out = out.shape[-1] // 32
+    rows = max(out.shape[2] // 32, 1) * out.shape[1]
+    total = rows * nt_out
+    work = [((total * c) // len(cores), (total * (c + 1)) // len(cores))
+            for c in range(len(cores))]
+
+    cbs = [ttnn.CBDescriptor(
+        total_size=(hc_count + 1) * tile_bytes, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=a.dtype, page_size=tile_bytes)])
+        for i in (0, 1)]
+    cbs.append(ttnn.CBDescriptor(
+        total_size=2 * tile_bytes, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=2, data_format=out.dtype, page_size=tile_bytes)]))
+
+    inv_bits = struct.unpack("<I", struct.pack("<f", 1.0 / hc_count))[0]
+
+    def kern(name, ct, args, cfg):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfg)
+
+    return ttnn.ProgramDescriptor(
+        kernels=[
+            kern("gated_mean_reader.cpp",
+                 [nt_out, hc_count, tile_bytes] + acc["a"] + acc["b"],
+                 [[a.buffer_address(), b.buffer_address(), lo, hi] for lo, hi in work],
+                 ttnn.ReaderConfigDescriptor()),
+            kern("gated_mean_compute.cpp", [hc_count, inv_bits],
+                 [[hi - lo] for lo, hi in work], ttnn.ComputeConfigDescriptor()),
+            kern("gated_mean_writer.cpp", [tile_bytes] + acc["o"],
+                 [[out.buffer_address(), lo, hi] for lo, hi in work],
+                 ttnn.WriterConfigDescriptor()),
+        ],
+        semaphores=[], cbs=cbs)
+
+
+def fused_gated_mean(mix, normed, hc_count: int, hidden_size: int):
+    """(1/hc) * sum_h mix_h * normed_h, in one pass. Falls back to the ops."""
+    try:
+        out = _gated_mean_output(mix, hidden_size)
+        ttnn.generic_op([mix, normed, out], _gated_mean_program(mix, normed, out, hc_count))
+        return out
+    except Exception:                                               # noqa: BLE001
+        gated = ttnn.multiply(mix, normed)
+        parts = [
+            ttnn.slice(gated, (0, 0, 0, h * hidden_size),
+                       (gated.shape[0], gated.shape[1], gated.shape[2],
+                        (h + 1) * hidden_size))
+            for h in range(hc_count)
+        ]
+        total = parts[0]
+        for nxt in parts[1:]:
+            total = ttnn.add(total, nxt)
+        return ttnn.multiply(total, 1.0 / hc_count)
+
+
 def gated_residual_mix(
     hyper: ttnn.Tensor,
     norm_w: ttnn.Tensor,
@@ -145,30 +266,10 @@ def gated_residual_mix(
     mix = ttnn.sigmoid(linear_rows(mix, up_w, compute_kernel_config=HIFI4))
     gated = ttnn.multiply(mix, normed)
 
-    # Mean over the hc_count streams, by slicing rather than reshaping.
-    #
-    # The obvious form -- reshape to [.., M, hc, hidden] and `mean` over the
-    # stream axis -- reads well and costs 92.3 us a call, because splitting the
-    # last dimension in TILE layout re-tiles the whole tensor rather than
-    # relabelling it. At 97 calls a token that single reshape was **8.95 ms** of
-    # a 104 ms step (`tiny_op_cost.py`).
-    #
-    # The flattened layout is stream-major, so stream h is just columns
-    # [h*hidden, (h+1)*hidden) -- and a slice on the last dimension at a
-    # multiple of 32 is tile-aligned, measured at 4.43 us. Four of those plus
-    # three adds and one scalar multiply is ~40 us against ~95, and the output
-    # needs no reshape because the slices already have the right shape.
-    #
-    # Same arithmetic: `mean` over four elements is their sum over four.
-    streams = [
-        ttnn.slice(gated, (0, 0, 0, h * hidden_size),
-                   (gated.shape[0], gated.shape[1], gated.shape[2], (h + 1) * hidden_size))
-        for h in range(hc_count)
-    ]
-    total = streams[0]
-    for nxt in streams[1:]:
-        total = ttnn.add(total, nxt)
-    mixed = ttnn.multiply(total, 1.0 / hc_count)
+    # Nine ttnn ops -- the multiply, four slices, three adds and the scale --
+    # collapse into one kernel pass. See `fused_gated_mean` for why, and for the
+    # fallback if `generic_op` is unavailable.
+    mixed = fused_gated_mean(mix, normed, hc_count, hidden_size)
 
     inject = None
     if inject_w is not None:
