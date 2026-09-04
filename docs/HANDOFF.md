@@ -3231,3 +3231,55 @@ Not the smallest remaining items, but the ones with the best ratio:
   attempted. `generic_op` is proven; a GEMV that splits the reduction across
   cores is the shape to try, and `dram_sharded_gemv_check.py` already has the
   harness to compare against.
+
+## 14. A GEMV that splits its reduction across cores: proven, not shippable yet
+
+`scripts/kernels/ksplit_{reader,compute,writer}.cpp` and
+`scripts/stage5_ksplit_gemv.py`. Core `(g, nt)` accumulates only K-tiles
+`[kt_lo, kt_hi)` for output column `nt` and writes a partial into `[1, G, M, N]`;
+the host sums over `G` with one `ttnn.sum`. No cross-core semaphore and no second
+kernel pass -- the reduction rides on a stock op, which is what made this
+buildable at all.
+
+This is the first attempt at invariant 38, the largest effect in the model:
+linears at 25-33 % of bandwidth because a narrow output leaves most cores idle.
+
+**bfloat16 partials** (110 cores of an 11x10 grid):
+
+| shape | `ttnn.linear` | k-split | ratio | rel err |
+|-------|-------------:|--------:|------:|--------:|
+| hc_down `[2560, 320]`, 11 groups | 31.80 us | **14.83** | **2.14x** | 1.72e-02 |
+| router `[2560, 512]`, 6 groups | 36.52 | **24.27** | **1.51x** | 2.83e-02 |
+| qsa out `[1536, 2560]`, 1 group | 33.23 | 41.98 | 0.79x | 4.14e-02 |
+
+The narrow shapes win and the already-wide one loses, which is exactly what the
+theory says: splitting the reduction only helps when the output cannot fill the
+grid on its own.
+
+**But the accuracy is not shippable**, and fixing it costs the win. With float32
+partials and `fp32_dest_acc_en`:
+
+| shape | ratio | rel err |
+|-------|------:|--------:|
+| hc_down | 1.02x | 1.29e-02 |
+| router | 0.68x | 1.89e-02 |
+| qsa out | 0.20x | 1.78e-02 |
+
+So the error is **not** mainly the partials' precision -- it barely moved -- and
+it is present at `groups=1`, where there is no cross-group summation at all.
+That points at the tile matmul path itself: `matmul_tiles` with bfloat8_b weights
+and bfloat16 activations is evidently not the same numerics as `ttnn.linear`'s
+tuned kernel. Until that is understood, 1.7e-02 relative on a projection that
+runs 96 times a token is not something to ship on the strength of a 1.63 ms
+saving.
+
+INVARIANT 57: splitting a GEMV's reduction across cores is worth **2.14x** on
+the model's narrowest projection and nothing on a wide one, so the mechanism is
+real and the diagnosis in invariant 38 is right. What blocks it is numerics, not
+performance: a hand-written `matmul_tiles` loop does not reproduce
+`ttnn.linear`'s accuracy at these dtypes, and buying that back with fp32
+accumulation costs more than the split saves.
+
+Next step for anyone picking this up: find out where the 1.7e-02 comes from at
+`groups=1` -- compare a single-core `matmul_tiles` against `ttnn.linear` on one
+tile, and vary the weight dtype -- rather than tuning the split.
