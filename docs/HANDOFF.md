@@ -341,7 +341,39 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     are ~0.13 ms and SDPA plus the cache update are ~0.10; the remaining ~2.8 ms
     is the small ops around them. Matmul tuning cannot reach that.
 
-24. **A device call on the eager prefill path is worth ~57 us, and its size does
+24. **Decode uses a thirty-second of the row capacity, and the way to get it
+    back is to fill the rows, not to remove the padding.** At M=1 the activation
+    pads to 32 rows, and a fixed weight takes *identical* time for M=1 through
+    M=32 -- 0.060 ms, 16.6 rows/ms at M=1 against 531 at M=32
+    (`gemv_padding_cost_check.py`). That is why prefill is ~23x faster per token,
+    and the instinct that decode therefore runs at 1/32 speed is right about the
+    waste.
+
+    It is wrong about the remedy. Removing the padding would not make M=1 faster:
+    at M=1 the op is fetching weights at 73.6 GB/s, far short of the arithmetic
+    limit, so the 31 empty rows are not what sets the 0.060 ms. They are spare
+    capacity, and spare capacity is reclaimed by *filling* it.
+
+    `step_n` fills it, and traced it is worth a lot (`traced_step_n_scaling_check.py`):
+
+        k        1      2      4      8     16     32
+        ms   175.1  228.5  254.1  302.2  400.1  572.5
+        /tok 175.1  114.3   63.5   37.8   25.0   17.9
+
+    k=32 costs 3.27x the time of k=1 for 32x the tokens -- **9.8x per token**. So
+    the ceiling on speculation here is not 1.1x (what prompt-lookup drafting
+    currently delivers) but close to an order of magnitude, and a drafted round at
+    k=32 pays for itself from about 3.3 accepted tokens. The bottleneck is the
+    drafter, not the machine.
+
+    What blocks collecting it today: the engine's verifier is *eager* because
+    alternating two traces hangs this build (`ttnn_bug_report/`), and eager
+    `step_n` is 122-318 ms/token against these traced figures. Capturing in
+    sequence is fine -- release, capture, replay -- but a per-round switch costs a
+    2.6 s capture, so this needs either the upstream fix or a design where
+    `step_n` is the only trace.
+
+25. **A device call on the eager prefill path is worth ~57 us, and its size does
     not matter.** Injecting a known number of ops and reading the slope gives
     90 +/- 15 us for the marginal op, and the one clean removal on record
     (`moe_chunk` 32 -> 128, 1008 calls, 918.6 -> 861.7 ms) gives 57 us for a real
