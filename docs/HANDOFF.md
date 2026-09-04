@@ -305,7 +305,23 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     head-to-KV mapping. Comparing an op against *itself* under a parameter that
     must not matter needs no reference at all, and is what found this.
 
-22. **A device call on the eager prefill path is worth ~57 us, and its size does
+22. **There is no matrix-vector op, and the tile is not a way to fake one.**
+    ttnn has no `matvec`/`gemv`. It has a configurable tile -- `ttnn.Tile([1,32])`
+    constructs and `linear`/`matmul` take an `output_tile` -- which looks like the
+    way to stop padding a 1-row decode activation up to 32. It is not, twice over
+    (`tiny_tile_matvec_check.py`). Below 16 rows the dense op **silently returns
+    the wrong answer**: 16x32 matches the exact product as well as 32x32 (2.97e-03)
+    while 8x32 and 1x32 are off by ~0.9, with no error raised; matching the
+    weight's tile to the activation's is rejected outright; and `sparse_matmul`
+    refuses a tiny `output_tile` entirely. And it would buy nothing anyway -- a
+    dense matvec at M=1 is bound by reading the weight ([2560, 3072] against one
+    row), so every tile from 1x32 to 32x32 times the same to within noise. The
+    padding only ever mattered where it *multiplied*: the MoE's [1, 512, 1, 2560]
+    was 84 MB carrying 2.6 (`022`), and that is precisely where the op refuses
+    tiny tiles -- which is why the fix there was to restructure the consumer
+    instead.
+
+23. **A device call on the eager prefill path is worth ~57 us, and its size does
     not matter.** Injecting a known number of ops and reading the slope gives
     90 +/- 15 us for the marginal op, and the one clean removal on record
     (`moe_chunk` 32 -> 128, 1008 calls, 918.6 -> 861.7 ms) gives 57 us for a real
