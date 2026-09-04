@@ -393,11 +393,29 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     And "a GEMV runs at a thirty-second of a GEMM" is about FLOPs, not bandwidth.
     A GEMV has an arithmetic intensity of ~1 op/byte where a 32-row GEMM has ~32,
     so at the *same* bandwidth it does 1/32 the arithmetic. Saturating DRAM is
-    the ceiling for a GEMV, not a shortfall from one. The two real losses here are
-    bfloat4_b unpacking (273 against bfloat16's 393 GB/s) and the launch floor on
-    small weights.
+    the ceiling for a GEMV, not a shortfall from one. So the launch floor on small
+    weights is the one real loss.
 
-26. **A device call on the eager prefill path is worth ~57 us, and its size does
+    > **The bfloat4_b "loss" was a bad framing, corrected.** Reading 273 GB/s
+    > against bfloat16's 393 compares *bytes*, and bfloat4_b moves 3.6x fewer of
+    > them for the same matrix. In elements it is the fastest of the three (493 G
+    > against bfloat8_b's 342 and bfloat16's 196), and in wall clock the same
+    > 2560x32768 matmul is **0.170 ms at bfloat4_b against 0.427 at bfloat16** --
+    > 2.5x faster, not 30 % worse. What caps bfloat4_b is elements per second, not
+    > bytes: the unpack and math pipeline, which is hardware. There is nothing to
+    > recover.
+
+26. **HiFi4 is free, so stop treating fidelity as a speed knob.** The unpack of a
+    quantised weight happens in the core, fed from L1, and the math passes behind
+    it are entirely hidden by the memory transfer. Across bfloat4_b, bfloat8_b
+    and bfloat16, at a floor-bound size and a bandwidth-bound one, LoFi through
+    HiFi4 all take the same time to within 2 % (`math_fidelity_check.py`) -- e.g.
+    bfloat4_b at N=32768: 0.170 / 0.170 / 0.171 / 0.173 ms. And the fidelity is
+    not cosmetic even on a 4-bit weight: against the dequantised weight, LoFi is
+    7.4e-03 and HiFi3/HiFi4 4.0e-03. Blanket HiFi4 costs nothing and buys
+    accuracy, which is the right default and now a measured one.
+
+27. **A device call on the eager prefill path is worth ~57 us, and its size does
     not matter.** Injecting a known number of ops and reading the slope gives
     90 +/- 15 us for the marginal op, and the one clean removal on record
     (`moe_chunk` 32 -> 128, 1008 calls, 918.6 -> 861.7 ms) gives 57 us for a real
