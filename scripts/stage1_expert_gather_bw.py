@@ -105,6 +105,11 @@ def build_program(weights, indices, out, grid, k_sel: int, read_batch: int):
     n_experts = weights.shape[1]
     ct_args = [tiles_per_expert, tile_bytes, read_batch, idx_bytes, out_bytes, n_experts]
     ct_args += accessors["w"] + accessors["i"] + accessors["o"]
+    # `generic_op`'s program hash covers compile_time_args by value but
+    # runtime_args only by count, so k_sel has to be here or every K in the
+    # sweep reuses the first compiled program and re-runs its work ranges.
+    # Trailing and unread by the kernel, which keeps the accessor offsets put.
+    ct_args.append(k_sel)
 
     w_addr, i_addr, o_addr = (
         weights.buffer_address(),
@@ -150,8 +155,15 @@ def verify(mesh, out, n_cores: int, ids: list[int], tiles_per_expert: int) -> tu
 
     Every core folds `tile_id` for each page it reads, so the total over all
     cores is a closed form. If it matches, every intended tile was visited
-    exactly once and nothing else was. `sum_data` only has to be non-zero and
-    to differ between devices -- each device holds a different 128 experts.
+    exactly once and nothing else was.
+
+    `sum_data` carries the other half: the kernel poisons each landing slot
+    before reading it, so this checks that the fold is neither zero nor the
+    sentinel, and that the four devices disagree -- each holds a different 128
+    experts, so agreement would mean they all read the same bytes.
+
+    `k_sel == 0` is legal and measures the per-launch floor: no tiles, so the
+    data checks are skipped and only the "read nothing" bookkeeping is asserted.
     """
     got = ttnn.to_torch(out, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
     got = got.reshape(-1, n_cores, OUT_ROW).to(torch.int64)  # [n_dev, cores, 32]
@@ -162,12 +174,32 @@ def verify(mesh, out, n_cores: int, ids: list[int], tiles_per_expert: int) -> tu
 
     ok = True
     parts = []
+    datas = []
     for d in range(got.shape[0]):
         sum_data = int(got[d, :, 0].sum() % (1 << 32))
         sum_tid = int(got[d, :, 1].sum() % (1 << 32))
         n_tiles = int(got[d, :, 2].sum())
-        ok = ok and sum_tid == want_tid and n_tiles == want_n and sum_data != 0
+        datas.append(sum_data)
+        ok = ok and sum_tid == want_tid and n_tiles == want_n
+        if want_n:
+            ok = ok and sum_data != 0
         parts.append(f"d{d}:tiles={n_tiles},tid=0x{sum_tid:08x},data=0x{sum_data:08x}")
+
+    # The docstring's other promise, which was never actually checked: each
+    # device holds a different 128 experts, so identical sums across devices
+    # would mean every device read the same bytes -- the one failure mode the
+    # data checksum exists to catch.
+    if want_n and len(datas) > 1 and len(set(datas)) != len(datas):
+        ok = False
+        parts.append("FAIL:devices agree on sum_data (all read the same bytes?)")
+
+    # The kernel poisons each landing slot with 0xDEADBExx before reading it, so
+    # a fold that comes back looking like the sentinel means the read never
+    # landed and `sum_data != 0` would have passed on garbage.
+    if want_n and any((v & 0xFFFFFF00) == 0xDEADBE00 for v in datas):
+        ok = False
+        parts.append("FAIL:sum_data looks like the poison sentinel -- reads did not land")
+
     return ok, f"want tiles={want_n} tid=0x{want_tid:08x} | " + " ".join(parts)
 
 
@@ -234,6 +266,11 @@ def main() -> None:
         per_k_layer_ms: dict[int, float] = {}
         for k_sel in args.k:
             ids = [(i * 37) % 128 for i in range(k_sel)]
+            # 37 is coprime with 128, so this is a permutation only while
+            # k_sel <= 128; past that ids repeat (double-counting the byte
+            # figure) and the write would run off the 512 B index page.
+            assert k_sel <= IDX_LEN, f"k_sel {k_sel} exceeds the index page ({IDX_LEN})"
+            assert len(set(ids)) == k_sel, f"repeated expert ids at k_sel={k_sel}"
             write_indices(mesh, replicate, idx_dev, ids)
             ttnn.synchronize_device(mesh)
 

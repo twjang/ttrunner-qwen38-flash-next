@@ -44,7 +44,6 @@
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
-#include "api/debug/assert.h"
 
 void kernel_main() {
     constexpr uint32_t TILES_PER_EXPERT = get_compile_time_arg_val(0);
@@ -59,8 +58,8 @@ void kernel_main() {
     static_assert(IDX_PAGE_BYTES % 64 == 0, "index page must be a multiple of DRAM_ALIGNMENT(64)");
     static_assert(OUT_PAGE_BYTES % 16 == 0, "output page must be a multiple of the DRAM write alignment");
 
-    constexpr uint32_t cb_w = tt::CBIndex::c_0;    // weight landing scratch
-    constexpr uint32_t cb_aux = tt::CBIndex::c_1;  // index page + output page
+    constexpr uint32_t cb_w = 0;    // weight landing scratch
+    constexpr uint32_t cb_aux = 1;  // index page + output page
 
     const uint32_t w_addr = get_arg_val<uint32_t>(0);
     const uint32_t idx_addr = get_arg_val<uint32_t>(1);
@@ -108,10 +107,13 @@ void kernel_main() {
         const uint32_t t = w - slot * TILES_PER_EXPERT;
         // The one data-dependent expression in the whole kernel.
         const uint32_t expert_id = idx[slot];
-        // A garbage index would read another tensor's bytes (silent) or a wild
-        // address (watcher hang). Cheap guard, watcher-visible, free in release.
-        ASSERT(expert_id < NUM_EXPERTS);
-        const uint32_t expert_first_tile = expert_id * TILES_PER_EXPERT;
+        // Clamped rather than asserted: ASSERT expands to `while (1) { ; }`
+        // under WATCHER_ENABLED, so the guard against a bad index would hang
+        // the card, and a hang here costs a device reset. Clamping keeps the
+        // reads in bounds and shows up host-side as a sum_tid mismatch, which
+        // verify() already treats as fatal.
+        const uint32_t safe_id = expert_id < NUM_EXPERTS ? expert_id : 0;
+        const uint32_t expert_first_tile = safe_id * TILES_PER_EXPERT;
 
         uint32_t run = TILES_PER_EXPERT - t;  // rest of this expert's slab
         if (run > work_hi - w) {
@@ -124,6 +126,14 @@ void kernel_main() {
             uint32_t batch = tile_end - tile;
             if (batch > READ_BATCH) {
                 batch = READ_BATCH;
+            }
+            // Poison first. The landing buffer is never initialised, so a read
+            // that silently did not happen would leave whatever L1 held -- and
+            // `sum_data != 0` would pass on it. A sentinel makes an unlanded
+            // read fold a value the host can recognise instead.
+            for (uint32_t i = 0; i < batch; ++i) {
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(w_l1 + i * TILE_BYTES)[0] =
+                    0xDEADBE00u | (i & 0xFFu);
             }
             for (uint32_t i = 0; i < batch; ++i) {
                 noc_async_read_page(tile + i, w_acc, w_l1 + i * TILE_BYTES);
