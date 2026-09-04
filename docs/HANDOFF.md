@@ -2799,3 +2799,37 @@ correctness either way.
 
 Session: **146.18 -> 96.21 ms** deployed, and **67.53 ms** with speculation on
 top -- 2.16x from where the session started, against a 32.6 ms target.
+
+### 9.1 Two policy results, both measured, both counter-intuitive
+
+**Always drafting is worse.** Padding a short draft so every round "verifies
+properly" cost **67.53 -> 86.08 ms a token**. The acceptance histogram was
+identical -- the padded drafts were all rejected -- but a rejection has to
+rewind, so seven rounds that had been one masked verify became two. The
+no-draft path's single masked verify, which advances by exactly 1, is optimal
+precisely when j is known in advance to be 0.
+
+**Where the time actually goes**, from the 17-round run: seven no-draft rounds
+at ~191 ms for one token each, five full acceptances at one verify for eight
+tokens, five partial at two verifies. Mean 4.00 tokens a round.
+
+That gives the ceiling of this design honestly:
+
+| | ms a token |
+|---|---:|
+| today, two verifies on a partial | 67.53 |
+| one verify a round (per-step state, not built) | ~47.8 |
+| the k=8 curve, if every round accepted all 8 | 22.71 |
+| **target** | **32.6** |
+
+So removing the second verify is worth ~20 ms and is the last piece of
+machinery. Past that it is the *drafter*: 32.6 ms needs a mean accepted prefix
+near 5.9 of 7, against the 3.00 `prompt_lookup_draft` manages. That is a model
+question -- the checkpoint carries a 51 B-parameter n-gram table for PLE that
+has never been tried as a drafter -- not an engineering one.
+
+INVARIANT 50: with a fixed capture width, emitting j+1 tokens requires the state
+to have advanced j+1, and j is only known after the step runs. So a partial
+acceptance costs either two verifies or per-step state saved in-graph. Do not
+"fix" it by drafting harder: a rejected draft is strictly worse than no draft,
+because no draft can use the single masked advance.

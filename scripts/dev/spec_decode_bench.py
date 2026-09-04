@@ -102,13 +102,20 @@ nxt = prime(state)
 ver = capture(state, lambda: TracedStepN(m, state, K))
 snap_buf = {}
 hist = collections.Counter()
-rounds = drafted = 0
+rounds = drafted = drafted_short = 0
 out = []
 t0 = time.perf_counter()
 while len(out) < N:
     context = list(state.histories[0]) + [nxt]
     draft = prompt_lookup_draft(context, K - 1)
     rounds += 1
+    # No draft -> one masked verify that advances by exactly 1. This looks
+    # wasteful (a full k=8 verify for one token, ~191 ms) and it is, but the
+    # alternative is worse and was measured: padding the draft so every round
+    # verifies "properly" turned those rounds into *two* verifies, because a
+    # padded draft is always rejected and a rejection has to rewind. 67.53 ms a
+    # token became 86.08. The masked-1 path is optimal exactly when j is known
+    # in advance to be 0.
     if draft is None or len(draft) != K - 1:
         h = ver.step_n([nxt] * K, accept=[1.0] + [0.0] * (K - 1))
         nxt = int(m.greedy_tokens(h)[0])
@@ -131,14 +138,17 @@ while len(out) < N:
 spec = 1000 * (time.perf_counter() - t0) / len(out)
 print(f"RESULT speculative:       {spec:7.2f} ms a token "
       f"({plain / spec:.2f}x against the plain step)", flush=True)
-print(f"RESULT rounds {rounds}, drafted {drafted} "
-      f"({100 * drafted / max(rounds, 1):.0f}%), {len(out)} tokens", flush=True)
+print(f"RESULT rounds {rounds}, full drafts {drafted}, padded {drafted_short} "
+      f"({100 * drafted / max(rounds, 1):.0f}% real), {len(out)} tokens", flush=True)
 print(f"RESULT accepted-prefix histogram: "
       f"{dict(sorted(hist.items()))}", flush=True)
 match = sum(1 for a, b in zip(out, baseline_out) if a == b)
 print(f"RESULT agrees with the plain step on {match}/{min(len(out), len(baseline_out))} "
       f"tokens", flush=True)
 print(f"RESULT text: {tok.decode(out[:24])!r}", flush=True)
+mean_j = sum(j * n for j, n in hist.items()) / max(sum(hist.values()), 1)
+print(f"RESULT mean accepted prefix {mean_j:.2f} of {K - 1} drafted, "
+      f"{len(out) / max(rounds, 1):.2f} tokens a round", flush=True)
 print(f"RESULT target is 32.6 ms a token", flush=True)
 
 ver.release()
