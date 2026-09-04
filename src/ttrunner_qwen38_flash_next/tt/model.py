@@ -1569,6 +1569,45 @@ class TTModel:
         state.positions = [p + 1 for p in state.positions]
         return mixed
 
+    def _bind_accept(self, k: int, accept: list[float] | None):
+        """Bind the two tensors that make speculative acceptance *data*.
+
+        Split out of `step_n` so a captured replay can rebind them between
+        replays: `_input` writes into the bound buffer when one exists, which is
+        exactly the mechanism the rope tables and cache positions already use.
+        One capture therefore serves every acceptance count, and the ladder of
+        widths that provokes the alternation hang is never needed.
+
+        `accept` must be a prefix of ones -- anything else would give a `j` that
+        does not mean what the caller thinks, so it is rejected rather than
+        interpreted.
+        """
+        if accept is None:
+            return None, None
+        if len(accept) != k:
+            raise ValueError(f"accept has {len(accept)} entries, expected k={k}")
+        j = int(sum(accept))
+        if j < 1 or accept[:j] != [1.0] * j or any(accept[j:]):
+            raise ValueError(f"accept must be ones then zeros, got {accept}")
+
+        n_v = self.n_v_local
+        acc = self._input(
+            "accept_mask",
+            torch.tensor(accept, dtype=torch.float32)
+            .repeat_interleave(n_v).reshape(k * n_v, 1, 1, 1),
+            ttnn.bfloat16, key=tuple(accept),
+        )
+        # `history` inside the layer is the entry ring, oldest first, then this
+        # call's k columns, so history index h holds the column from time
+        # `h - depth`. After accepting j, ring slot s (0 is newest) must hold
+        # time `j - 1 - s`, i.e. index `depth + j - 1 - s`.
+        depth = self.cfg.conv_kernel - 1
+        sel = torch.zeros(1, 1, depth, depth + k, dtype=torch.float32)
+        for slot in range(depth):
+            sel[0, 0, slot, depth + j - 1 - slot] = 1.0
+        csel = self._input("conv_sel", sel, ttnn.bfloat16, key=(k, j))
+        return acc, csel
+
     def step_n(self, tokens: list[int], state: TTState,
                accept: list[float] | None = None) -> ttnn.Tensor:
         """Advance one sequence by `k` tokens in a single step.
@@ -1637,40 +1676,7 @@ class TTModel:
                 "step_n does not carry the QSA selection yet; construct the model "
                 f"with max_seq_len <= {self.cfg.indexer_budget} to use it"
             )
-        # The acceptance mask, broadcast to the (k * n_v) rows the recurrence
-        # works over. Bound like every other per-step input, so it is data and
-        # one capture serves any acceptance count -- see
-        # `_linear_attention_step_n` for why that matters.
-        acc = csel = None
-        if accept is not None:
-            if len(accept) != k:
-                raise ValueError(f"accept has {len(accept)} entries, expected k={k}")
-            n_v = self.n_v_local
-            acc = self._input(
-                "accept_mask",
-                torch.tensor(accept, dtype=torch.float32)
-                .repeat_interleave(n_v).reshape(k * n_v, 1, 1, 1),
-                ttnn.bfloat16, key=tuple(accept),
-            )
-
-            # The convolution ring's rewind, as a gather written as a matmul.
-            #
-            # `history` inside the layer is the entry ring (oldest first) then
-            # this call's k columns, so history index h holds the column from
-            # time `h - depth`. After accepting j tokens the ring's slot s -- 0
-            # is newest -- must hold time `j - 1 - s`, i.e. history index
-            # `depth + j - 1 - s`. One 1 a row, and being bound it is data, so
-            # one capture serves any j.
-            j = int(sum(accept))
-            if j < 1 or accept[:j] != [1.0] * j or any(accept[j:]):
-                raise ValueError(
-                    f"accept must be a prefix of ones then zeros, got {accept}"
-                )
-            depth = self.cfg.conv_kernel - 1
-            sel = torch.zeros(1, 1, depth, depth + k, dtype=torch.float32)
-            for slot in range(depth):
-                sel[0, 0, slot, depth + j - 1 - slot] = 1.0
-            csel = self._input("conv_sel", sel, ttnn.bfloat16, key=(k, j))
+        acc, csel = self._bind_accept(k, accept)
 
         start = state.positions[0]
 

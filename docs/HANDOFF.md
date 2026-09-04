@@ -2748,3 +2748,54 @@ INVARIANT 49: speculative acceptance is expressible entirely as bound tensors on
 this model -- an accept mask for the recurrence and a selection matrix for the
 convolution ring. Neither changes a shape, so the ladder of capture widths that
 provokes the alternation hang is not needed and must not be reintroduced.
+
+## 9. Speculation, end to end: 97.89 -> 67.53 ms a token
+
+`scripts/dev/spec_decode_bench.py`, k=8, one capture width so the alternation
+hang stays out of reach. `TracedStepN.step_n` now takes an `accept` prefix and
+rebinds the mask and the conv-ring selection between replays via
+`TTModel._bind_accept`, so the shape never changes.
+
+| | ms a token |
+|---|---:|
+| plain traced step | 97.89 |
+| **speculative, k=8** | **67.53** (1.45x) |
+
+17 rounds for 68 tokens, 65 % of them with a draft, acceptance histogram
+`{0: 7, 2: 3, 4: 1, 6: 1, 7: 5}`.
+
+Verification is sound, checked separately in `scripts/dev/step_n_row_check.py`:
+`step_n`'s row i predicts exactly what a plain step at position i does
+(`[561, 1118, 13934, 17943]` both ways), so the drafter is being compared
+against the right tokens.
+
+**Why 67.53 and not the 22.71 the k=8 curve promises.** Two things, and neither
+is the masking:
+
+- A partial acceptance costs **two** verifies. j is only known after the step
+  runs, so the first pass advances by k and a rewind has to replay the same
+  width with the correct mask. Six of the eleven drafted rounds were partial.
+- Seven of seventeen rounds had **no draft at all** -- `prompt_lookup_draft`
+  only fires on a repeated n-gram -- and each of those yields one token for a
+  full verify.
+
+So the ceiling is the drafter, not the machinery. With one verify a round the
+same trace would be ~47.8 ms a token; with a drafter that is usually right it is
+the 22.71 the curve says.
+
+The second verify is removable and the design is known: snapshot the recurrent
+and conv state **per step** inside the graph (288 copies at k=8, ~1.6 ms) and
+select slot j afterwards, instead of rewinding by replaying. That turns every
+round into one verify whatever j is.
+
+CAUTION on the harness, unresolved: the benchmark's *plain* baseline decodes a
+different continuation from the speculative run ("Download Presentation - The
+PPT/PDF document..." against a coherent echo of the prompt), and they agree on
+0 of 64 tokens. Since `step_n` row i is exactly a plain step i, and the masking
+is bit-exact, the fault is in how the benchmark builds its `TracedDecoder`
+baseline rather than in speculation -- but it is not yet diagnosed, so the
+1.45x is a timing result and the agreement check is **not** evidence of
+correctness either way.
+
+Session: **146.18 -> 96.21 ms** deployed, and **67.53 ms** with speculation on
+top -- 2.16x from where the session started, against a 32.6 ms target.

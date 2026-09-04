@@ -76,7 +76,13 @@ class TracedStepN:
         # Then two real `step_n` calls: its buffers and kernels have to exist
         # before capture, and the LM head has to be warmed for the same reason
         # `TracedDecoder` warms it -- a caller reads the logits of the k rows.
-        model.step_n(warm, state)
+        # Captured *with* an accept mask, all ones. The mask and the conv-ring
+        # selection are bound tensors, so their ops have to be in the graph for
+        # a replay to have anything to rebind -- and once they are, one capture
+        # serves every acceptance count. Without this the graph would advance by
+        # k unconditionally and partial acceptance would need a second width,
+        # which is the one thing that provokes the alternation hang.
+        model.step_n(warm, state, accept=[1.0] * k)
         ttnn.synchronize_device(model.mesh)
         warm_hidden = model.step_n(warm, state)
         model.logits(warm_hidden)
@@ -120,15 +126,26 @@ class TracedStepN:
             base.append(tok)
             write(f"ngram_n{k}_{i}", model.ngram_embed([list(base)]), ttnn.bfloat16)
 
-    def step_n(self, tokens: list[int]) -> ttnn.Tensor:
-        """Replay the capture for these k tokens. Returns [1, 1, k, hidden]."""
+    def step_n(self, tokens: list[int], accept: list[float] | None = None) -> ttnn.Tensor:
+        """Replay the capture for these k tokens. Returns [1, 1, k, hidden].
+
+        `accept` is a prefix of ones saying how many of the k tokens to commit.
+        It is written into bound buffers before the replay, so the *shape* stays
+        k and only the state advance changes -- which is what keeps this to one
+        capture. Rejected steps are bit-exactly inert (handoff 8.2, 8.3).
+
+        Defaults to all ones, which is the ordinary verify: advance by k.
+        """
         if len(tokens) != self.k:
             raise ValueError(f"this trace was captured for k={self.k}, got {len(tokens)}")
         state = self.state
+        acc = [1.0] * self.k if accept is None else accept
+        self.model._bind_accept(self.k, acc)
         self._fill_inputs(tokens)
-        state.histories[0].extend(tokens)
+        j = int(sum(acc))
+        state.histories[0].extend(tokens[:j])
         ttnn.execute_trace(self.model.mesh, self.trace_id, cq_id=self.cq_id, blocking=True)
-        state.positions = [state.positions[0] + self.k]
+        state.positions = [state.positions[0] + j]
         return self.output
 
     def release(self) -> None:
