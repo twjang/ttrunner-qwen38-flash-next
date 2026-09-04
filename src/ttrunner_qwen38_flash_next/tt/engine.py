@@ -286,8 +286,9 @@ class TTEngine(Engine):
         # either way.
         if self._chunked_prefill and use_trace:
             print(
-                "[tt] chunked_prefill needs eager execution; trace capture is off. "
-                "Prompt ingestion is ~11x faster, each generated token ~2.2x slower."
+                "[tt] chunked_prefill with the trace on: the trace is released "
+                "around each prefill and recaptured after it (~2.6 s a request "
+                "that ingests). Prompt at ~7.6 ms/token, generation stays traced."
             )
         # Trace replays a captured step with a single dispatch, and for a single
         # user that is the whole game: 2.02x at batch 1 (516 -> 255 ms), 1.52x at
@@ -364,7 +365,12 @@ class TTEngine(Engine):
                     "step_n does not carry the QSA selection yet, so speculation "
                     "and a context in (2048, 65536] cannot both be on"
                 )
-        self._use_trace = use_trace and max_concurrency < 48 and not self._chunked_prefill
+        # Chunked prefill no longer forces this off. The two really do corrupt
+        # each other -- a prefill that allocates while a trace is *live* makes the
+        # replay return the wrong tokens, measured, not assumed -- but the fix is
+        # to not have one live: `_device_loop` releases the trace around each
+        # prefill and captures again afterwards. See `_reprefill` there.
+        self._use_trace = use_trace and max_concurrency < 48
         self._decoder = None
         # Captured traces this engine owns, so `close` can release them. Closing
         # the mesh with a trace still registered leaves the devices in a state
@@ -457,21 +463,6 @@ class TTEngine(Engine):
         # -- which contains the previous turn as an exact prefix -- only has to
         # feed the tokens it added.
         prefix: list[list[int] | None] = [None] * B
-
-        if self._chunked_prefill and self._use_trace:
-            # Warm the chunk graph before anything is captured, for the same
-            # reason the eager verifier needs its widths warmed: a first prefill
-            # allocates gigabytes of its own temporaries, and doing that while a
-            # trace is live corrupts the replay -- which is what "token 0
-            # repeated" was. One chunk of the default width makes every buffer
-            # exist.
-            mark("warming the prefill chunk graph")
-            from .model import PREFILL_CHUNK
-
-            warm_state = self.model.new_state(batch=1)
-            self.model.prefill([0] * PREFILL_CHUNK, warm_state)
-            del warm_state
-            mark("prefill graph warmed")
 
         # Captured here rather than in __init__: it runs a warmup step, which
         # compiles every kernel and takes tens of seconds, and it must happen on
@@ -617,6 +608,43 @@ class TTEngine(Engine):
             free.append(slot)
             self._stats.running = sum(x is not None for x in slots)
 
+        def _reprefill(chunk: list[int]) -> None:
+            """Prefill `chunk`, with no trace live while it happens.
+
+            A prefill allocates gigabytes of temporaries, and allocating those
+            while a trace is live corrupts the replay -- the reason chunked
+            prefill used to turn the trace off wholesale, costing every generated
+            token 588 ms instead of 177. Releasing the trace for the duration
+            keeps both: ingestion at ~7.6 ms/token *and* a traced step after it.
+
+            Capturing consumes two warm-up tokens, so it dirties the state the
+            prefill just built. `TracedDecoder.reset()` would fix that by zeroing
+            everything, which would throw the prompt away; `snapshot`/`restore`
+            puts it back instead, in place, so the addresses the new trace just
+            recorded stay valid.
+
+            Measured (`recapture_after_prefill_check.py`, 128-token prompt):
+            release 9.1 ms, snapshot 39.3, capture 2537.9, restore 3.4 -- about
+            2.6 s a request that ingests -- against 411 ms saved on every token
+            generated afterwards. It pays from roughly the seventh token, and the
+            tokens it produces are identical to the eager path's.
+            """
+            if self._decoder is None:
+                self.model.prefill(chunk, state)
+                return
+            from .traced import TracedDecoder
+
+            self._decoder.release()
+            self._decoder = None
+            self.model.prefill(chunk, state)
+            snap = self.model.snapshot(state)
+            try:
+                self._decoder = TracedDecoder(self.model, state)
+            finally:
+                # restore even if the capture failed: the warm-up tokens have
+                # already moved the state either way
+                self.model.restore(state, snap)
+
         def admit(seq: _Sequence, slot: int) -> None:
             """Give `seq` a slot, reusing the state already there when it can.
 
@@ -654,7 +682,7 @@ class TTEngine(Engine):
                 take = available - available % TILE
                 if take and seq.prompt_pos % TILE == 0:
                     chunk = prompt[seq.prompt_pos : seq.prompt_pos + take]
-                    self.model.prefill(chunk, state)
+                    _reprefill(chunk)
                     seq.prompt_pos += take
                     if prefix[slot] is not None:
                         prefix[slot].extend(chunk)

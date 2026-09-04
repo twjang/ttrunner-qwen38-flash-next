@@ -373,31 +373,43 @@ is back to 236.1 ms from 239.1; attn_qkv costs ~200 MB more per device.
 what any change to the plan or the shard layout needs.
 
 
-### 5.2 Chunked prefill alongside the trace — **NOT done**; a previous claim that it was is retracted
-> **Retracted 2026-09-04.** This item was marked done on the strength of a
-> `prefix_reuse_check.py --chunked --trace` run. That run never had a trace: the
-> engine forces `_use_trace` off whenever `chunked_prefill` is on
-> (`engine.py`, the `and not self._chunked_prefill` term, which dates from
-> `87fb00b` and was never actually removed), and it prints
-> "[tt] chunked_prefill needs eager execution; trace capture is off" when it does
-> so. The improvement attributed to the trace -- cold TTFT 11.40 -> 6.3 s -- came
-> from prefill itself getting faster (2033 -> 919 ms a chunk), not from the two
-> coexisting. A contract test, `test_chunked_prefill_turns_the_trace_off`, says
-> exactly this and was passing the whole time.
+### 5.2 Chunked prefill alongside the trace — **done**, by releasing the trace around each prefill
+> **Two corrections, in order.** This was first marked done in 4a43a7a on a
+> `prefix_reuse_check.py --chunked --trace` run that never had a trace: the
+> engine forced `_use_trace` off whenever `chunked_prefill` was on, printed that
+> it was doing so, and the improvement credited to the trace came from prefill
+> getting faster on its own. Removing the exclusion then showed the two really do
+> corrupt each other -- with the trace genuinely live, turn 2 replayed cold
+> returned `[2250, 10478, ...]` against `[10782, 303, ...]` everywhere else, and
+> `turn2 warm == cold` went YES -> NO. Warming one chunk before the capture, the
+> fix attempted at the time, does not cover it.
 >
-> Removing the exclusion and running the same check settles it the other way. The
-> pre-capture warm-up added for this (`_device_loop`, "warming the prefill chunk
-> graph") is **not sufficient**: with the trace genuinely on, the *warm* path is
-> right and the *cold* one is wrong -- turn 2 replayed cold returns
-> `[2250, 10478, 11, ...]` where every other configuration returns
-> `[10782, 303, 220, ...]`, and `turn2 warm == cold` goes YES -> **NO**. That is
-> the same corruption the original note describes.
+> **What does work is not having a trace live while a prefill allocates.**
+> `_device_loop._reprefill` releases the trace, prefills, and captures again.
+> Capturing consumes two warm-up tokens and so dirties the state the prefill just
+> built, and `TracedDecoder.reset()` would fix that by zeroing everything --
+> which throws the prompt away -- so `snapshot`/`restore` puts it back in place,
+> keeping the addresses the new trace just recorded valid.
 >
-> So the allocation hazard was a real hazard and warming one chunk does not cover
-> it. What the engine does today is correct: chunked prefill runs eager. The
-> practical consequence for a server is a genuine choice, not a bug --
-> `--chunked-prefill` buys ~11x on prompt ingestion and costs ~3.3x on every
-> generated token (588 ms/token measured against 176).
+> Costs, measured (`recapture_after_prefill_check.py`, 128-token prompt): release
+> 9.1 ms, snapshot 39.3, capture 2537.9, restore 3.4 -- about 2.6 s per request
+> that ingests, against 411 ms saved on every token generated afterwards. It pays
+> from roughly the seventh token. The tokens it produces are identical to the
+> eager path's, and `prefix_reuse_check.py --chunked --trace` now returns
+> `turn2 warm == cold: YES` with the right tokens.
+>
+> End to end on a fresh 1051-token prompt, through the server:
+>
+> | | ingestion | generation |
+> |---|---|---|
+> | now | **13.4 ms/token** | **183-194 ms/token** |
+> | chunked prefill, trace off | 7.6 | 588 |
+> | traced, no chunked prefill | 177 | 177 |
+>
+> A 1051-token prompt with 200 generated is **50.7 s**, against 125.6 s and
+> 221.4 s for the two configurations that were previously the only choices. A
+> turn whose prompt is already cached skips ingestion entirely and pays no
+> capture.
 
 Chunked prefill works and is on for one-slot engines, but it turns the trace off:
 it runs eagerly, and a captured prefill graph replayed as token 0 repeated.

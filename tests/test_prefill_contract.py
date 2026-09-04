@@ -243,12 +243,29 @@ def test_chunked_attention_takes_its_position_from_the_device() -> None:
     assert "paged_fill_cache" in src
 
 
-def test_chunked_prefill_turns_the_trace_off() -> None:
-    """Prefill runs eagerly and allocates gigabytes per call; a trace replays
-    against the addresses it captured. After a few prefills the replay returned
-    token 0 repeatedly -- eager prefill is correct, the combination is not."""
-    src = inspect.getsource(TTEngine.__init__)
-    assert "and not self._chunked_prefill" in src
+def test_chunked_prefill_releases_the_trace_around_each_prefill() -> None:
+    """Both, by never having a trace live while a prefill allocates.
+
+    Prefill allocates gigabytes per call and a trace replays against the
+    addresses it captured, so with one live the replay comes back wrong -- turn 2
+    replayed cold returned `[2250, 10478, ...]` where every other configuration
+    returns `[10782, 303, ...]`. The engine used to avoid that by turning the
+    trace off whenever chunked prefill was on, which cost every generated token
+    588 ms instead of 177.
+
+    It now releases the trace for the duration of the prefill and captures again
+    afterwards, restoring the state the capture's warm-up tokens dirtied. So the
+    exclusion must be gone *and* the release/recapture must be there -- either
+    half alone is the bug.
+    """
+    init = inspect.getsource(TTEngine.__init__)
+    assert "and not self._chunked_prefill" not in init, (
+        "chunked prefill no longer disables the trace; see _reprefill"
+    )
+    loop = inspect.getsource(TTEngine._device_loop)
+    assert "_reprefill" in loop, "the prefill must go through the release/recapture path"
+    for step in ("self._decoder.release()", "self.model.snapshot(", "self.model.restore("):
+        assert step in loop, f"_reprefill lost its {step!r} step"
 
 
 def test_prefill_refuses_a_moe_chunk_past_the_cliff() -> None:
