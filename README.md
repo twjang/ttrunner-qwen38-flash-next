@@ -123,6 +123,45 @@ selection on -- contexts in `(2048, 65536]` -- a step was 297.5 ms at 8192 token
 against 236.1 dense; the extra is almost all `ttnn.topk` at k=512, see
 `docs/iterations/015`.)
 
+### Pointing an agent harness at it
+
+The server speaks OpenAI chat completions, including tool calls. This checkpoint
+does not emit OpenAI tool-call JSON -- its chat template asks for XML and the
+server translates both directions -- and it is a reasoning model, so the answer
+arrives after a `</think>` the server splits into `reasoning_content`.
+
+Two things a client has to be told, because they are not the OpenAI defaults:
+send `chat_template_kwargs: {"enable_thinking": false}` to skip the reasoning
+pass (4.4x faster on short turns), and use the `system` role rather than
+`developer`. For [pi](https://pi.dev), `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "ttrunner": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": false,
+        "maxTokensField": "max_tokens",
+        "thinkingFormat": "qwen-chat-template"
+      },
+      "models": [{ "id": "Qwen3.8-Flash-Next", "name": "Qwen3.8-Flash-Next",
+                   "reasoning": true, "input": ["text"],
+                   "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                   "contextWindow": 32768, "maxTokens": 4096 }]
+    }
+  }
+}
+```
+
+`contextWindow` is set well under the model's own because ingestion is ~13
+ms/token: 32k of context is about seven minutes of prefill, and a bigger window
+mostly buys a longer wait.
+
 For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
 **~13 ms/token** instead of ~177, and keeps the traced decode step. The two used
 to be mutually exclusive -- a prefill allocating while a trace is live corrupts

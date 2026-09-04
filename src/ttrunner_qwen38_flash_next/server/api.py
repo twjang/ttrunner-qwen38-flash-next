@@ -9,6 +9,7 @@ the CPU reference or the ttnn backend unchanged.
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -31,6 +32,12 @@ router = APIRouter()
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str | list[dict[str, Any]] | None = None
+    # An assistant turn that called tools replays with them, and the chat
+    # template renders them back into its own XML. A tool result carries the id
+    # it answers.
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class _Sampling(BaseModel):
@@ -58,6 +65,11 @@ class ChatCompletionRequest(_Sampling):
     # {"enable_thinking": false} is how a caller asks for a direct answer. The
     # name matches vLLM and SGLang so existing clients need no special case.
     chat_template_kwargs: dict[str, Any] | None = None
+    # OpenAI tool definitions. The chat template renders these into a <tools>
+    # block with instructions to answer in its own XML, which `parse_tool_calls`
+    # turns back into OpenAI `tool_calls` on the way out.
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
 
 
 class CompletionRequest(_Sampling):
@@ -93,6 +105,138 @@ def _build(req: _Sampling, engine: Engine, prompt_ids: list[int], max_tokens: in
 
 def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
+_FUNCTION_RE = re.compile(r"<function=([^>\s]+)>\s*(.*?)\s*</function>", re.S)
+_PARAM_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.S)
+
+
+def _coerce(raw: str) -> Any:
+    """Give a parameter back the type its schema probably wanted.
+
+    The template's format is XML with no types, so every value arrives as text.
+    A tool expecting `line: 12` or `recursive: true` would be handed "12" and
+    "true" and reject them. JSON round-tripping recovers the obvious cases while
+    leaving prose alone: a value is only converted when it parses as JSON *and*
+    is not itself a string, so "12" becomes 12 but "hello" and "12 apples" stay
+    as they are.
+    """
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+    return raw if isinstance(parsed, str) else parsed
+
+
+def parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Split the model's output into prose and OpenAI-shaped tool calls.
+
+    This checkpoint does not emit OpenAI tool-call JSON; its chat template asks
+    for XML instead, and without this the calls arrive as literal text -- which
+    is what an agent harness sees as the model refusing to use its tools.
+
+        <tool_call>
+        <function=read>
+        <parameter=file_path>
+        /tmp/note.txt
+        </parameter>
+        </function>
+        </tool_call>
+
+    The template also allows reasoning in prose *before* a call, so whatever sits
+    outside the blocks is kept as content.
+    """
+    calls: list[dict[str, Any]] = []
+    for block in TOOL_CALL_RE.findall(text):
+        fn = _FUNCTION_RE.search(block)
+        if fn is None:
+            continue
+        name, body = fn.group(1), fn.group(2)
+        args = {k: _coerce(v) for k, v in _PARAM_RE.findall(body)}
+        calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            }
+        )
+    content = TOOL_CALL_RE.sub("", text).strip()
+    return content, calls
+
+
+def normalise_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Give the chat template tool-call arguments as an object, not a string.
+
+    OpenAI puts `function.arguments` on the wire as a JSON *string*, and this
+    template refuses it outright: "Tool call arguments for function ... were
+    passed as a JSON string. Parse them into an object before calling
+    apply_chat_template." Left unfixed the first turn of an agent loop succeeds
+    and the second returns 400, which a harness shows as an empty answer.
+
+    A string that does not parse is left alone so the template raises its own
+    error rather than this silently inventing one.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        calls = message.get("tool_calls")
+        if not calls:
+            out.append(message)
+            continue
+        fixed = []
+        for call in calls:
+            fn = call.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                try:
+                    parsed = json.loads(fn["arguments"] or "{}")
+                except ValueError:
+                    fixed.append(call)
+                    continue
+                call = {**call, "function": {**fn, "arguments": parsed}}
+            fixed.append(call)
+        out.append({**message, "tool_calls": fixed})
+    return out
+
+
+TOOL_OPEN = "<tool_call>"
+
+
+class _ToolCallGate:
+    """Stream prose, but hold back anything that turns out to be a tool call.
+
+    A call has to be parsed whole, so it cannot be streamed as it arrives, and
+    emitting it as text is the bug this exists to avoid. But buffering the entire
+    answer would freeze the visible output for the whole generation, so only the
+    tail is held: enough to recognise `<tool_call>` if it is starting, and
+    everything after one begins.
+    """
+
+    def __init__(self, watching: bool) -> None:
+        self.watching = watching
+        self._buf = ""
+        self._in_call = False
+
+    def feed(self, delta: str) -> str:
+        """Content delta in, content delta out (possibly empty)."""
+        if not self.watching:
+            return delta
+        self._buf += delta
+        if self._in_call or TOOL_OPEN in self._buf:
+            self._in_call = True
+            return ""
+        # a partial opening tag may span deltas, so keep back that much
+        hold = len(TOOL_OPEN) - 1
+        if len(self._buf) <= hold:
+            return ""
+        out, self._buf = self._buf[:-hold], self._buf[-hold:]
+        return out
+
+    def flush(self) -> tuple[str, list[dict[str, Any]]]:
+        """-> (trailing content, tool calls)."""
+        buf, self._buf = self._buf, ""
+        if not self._in_call:
+            return buf, []
+        return parse_tool_calls(buf)
 
 
 THINK_CLOSE = "</think>"
@@ -235,10 +379,13 @@ async def health(request: Request) -> JSONResponse:
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
     engine = _engine(request)
-    messages = [m.model_dump() for m in body.messages]
+    messages = normalise_tool_calls([m.model_dump(exclude_none=True) for m in body.messages])
     try:
+        template_kwargs: dict[str, Any] = dict(body.chat_template_kwargs or {})
+        if body.tools:
+            template_kwargs.setdefault("tools", body.tools)
         prompt = engine.apply_chat_template(
-            messages, add_generation_prompt=True, **(body.chat_template_kwargs or {})
+            messages, add_generation_prompt=True, **template_kwargs
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"chat template failed: {exc}") from exc
@@ -256,7 +403,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     if not body.stream:
         text, reason, n = await _collect(engine, gen_req, stops)
         reasoning, content = split_thinking(text, open_block)
-        message: dict[str, Any] = {"role": "assistant", "content": content}
+        content, tool_calls = parse_tool_calls(content)
+        message: dict[str, Any] = {"role": "assistant", "content": content or None}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            # OpenAI reports a call as its own stop reason, and an agent loop
+            # branches on it
+            reason = "tool_calls"
         if reasoning:
             # the key DeepSeek-R1 and vLLM use, so clients that know about it
             # find the reasoning and clients that do not still get a clean answer
@@ -295,6 +448,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         acc: list[str] = []
         reason = "length"
         splitter = _ThinkSplitter(open_block)
+        gate = _ToolCallGate(bool(body.tools))
 
         def chunk(delta: dict) -> str:
             return _sse(
@@ -321,14 +475,23 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 reasoning, content = splitter.feed(event.text)
                 if reasoning:
                     yield chunk({"reasoning_content": reasoning})
+                content = gate.feed(content)
                 if content:
                     yield chunk({"content": content})
             # whatever is still buffered: reasoning if the block never closed
             reasoning, content = splitter.flush()
             if reasoning:
                 yield chunk({"reasoning_content": reasoning})
+            content = gate.feed(content)
             if content:
                 yield chunk({"content": content})
+            trailing, tool_calls = gate.flush()
+            if trailing:
+                yield chunk({"content": trailing})
+            for i, call in enumerate(tool_calls):
+                yield chunk({"tool_calls": [{"index": i, **call}]})
+            if tool_calls:
+                reason = "tool_calls"
         except Exception as exc:  # surface mid-stream failures to the client
             yield _sse({"error": {"message": str(exc), "type": type(exc).__name__}})
             return

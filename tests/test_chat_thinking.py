@@ -58,3 +58,106 @@ def test_answer_streams_once_the_block_closes() -> None:
     sp.feed("thought</think>\n\n")
     assert sp.feed("one") == ("", "one")
     assert sp.feed(" two") == ("", " two")
+
+
+# --------------------------------------------------------------------------
+# tool calls
+# --------------------------------------------------------------------------
+import json  # noqa: E402
+
+from ttrunner_qwen38_flash_next.server.api import (  # noqa: E402
+    _ToolCallGate,
+    parse_tool_calls,
+)
+
+CALL = (
+    "<tool_call>\n<function=read>\n<parameter=file_path>\n/tmp/note.txt\n"
+    "</parameter>\n</function>\n</tool_call>"
+)
+
+
+def test_a_tool_call_is_parsed_out_of_the_xml() -> None:
+    """The checkpoint answers in its template's XML, not OpenAI tool-call JSON.
+
+    Without this an agent harness sees the call as literal text and reads it as
+    the model declining to use its tools.
+    """
+    content, calls = parse_tool_calls(CALL)
+    assert content == ""
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "read"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"file_path": "/tmp/note.txt"}
+    assert calls[0]["type"] == "function" and calls[0]["id"]
+
+
+def test_prose_before_a_call_is_kept() -> None:
+    """The template allows reasoning before a call, and it is part of the answer."""
+    content, calls = parse_tool_calls("Let me look.\n" + CALL)
+    assert content == "Let me look."
+    assert len(calls) == 1
+
+
+def test_parameters_recover_their_types() -> None:
+    """XML has no types; a tool wanting `limit: 12` must not get "12"."""
+    text = (
+        "<tool_call>\n<function=grep>\n<parameter=pattern>\nhello world\n</parameter>\n"
+        "<parameter=limit>\n12\n</parameter>\n<parameter=recursive>\ntrue\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    args = json.loads(parse_tool_calls(text)[1][0]["function"]["arguments"])
+    assert args == {"pattern": "hello world", "limit": 12, "recursive": True}
+
+
+def test_plain_text_is_untouched() -> None:
+    assert parse_tool_calls("just an answer") == ("just an answer", [])
+
+
+def test_the_gate_streams_prose_when_no_call_appears() -> None:
+    gate = _ToolCallGate(True)
+    streamed = "".join(gate.feed(c) for c in "hello there")
+    trailing, calls = gate.flush()
+    assert streamed + trailing == "hello there"
+    assert calls == []
+
+
+def test_the_gate_withholds_a_call_split_across_deltas() -> None:
+    """The opening tag can straddle deltas, so the tail is held back."""
+    gate = _ToolCallGate(True)
+    streamed = "".join(gate.feed(d) for d in ("Look: ", "<tool", "_call>\n<function=read>\n"))
+    streamed += gate.feed("<parameter=file_path>\n/tmp/note.txt\n</parameter>\n")
+    streamed += gate.feed("</function>\n</tool_call>")
+    trailing, calls = gate.flush()
+    assert "<tool_call>" not in streamed + trailing
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "read"
+
+
+def test_the_gate_is_a_passthrough_when_no_tools_were_offered() -> None:
+    gate = _ToolCallGate(False)
+    assert gate.feed("<tool_call> literal") == "<tool_call> literal"
+
+
+def test_tool_call_arguments_are_parsed_for_the_template() -> None:
+    """OpenAI sends arguments as a JSON string; this template demands an object.
+
+    Unfixed, the first turn of an agent loop works and the second returns 400,
+    which a harness reports as an empty answer rather than an error.
+    """
+    from ttrunner_qwen38_flash_next.server.api import normalise_tool_calls
+
+    msgs = normalise_tool_calls(
+        [{"role": "assistant", "tool_calls": [
+            {"id": "1", "type": "function",
+             "function": {"name": "read", "arguments": '{"file_path": "/tmp/x"}'}}]}]
+    )
+    assert msgs[0]["tool_calls"][0]["function"]["arguments"] == {"file_path": "/tmp/x"}
+
+
+def test_unparsable_arguments_are_left_for_the_template_to_reject() -> None:
+    from ttrunner_qwen38_flash_next.server.api import normalise_tool_calls
+
+    msgs = normalise_tool_calls(
+        [{"role": "assistant", "tool_calls": [
+            {"id": "1", "type": "function", "function": {"name": "x", "arguments": "not json"}}]}]
+    )
+    assert msgs[0]["tool_calls"][0]["function"]["arguments"] == "not json"
