@@ -2398,3 +2398,49 @@ the convolution.
 
 "Everything else" being the largest bucket is the finding: no single component
 owns it, so no single ablation was ever going to show it.
+
+## 6. Stage 2 built: the gather works, and replacing the matmul is a regression
+
+`scripts/kernels/expert_gather.cpp` + `scripts/stage2_gather_matmul.py`. The
+stage-1 reader with its checksum replaced by a write, so the selected experts'
+weights land in a compact `[1, K_SEL, K, N]` tensor and the arithmetic can be an
+ordinary dense batched matmul over K_SEL instead of E.
+
+It works, and it is **bit-exact**: gathered against `torch`'s own index, max abs
+error **0.000e+00**. On the real layer-0 `ffn_gateup_exps` `[1, 128, 2560, 1280]`
+bfloat4_b, at K_SEL=10 (the worst case -- all ten routed experts could land on
+one device, and a trace needs a static shape):
+
+| | ms/call | over 48 layers |
+|---|--------:|---------------:|
+| gather only | 0.1495 | 7.18 |
+| dense matmul over K_SEL=10 | 0.3824 | 18.35 |
+| gather + dense matmul | 0.5307 | 25.47 |
+| **one `sparse_matmul` over E=128, today** | **0.321** | -- |
+
+The gather is at bandwidth -- 18.4 MB read plus 18.4 written in 0.1495 ms is
+246 GB/s, matching stage 1. The problem is the other half: **a dense matmul over
+ten experts costs more than a sparse one over 128.** So gather-then-dense is a
+regression, not a win, and `expert_ffn`'s 30.83 ms is not the matmul.
+
+INVARIANT 44: `ttnn.sparse_matmul` is *good* at the matmul. At M=1 it beats a
+dense batched matmul over the ten selected experts (0.321 ms against 0.382),
+even though the dense one reads a twelfth of the weight. Do not replace it. Its
+cost lives in the zero-fill of its `[1, E, M, N]` output (invariant 40) and in
+everything downstream having to work over E rather than over the selection.
+
+Which relocates the target. What is still worth removing, in order:
+
+1. The SwiGLU chain over `[1, 128, 1, 1280]` -- 142 us a layer, 6.83 ms a token
+   (measured as a unit; summing its four ops individually gives 183 and
+   over-adds, because consecutive ops pipeline). A gather of the *output* is
+   25 KB rather than 18 MB and would let the chain run over `[1, 10, 1, 1280]`.
+   That needs the down projection's weights gathered too, or its expert axis
+   will not match.
+2. The zero-fill, 1.51 GB a token, which needs a smaller output and therefore
+   the same restructuring.
+
+Both are the same change: make everything after the first `sparse_matmul` work
+over the selection instead of over E. The gather kernel is the piece that was
+missing and it now exists and is exact; what it should gather is the activations
+and the down weights, not the gate/up weights.
