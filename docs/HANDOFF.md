@@ -3273,13 +3273,29 @@ tuned kernel. Until that is understood, 1.7e-02 relative on a projection that
 runs 96 times a token is not something to ship on the strength of a 1.63 ms
 saving.
 
-INVARIANT 57: splitting a GEMV's reduction across cores is worth **2.14x** on
-the model's narrowest projection and nothing on a wide one, so the mechanism is
-real and the diagnosis in invariant 38 is right. What blocks it is numerics, not
-performance: a hand-written `matmul_tiles` loop does not reproduce
-`ttnn.linear`'s accuracy at these dtypes, and buying that back with fp32
-accumulation costs more than the split saves.
+**Correction, and it nearly cost the whole thing.** The 1.7e-02 above is
+divergence from `ttnn.linear`, which is not the same as error. Judged against
+float64 on the same quantised operands:
 
-Next step for anyone picking this up: find out where the 1.7e-02 comes from at
-`groups=1` -- compare a single-core `matmul_tiles` against `ttnn.linear` on one
-tile, and vary the weight dtype -- rather than tuning the split.
+| shape | kernel | `ttnn.linear` | |
+|-------|-------:|-------------:|---|
+| hc_down `[2560, 320]`, 11 groups | **9.71e-03** | 1.29e-02 | kernel is *more* accurate |
+| router `[2560, 512]`, 6 groups | **1.64e-02** | 1.86e-02 | kernel is *more* accurate |
+| qsa out `[1536, 2560]`, 1 group | 3.91e-02 | 1.68e-02 | 2.3x worse |
+
+On both shapes where it wins on speed it is also the more accurate of the two,
+and the reason is structural: splitting the reduction into groups *is* a
+pairwise summation, which is better conditioned than one long serial
+accumulation. That is why the only shape where it is less accurate is the one
+with a single group, where no pairing happens.
+
+INVARIANT 57: splitting a GEMV's reduction across cores is worth **2.12x** on
+the model's narrowest projection, nothing on a wide one, and is *more accurate*
+than `ttnn.linear` wherever it applies. Judge a replacement against float64, not
+against the op it replaces -- comparing the two to each other made a better
+kernel look like a broken one, and it was nearly discarded on that basis.
+
+Deployed for the hyper-connection `down|inject` matmul: **~83 -> 82.25 ms**,
+about 1 ms where 1.6 was predicted, with quality inside the run-to-run spread
+(top-1 83.0 %, NLL 0.666). The guard is `groups >= 2`, so a shape whose output
+already fills the grid falls through to `ttnn.linear`.

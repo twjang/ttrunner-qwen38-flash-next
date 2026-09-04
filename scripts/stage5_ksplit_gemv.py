@@ -139,14 +139,30 @@ def main() -> None:
             got = ttnn.to_torch(ksplit(), mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
             ref = ttnn.to_torch(ttnn.linear(a, w),
                                 mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
-            d = (got.to(torch.float64) - ref.to(torch.float64)).abs()
-            scale = ref.to(torch.float64).abs().max().item()
-            rel = d.max().item() / max(scale, 1e-30)
-            ok = rel <= 0.05
-            print(f"RESULT {label} groups={groups:3d} cores={groups*nt:4d}  "
-                  f"rel err {rel:.2e} {'OK' if ok else 'MISMATCH'}", flush=True)
-            if not ok:
-                continue
+
+            # Against each other *and* against float64 on the quantised operands.
+            # "Differs from ttnn.linear" is not the same as "less accurate": at
+            # bfloat8_b, two roundings are already ~1.6e-02, so the question is
+            # whether the kernel is further from the truth than the op it would
+            # replace, not whether it matches it bit for bit.
+            a64 = ttnn.to_torch(a, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
+            w64 = ttnn.to_torch(w, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
+            truth = (a64.to(torch.float64).squeeze(0).squeeze(0)
+                     @ w64.to(torch.float64).squeeze(0).squeeze(0))
+            scale = truth.abs().max().item()
+
+            def rel_to_truth(t):
+                v = t.to(torch.float64).squeeze(0).squeeze(0)
+                return (v - truth).abs().max().item() / max(scale, 1e-30)
+
+            r_mine, r_ttnn = rel_to_truth(got), rel_to_truth(ref)
+            rel = (got.to(torch.float64) - ref.to(torch.float64)).abs().max().item() / max(scale, 1e-30)
+            verdict = ("as accurate" if r_mine <= r_ttnn * 1.5
+                       else f"{r_mine / max(r_ttnn, 1e-30):.1f}x worse")
+            print(f"RESULT {label} groups={groups:3d} cores={groups*nt:4d}", flush=True)
+            print(f"RESULT   vs float64: kernel {r_mine:.2e}, ttnn.linear {r_ttnn:.2e} "
+                  f"-> {verdict};  they differ from each other by {rel:.2e}", flush=True)
+            ok = r_mine <= r_ttnn * 1.5
 
             def timed(fn, tag, reps=30, iters=8):
                 for _ in range(2):

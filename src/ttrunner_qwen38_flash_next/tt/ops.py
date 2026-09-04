@@ -224,6 +224,107 @@ def fused_gated_mean(mix, normed, hc_count: int, hidden_size: int):
         return ttnn.multiply(total, 1.0 / hc_count)
 
 
+# --- a GEMV whose reduction is split across cores ----------------------------
+#
+# `ttnn.linear` at M=1 runs at a quarter of bandwidth when its output is narrow,
+# because N decides how many output tiles exist and so how many cores get work
+# (invariant 38). Giving the idle cores a slice of the *reduction* instead --
+# core (g, nt) accumulates only K-tiles [kt_lo, kt_hi) and writes a partial,
+# which one `ttnn.sum` folds -- measures **2.12x** on `hc_down` and 1.49x on the
+# router, and loses on shapes whose output already fills the grid.
+#
+# It is also *more accurate* than the op it replaces: against float64 the kernel
+# is 9.71e-03 where `ttnn.linear` is 1.29e-02, because splitting the reduction is
+# a pairwise summation and better conditioned than one long serial accumulation.
+# The two differ from each other by 1.73e-02, which is what nearly got this
+# discarded -- divergence from `ttnn.linear` is not error (invariant 57).
+_KSPLIT: dict = {}
+_KS_KDIR = Path(__file__).resolve().parents[3] / "scripts" / "kernels"
+
+
+def _ksplit_build(a, w, out, groups: int, kt: int, nt: int):
+    grid = a.device().compute_with_storage_grid_size()
+    cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
+    crs = ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    acc = {}
+    for tag, t in (("a", a), ("w", w), ("o", out)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"{tag}: the k-split GEMV wants interleaved tensors")
+        acc[tag] = ct
+
+    plan = []
+    for g in range(groups):
+        lo, hi = (kt * g) // groups, (kt * (g + 1)) // groups
+        for n in range(nt):
+            plan.append((lo, hi, n, g))
+    if len(plan) > len(cores):
+        raise RuntimeError(f"{len(plan)} work items over {len(cores)} cores")
+    while len(plan) < len(cores):
+        plan.append((0, 0, 0, 0))                     # idle core
+
+    cbs = [
+        ttnn.CBDescriptor(total_size=4 * acc["a"][1], core_ranges=crs,
+                          format_descriptors=[ttnn.CBFormatDescriptor(
+                              buffer_index=0, data_format=a.dtype, page_size=acc["a"][1])]),
+        ttnn.CBDescriptor(total_size=4 * acc["w"][1], core_ranges=crs,
+                          format_descriptors=[ttnn.CBFormatDescriptor(
+                              buffer_index=1, data_format=w.dtype, page_size=acc["w"][1])]),
+        ttnn.CBDescriptor(total_size=2 * acc["o"][1], core_ranges=crs,
+                          format_descriptors=[ttnn.CBFormatDescriptor(
+                              buffer_index=16, data_format=out.dtype, page_size=acc["o"][1])]),
+    ]
+
+    def kern(name, ct, args, cfg):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KS_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfg)
+
+    aa, wa, oa = a.buffer_address(), w.buffer_address(), out.buffer_address()
+    return ttnn.ProgramDescriptor(
+        kernels=[
+            kern("ksplit_reader.cpp", [kt, nt] + acc["a"] + acc["w"],
+                 [[aa, wa, lo, hi, n] for lo, hi, n, _ in plan],
+                 ttnn.ReaderConfigDescriptor()),
+            kern("ksplit_compute.cpp", [], [[hi - lo] for lo, hi, _, _ in plan],
+                 ttnn.ComputeConfigDescriptor(math_fidelity=ttnn.MathFidelity.HiFi4)),
+            kern("ksplit_writer.cpp", [nt] + acc["o"],
+                 [[oa, g, n] for _, _, n, g in plan], ttnn.WriterConfigDescriptor()),
+        ],
+        semaphores=[], cbs=cbs)
+
+
+def ksplit_linear(x, w):
+    """`x @ w` with the reduction split across cores, or `ttnn.linear` if it would not pay.
+
+    Only worth it while the output cannot fill the grid on its own: at
+    `[1536, 2560]` the split measured 0.79x and less accurate, so the guard is
+    that the split has to buy at least two reduction groups.
+    """
+    dev = x.device()
+    kt, nt = w.shape[-2] // 32, w.shape[-1] // 32
+    grid = dev.compute_with_storage_grid_size()
+    n_cores = grid.x * grid.y
+    groups = max(1, min(kt, n_cores // max(nt, 1)))
+    if groups < 2 or x.shape[-2] > 32:
+        return linear_rows(x, w, compute_kernel_config=HIFI4)
+
+    key = (id(w), x.shape[-2], groups)
+    got = _KSPLIT.get(key)
+    if got is None:
+        out = ttnn.from_torch(
+            torch.zeros(1, groups, x.shape[-2], w.shape[-1]), dtype=x.dtype,
+            layout=ttnn.TILE_LAYOUT, device=dev,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(dev))
+        got = (out, None)
+        _KSPLIT[key] = got
+    out = got[0]
+    ttnn.generic_op([x, w, out], _ksplit_build(x, w, out, groups, kt, nt))
+    return ttnn.sum(out, dim=1, keepdim=True)
+
 # --- down and inject as one matmul -------------------------------------------
 #
 # `inject_w` is [10240, 4]: four output columns, one tile, and the narrowest
@@ -300,8 +401,7 @@ def gated_residual_mix(
         part = linear_rows(local, down_w, compute_kernel_config=HIFI4)
     else:
         # One matmul for both: see `down_inject_weight`.
-        part = linear_rows(local, down_inject_weight(down_w, inject_w, span),
-                           compute_kernel_config=HIFI4)
+        part = ksplit_linear(local, down_inject_weight(down_w, inject_w, span))
     whole = ttnn.all_reduce(part, cluster_axis=1, topology=ttnn.Topology.Linear)
     mix = ttnn.silu(
         whole if inject_w is None
