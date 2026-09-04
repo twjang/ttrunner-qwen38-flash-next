@@ -52,27 +52,50 @@ torch.manual_seed(0)
 ring = u.effective_matmul_ring_size(mesh)
 width_dim = u.auto_output_width_shard_dim(K, matmul_ring_size=ring)
 
-w0 = torch.randn(1, E_LOCAL, K, N) * 0.05
-w1 = torch.randn(1, E_LOCAL, K, N) * 0.05
-w2 = torch.randn(1, E_LOCAL, N, K) * 0.05
-
-w0_w1_map, w2_map, dram_cores = u.get_weight_core_shard_maps(mesh, K, N)
-w0w1 = u.prepare_w0_w1_tensor_for_moe_compute(w0, w1, 1, E_LOCAL, K, N, w0_w1_map)
-w2p = u.prepare_w2_tensor_for_moe_compute(w2, 1, E_LOCAL, N, K, w2_map, w0_w1_map)
-w0w1_mc, w2_mc, _, _ = u.get_weight_mem_configs(1, E_LOCAL, K, N, w0_w1_map, w2_map, dram_cores)
+w0 = (torch.randn(1, E_LOCAL, K, N) * 0.05).to(torch.bfloat16)
+w1 = (torch.randn(1, E_LOCAL, K, N) * 0.05).to(torch.bfloat16)
+w2 = (torch.randn(1, E_LOCAL, N, K) * 0.05).to(torch.bfloat16)
 
 rep = ttnn.ReplicateTensorToMesh(mesh)
 shard0 = ttnn.ShardTensorToMesh(mesh, dim=0)
 
-w0w1_d = ttnn.from_torch(w0w1, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                         device=mesh, memory_config=w0w1_mc, mesh_mapper=rep)
-w2_d = ttnn.from_torch(w2p, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                       device=mesh, memory_config=w2_mc, mesh_mapper=rep)
+# The packers in `moe_compute_utils` are, as that module says of itself,
+# "executable specifications" -- reference implementations for tests. The
+# production path is the on-device prepare ops plus a host quantise, and using
+# the spec instead is what made the combine output garbage.
+def _raw(t):
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16, device=mesh,
+                           memory_config=ttnn.DRAM_MEMORY_CONFIG, mesh_mapper=rep)
+
+
+_w0, _w1, _w2 = _raw(w0), _raw(w1), _raw(w2)
+_w0w1_prep = ttnn.experimental.prepare_w0_w1_tensor_for_moe_compute(
+    _w0, _w1, L=1, E=E_LOCAL, K=K, N=N)
+ttnn.deallocate(_w0)
+ttnn.deallocate(_w1)
+w0w1_host = ttnn.experimental.quantize_weights_via_host(
+    _w0w1_prep, dtype=ttnn.bfloat4_b, memory_config=None)
+ttnn.deallocate(_w0w1_prep)
+
+_w2_prep = ttnn.experimental.prepare_w2_tensor_for_moe_compute(
+    _w2, L=1, E=E_LOCAL, N=N, K=K)
+ttnn.deallocate(_w2)
+w2_host = ttnn.experimental.quantize_weights_via_host(
+    _w2_prep, dtype=ttnn.bfloat4_b, memory_config=None)
+ttnn.deallocate(_w2_prep)
+
+wmc = ttnn.experimental.get_weight_mem_configs(
+    mesh, num_layers=1, experts_per_device=E_LOCAL,
+    hidden_size=K, intermediate_size=N, has_bias=False)
+w0w1_d = ttnn.to_device(w0w1_host, mesh, memory_config=wmc.w0_w1)
+w2_d = ttnn.to_device(w2_host, mesh, memory_config=wmc.w2)
+print(f"RESULT weights prepared on device: {tuple(w0w1_d.shape)} {tuple(w2_d.shape)}",
+      flush=True)
 
 # FullCcl carries the combine over fabric through mux workers, which need cores
 # of their own -- "Not enough mux cores! Needed: 1 ... Available: 0" is what
-# passing None gets you. ((1,1),(3,3)) is the upstream default. The drain core is
-# placed around them, so the same set has to go to both.
+# passing None gets you. ((1,1),(3,3)) is the upstream default. It feeds three
+# placement helpers, so it has to be decided before any of them.
 MUX = (ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(1, 1), ttnn.CoreCoord(3, 3))])
        if len(sys.argv) > 1 and sys.argv[1] == "ccl" else None)
 
@@ -146,11 +169,13 @@ arg = sys.argv[1] if len(sys.argv) > 1 else "combine"
 if arg == "ccl":
     M = 32
     inputs, tokens, idx, scores = build(M)
-    grid = mesh.compute_with_storage_grid_size()
+    # On the combine cores, not the whole grid -- that is where the barrier is
+    # waited on (§4c.4).
+    combine_cores = ttnn.experimental.get_moe_combine_cores(
+        mesh, HEIGHT_SHARD, width_dim, K, mux_core_range_set=MUX)
     sem = ttnn.create_global_semaphore(
-        mesh, ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0),
-                                                ttnn.CoreCoord(grid.x - 1, grid.y - 1))}), 0)
-    print("RESULT semaphore created", flush=True)
+        mesh, ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in combine_cores]), 0)
+    print(f"RESULT semaphore on {len(combine_cores)} combine cores", flush=True)
     out_t = ttnn.from_torch(torch.zeros(TOPK, M, K, dtype=torch.bfloat16),
                             dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
                             device=mesh, mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=1))
@@ -168,6 +193,50 @@ if arg == "ccl":
         ttnn.synchronize_device(mesh)
         best = min(best, 1000 * (time.perf_counter() - t0))
     print(f"RESULT FullCcl steady state: {best:.2f} ms/layer", flush=True)
+
+    # The combine output is token-sharded: device d holds its own slice of the
+    # tokens, already summed across every expert the CCL stage gathered. So
+    # concatenating on the token axis and summing over k should *be* the MoE
+    # output -- no all-reduce, unlike the path we have now.
+    full = ttnn.to_torch(outs[-1], mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=1))
+    f64 = full.to(torch.float64)
+
+    # Unpopulated (k, token) slots are not zeroed by the op -- upstream's
+    # validator carries an `output_data_map` for exactly this reason -- so find
+    # out which slots carry data before summing anything.
+    bad = ~torch.isfinite(f64)
+    print(f"RESULT non-finite: {bad.sum().item()} of {bad.numel()} elements; "
+          f"per-k rows affected {[int(bad[k].any(dim=-1).sum()) for k in range(TOPK)]}",
+          flush=True)
+    rowbad = bad.any(dim=-1)                                    # [k, M]
+    print(f"RESULT tokens with any bad slot: "
+          f"{int(rowbad.any(dim=0).sum())} of {M}", flush=True)
+    # Slot k holds the raw output of the token's k-th selected expert, with **no
+    # score applied** -- `compute_matmul_golden` upstream takes no scores at all,
+    # and the combine golden assigns `contrib` unweighted. The router weighting
+    # is the model's job, so apply it here.
+    clean = torch.where(rowbad.unsqueeze(-1), torch.zeros_like(f64), f64)
+    w = scores.to(torch.float64).transpose(0, 1).unsqueeze(-1)  # [k, M, 1]
+    got = (clean * w).sum(dim=0)
+
+    x = tokens.to(torch.float64)
+    W0, W1, W2 = (w.to(torch.float64) for w in (w0[0], w1[0], w2[0]))
+    want = torch.zeros(M, K, dtype=torch.float64)
+    for t in range(M):
+        for j in range(TOPK):
+            el = int(idx[t, j]) % E_LOCAL
+            g = x[t] @ W0[el]
+            h = (g * torch.sigmoid(g)) * (x[t] @ W1[el])
+            want[t] += float(scores[t, j]) * (h @ W2[el])
+
+    err = (got - want).abs().max().item()
+    scale = want.abs().max().item()
+    num = (got * want).sum().item()
+    den = (got.norm() * want.norm()).item()
+    print(f"RESULT concat shape {tuple(full.shape)} -> summed {tuple(got.shape)}", flush=True)
+    print(f"RESULT max abs err {err:.4e} (values up to {scale:.4e}, "
+          f"rel {err / max(scale, 1e-30):.3e}), cosine {num / max(den, 1e-30):.6f}",
+          flush=True)
     ttnn.close_mesh_device(mesh)
     raise SystemExit(0)
 

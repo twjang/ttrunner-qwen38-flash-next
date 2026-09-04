@@ -1815,3 +1815,48 @@ INVARIANT 32: read the reference flow a docstring points at before wiring
 against the op, not after. Every wrong turn in §4c -- "CCL is broken here",
 "the port is closed", the missing mux cores -- was already answered in
 `test_moe_compute_6U.py`.
+
+### 4c.5 FullCcl validated, and the weight path that makes it work
+
+Numbers, all at M=32 on the 1x4 mesh: **1.65 ms/layer** eager, **57.7 ms for all
+48 layers inside a trace** (1.20 ms/layer; tracing buys only 1.03x over eager,
+so this is device-bound, not dispatch-bound). Against a whole traced decode step
+of 109.2 ms today.
+
+Correctness took three fixes, each of which was already written down upstream:
+
+**1. The Python packers are not the production path.** `moe_compute_utils`
+describes itself as "executable specifications", and using them produced a
+combine output that was 96 % non-finite. The real path is on-device:
+
+    _prep = ttnn.experimental.prepare_w0_w1_tensor_for_moe_compute(w0, w1, L=, E=, K=, N=)
+    host  = ttnn.experimental.quantize_weights_via_host(_prep, dtype=ttnn.bfloat4_b,
+                                                        memory_config=None)
+    dev   = ttnn.to_device(host, mesh, memory_config=wmc.w0_w1)
+
+with `wmc = ttnn.experimental.get_weight_mem_configs(mesh, num_layers=,
+experts_per_device=, hidden_size=, intermediate_size=, has_bias=)`. Raw weights
+go up replicated to DRAM first; `memory_config=None` on the quantise is what
+makes it hand back a host tensor.
+
+**2. `bfloat4_b` is mandatory.** Quantising to `bfloat16` instead is not a
+precision trade -- the output comes back all zeros. Fine for us, since the
+experts are 4-bit anyway.
+
+**3. The combine applies no router weights.** `compute_matmul_golden` upstream
+takes no scores argument at all, and the combine golden assigns `contrib`
+unweighted. Slot k holds the raw output of the token's k-th selected expert; the
+score weighting is the model's job. Applying it host-side moved cosine from
+0.728 to 0.980.
+
+INVARIANT 33: the combine output is `[k, tokens, hidden]`, token-sharded across
+the mesh, holding *unweighted* per-expert results. The MoE output is
+`sum_k score[t,k] * out[k,t]` after concatenating on the token axis -- and it is
+already summed across devices, so it needs an all-gather on tokens, **not** the
+all-reduce our current path uses.
+
+Residual error against float64 with 4-bit weights: max abs 2.35e-02 on values up
+to 1.19e-01, cosine 0.980. Whether that is acceptable is an end-to-end question
+(quality today is 102/127 top-1, NLL 0.887), not one this harness can settle,
+because our own `sparse_matmul` path is 4-bit too and has never been measured
+this way on the same inputs.
