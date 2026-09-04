@@ -398,8 +398,14 @@ class TTEngine(Engine):
     def decode(self, token_ids: list[int]) -> str:
         return self.tokenizer.decode(token_ids)
 
-    def apply_chat_template(self, messages: list[dict], add_generation_prompt: bool = True) -> str:
-        return self.tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt)
+    def apply_chat_template(
+        self, messages: list[dict], add_generation_prompt: bool = True, **kwargs
+    ) -> str:
+        # kwargs reach the Jinja template, which is how `enable_thinking` and
+        # `reasoning_effort` are set -- see the server's chat_template_kwargs.
+        return self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=add_generation_prompt, **kwargs
+        )
 
     @property
     def stats(self) -> EngineStats:

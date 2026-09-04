@@ -64,7 +64,9 @@ class Engine(abc.ABC):
     def decode(self, token_ids: list[int]) -> str: ...
 
     @abc.abstractmethod
-    def apply_chat_template(self, messages: list[dict], add_generation_prompt: bool = True) -> str: ...
+    def apply_chat_template(
+        self, messages: list[dict], add_generation_prompt: bool = True, **kwargs
+    ) -> str: ...
 
     @abc.abstractmethod
     def generate(self, request: GenerationRequest) -> AsyncIterator[TokenEvent]: ...
@@ -102,8 +104,12 @@ class ReferenceEngine(Engine):
     def decode(self, token_ids: list[int]) -> str:
         return self.tokenizer.decode(token_ids)
 
-    def apply_chat_template(self, messages: list[dict], add_generation_prompt: bool = True) -> str:
-        return self.tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt)
+    def apply_chat_template(
+        self, messages: list[dict], add_generation_prompt: bool = True, **kwargs
+    ) -> str:
+        return self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=add_generation_prompt, **kwargs
+        )
 
     @property
     def stats(self) -> EngineStats:

@@ -53,6 +53,11 @@ class ChatCompletionRequest(_Sampling):
     model: str
     messages: list[ChatMessage]
     max_completion_tokens: int | None = None
+    # Passed straight to the Jinja chat template. This checkpoint's template
+    # reads `enable_thinking` (default true) and `reasoning_effort`, so
+    # {"enable_thinking": false} is how a caller asks for a direct answer. The
+    # name matches vLLM and SGLang so existing clients need no special case.
+    chat_template_kwargs: dict[str, Any] | None = None
 
 
 class CompletionRequest(_Sampling):
@@ -88,6 +93,79 @@ def _build(req: _Sampling, engine: Engine, prompt_ids: list[int], max_tokens: in
 
 def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+THINK_CLOSE = "</think>"
+
+
+def _thinking_is_open(prompt: str) -> bool:
+    """Does the rendered prompt leave the model inside a reasoning block?
+
+    Read off the prompt rather than assumed from the request, because the
+    template decides. With thinking on it ends `<|im_start|>assistant\n<think>\n`
+    and the model generates reasoning, then `</think>`, then the answer. With
+    `enable_thinking: false` it ends `<think>\n\n</think>\n\n` -- already
+    closed -- and everything generated is answer.
+    """
+    return prompt.rstrip().endswith("<think>")
+
+
+class _ThinkSplitter:
+    """Split a reasoning model's output into reasoning and answer.
+
+    The closing tag can straddle two token deltas, so while the block is open
+    everything is buffered and released when the tag arrives. Reasoning is
+    therefore delivered in one piece rather than incrementally, which costs
+    nothing that matters: the answer still streams from the moment it starts,
+    and that is the part a caller renders.
+
+    When the block never closes -- the token budget ran out mid-thought -- the
+    buffer is reasoning, and the answer is empty. That is the honest shape, and
+    an empty `content` with `finish_reason: length` says exactly what happened.
+    """
+
+    def __init__(self, open_block: bool) -> None:
+        self.open = open_block
+        self._buf = ""
+        # the template puts a blank line after the tag, and it is not part of the
+        # answer. It cannot simply be stripped from the delta that carried the
+        # tag: if the tag straddles two deltas the newlines arrive in a later
+        # one, so the trim is a state that outlives a single delta.
+        self._trim = False
+
+    def _answer(self, text: str) -> str:
+        if self._trim:
+            text = text.lstrip("\n")
+            if text:
+                self._trim = False
+        return text
+
+    def feed(self, delta: str) -> tuple[str, str]:
+        """One delta in, (reasoning, content) out. Either may be empty."""
+        if not self.open:
+            return "", self._answer(delta)
+        self._buf += delta
+        cut = self._buf.find(THINK_CLOSE)
+        if cut < 0:
+            return "", ""
+        reasoning = self._buf[:cut]
+        rest = self._buf[cut + len(THINK_CLOSE):]
+        self._buf = ""
+        self.open = False
+        self._trim = True
+        return reasoning, self._answer(rest)
+
+    def flush(self) -> tuple[str, str]:
+        buf, self._buf = self._buf, ""
+        return (buf, "") if self.open else ("", self._answer(buf))
+
+
+def split_thinking(text: str, open_block: bool) -> tuple[str, str]:
+    """`_ThinkSplitter` over a whole string. -> (reasoning, content)."""
+    sp = _ThinkSplitter(open_block)
+    r1, c1 = sp.feed(text)
+    r2, c2 = sp.flush()
+    return r1 + r2, c1 + c2
 
 
 async def _collect(
@@ -159,10 +237,15 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     engine = _engine(request)
     messages = [m.model_dump() for m in body.messages]
     try:
-        prompt = engine.apply_chat_template(messages, add_generation_prompt=True)
+        prompt = engine.apply_chat_template(
+            messages, add_generation_prompt=True, **(body.chat_template_kwargs or {})
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"chat template failed: {exc}") from exc
 
+    # Whether the model is starting inside a reasoning block is a property of
+    # the prompt the template just produced, so read it there.
+    open_block = _thinking_is_open(prompt)
     prompt_ids = engine.encode(prompt)
     max_tokens = body.max_completion_tokens or body.max_tokens or 128
     gen_req = _build(body, engine, prompt_ids, max_tokens)
@@ -172,6 +255,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     if not body.stream:
         text, reason, n = await _collect(engine, gen_req, stops)
+        reasoning, content = split_thinking(text, open_block)
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning:
+            # the key DeepSeek-R1 and vLLM use, so clients that know about it
+            # find the reasoning and clients that do not still get a clean answer
+            message["reasoning_content"] = reasoning
         return JSONResponse(
             {
                 "id": cid,
@@ -181,7 +270,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": text},
+                        "message": message,
                         "finish_reason": reason,
                     }
                 ],
@@ -205,6 +294,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         )
         acc: list[str] = []
         reason = "length"
+        splitter = _ThinkSplitter(open_block)
+
+        def chunk(delta: dict) -> str:
+            return _sse(
+                {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": body.model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                }
+            )
+
         try:
             async for event in engine.generate(gen_req):
                 if event.finish_reason:
@@ -216,15 +318,17 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 if hit:
                     reason = "stop"
                     break
-                yield _sse(
-                    {
-                        "id": cid,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": body.model,
-                        "choices": [{"index": 0, "delta": {"content": event.text}, "finish_reason": None}],
-                    }
-                )
+                reasoning, content = splitter.feed(event.text)
+                if reasoning:
+                    yield chunk({"reasoning_content": reasoning})
+                if content:
+                    yield chunk({"content": content})
+            # whatever is still buffered: reasoning if the block never closed
+            reasoning, content = splitter.flush()
+            if reasoning:
+                yield chunk({"reasoning_content": reasoning})
+            if content:
+                yield chunk({"content": content})
         except Exception as exc:  # surface mid-stream failures to the client
             yield _sse({"error": {"message": str(exc), "type": type(exc).__name__}})
             return
