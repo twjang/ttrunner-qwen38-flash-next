@@ -3029,3 +3029,43 @@ way that was not chased down. The op-by-op numbers above stand on their own; the
 Also fixed while here: the wide path's fallback to `sparse_matmul` was a silent
 `except: pass`, which would have left the old path running while every
 measurement claimed the new one. It now warns once. Checked: it does not fire.
+
+## 11. The unattributed time was never a component
+
+Re-censused after everything above:
+
+| | at the start | now |
+|---|---:|---:|
+| ttnn calls a step | 7064 | **6426** |
+| bytes moved a step (per device, from shapes) | 25.29 GB | **4.72 GB** |
+| step | 146.18 ms | **91.09 ms** |
+
+`sparse_matmul` is gone from the list entirely -- the wide path turned it into
+`ttnn.linear`, which is now 880 calls moving 4.142 GB. **Bytes fell 81 %.**
+
+And the accounting closes, which answers the question that has been open since
+section 5.4. Modelling each op as `max(5.5 us, its bytes / 388 GB/s)`, and
+linears at the 25-33 % of bandwidth invariant 38 measured:
+
+    ~5546 small ops x 5.5 us                     ~30 ms
+    880 linears, 4.142 GB at ~4x their byte time ~43 ms
+                                                 ------
+                                                 ~73 ms   against 91.09 measured
+
+So **the "unattributed 30 ms" is the per-op floor, spread across five and a half
+thousand small operations.** It never belonged to a component, which is exactly
+why no component ablation could show it: stubbing one out leaves every other
+op's floor standing. Every hunt for it in sections 5.4 through 10.2 was looking
+for the wrong kind of thing.
+
+INVARIANT 54: the decode step's time is roughly `5.5 us x (number of ops)` plus
+the linears at three to four times their byte time. At 6426 calls that floor
+alone is 35 ms, so **no amount of byte-level work gets past it** -- the bytes are
+already down to 4.72 GB, which is 12 ms at bandwidth. Only fusing ops away moves
+the floor, and only widening the linears' output moves the other half.
+
+What that implies for the 32.6 ms target, stated plainly: it needs the op count
+roughly halved *and* the linears saturating. Both are known-possible -- the two
+fused kernels deployed here each removed the ops they replaced, and the wide
+gather showed what widening an output does -- but it is a long grind of the same
+two moves, not one more insight.
