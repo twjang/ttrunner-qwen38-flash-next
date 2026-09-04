@@ -212,6 +212,14 @@ def moe_block(
     sparsity = ttnn.max(keep, dim=-2, keepdim=True)
     sparsity = ttnn.to_layout(ttnn.typecast(sparsity, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)
 
+    if WIDE_EXPERTS and up_w is None:
+        # Two gathers and two wide matmuls, the second of which also combines.
+        # Falls back below if anything about the shapes is unexpected.
+        try:
+            return wide_expert_ffn(x, gate_w, down_w, weights, WIDE_EXPERTS, hidden_size)
+        except Exception:                                   # noqa: BLE001
+            pass
+
     per_expert = expert_ffn(
         x, gate_w, up_w, down_w, sparsity, None, e_local, hidden_size, intermediate_size
     )                                                     # [1, E_local, M, K]
@@ -382,6 +390,145 @@ def fused_swiglu(both, n_out: int):
         gate = ttnn.slice(both, (0, 0, 0, 0), (1, e, m, n_out))
         up = ttnn.slice(both, (0, 0, 0, n_out), (1, e, m, 2 * n_out))
         return ttnn.multiply(ttnn.silu(gate), up)
+
+
+# --- the wide-gather expert path ---------------------------------------------
+#
+# `sparse_matmul` is good at the matmul (invariant 44) but everything around it
+# pays for an expert axis of 128 when ~3 experts are wanted: a mask-independent
+# zero-fill of 1.51 GB a token (invariant 40) and every downstream elementwise op
+# sized by E rather than by the selection (invariant 42).
+#
+# Gathering the selected experts side by side into one wide matrix removes all of
+# it. The layout is what decides whether that is worth doing: gathered into an
+# expert *batch* it loses to sparse_matmul, gathered into width it beats it 7x
+# (invariant 52). Measured at the safe K_SEL=10, gate/up is 10.60 ms over 48
+# layers against 30.83 for both projections today.
+#
+# The down projection is gathered with the other concatenation, on its input
+# axis, so its matmul sums over the experts -- which is `_combine`, for free.
+_GATHER_KERNEL = str(Path(__file__).resolve().parents[3] / "scripts" / "kernels"
+                     / "expert_gather.cpp")
+_GATHER_BUF: dict = {}
+_IDX_LEN = 128            # index page width in uint32 -> 512 B
+_READ_BATCH = 8
+# Selection width for the wide path, or 0 to keep `sparse_matmul`. Ten is
+# the worst case for top-10 over four devices and therefore the exact one;
+# smaller values would drop a routed expert when the routing clusters.
+WIDE_EXPERTS = 10
+
+
+def _buf(key, shape, dtype, device):
+    """A persistent output for `generic_op`, which cannot allocate under capture."""
+    got = _GATHER_BUF.get(key)
+    if got is None:
+        got = ttnn.from_torch(
+            torch.zeros(*shape), dtype=dtype, layout=ttnn.TILE_LAYOUT,
+            device=device, mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+        _GATHER_BUF[key] = got
+    return got
+
+
+def _gather_program(weights, indices, out, k_sel: int, wide: int):
+    grid = weights.device().compute_with_storage_grid_size()
+    cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
+    crs = ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    acc = {}
+    for tag, t in (("w", weights), ("i", indices), ("o", out)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"{tag}: the gather wants interleaved tensors")
+        acc[tag] = ct
+    tile_bytes, idx_bytes = acc["w"][1], acc["i"][1]
+
+    kt, nt = weights.shape[-2] // TILE, weights.shape[-1] // TILE
+    tpe = kt * nt
+    total = k_sel * tpe
+    work = [((total * c) // len(cores), (total * (c + 1)) // len(cores))
+            for c in range(len(cores))]
+
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=(_READ_BATCH + 1) * tile_bytes, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=0, data_format=weights.dtype, page_size=tile_bytes)]),
+        ttnn.CBDescriptor(
+            total_size=64 * ((idx_bytes + 64 + 63) // 64), core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=1, data_format=ttnn.uint32, page_size=64)]),
+    ]
+    ct_args = [tpe, tile_bytes, _READ_BATCH, idx_bytes,
+               weights.shape[1], k_sel, nt, wide]
+    ct_args += acc["w"] + acc["i"] + acc["o"]
+    addrs = (weights.buffer_address(), indices.buffer_address(), out.buffer_address())
+    kernel = ttnn.KernelDescriptor(
+        kernel_source=_GATHER_KERNEL,
+        source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+        core_ranges=crs, compile_time_args=ct_args,
+        runtime_args=[(c, [*addrs, lo, hi]) for c, (lo, hi) in zip(cores, work)],
+        config=ttnn.ReaderConfigDescriptor())
+    return ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=cbs)
+
+
+def _gather(weights, idx_u32, k_sel: int, wide: int, out_shape):
+    out = _buf(("g", wide, out_shape, str(weights.dtype)), out_shape,
+               weights.dtype, weights.device())
+    ttnn.generic_op([weights, idx_u32, out],
+                    _gather_program(weights, idx_u32, out, k_sel, wide))
+    return out
+
+def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size):
+    """The whole MoE for this device: two gathers, two wide matmuls, one SwiGLU.
+
+    `weights_local` is the router's normalised weights restricted to this
+    device's experts, zero where an expert was not selected. `ttnn.topk` on it
+    hands back both the local ids to gather and the scores to scale by, and the
+    zero-scored padding entries contribute nothing -- so a fixed `k_sel` is safe
+    as long as it is the worst case, which for top-10 over four devices is 10.
+
+    Shapes, with N the intermediate width and E the local expert count:
+
+        gather gate|up (WIDE=2)   [1, 1, K, k_sel*2N]   gates then ups
+        linear                     [1, 1, M, k_sel*2N]
+        fused SwiGLU               [1, 1, M, k_sel*N]
+        scale by the router        (one small matmul broadcasts k_sel -> k_sel*N)
+        gather down (WIDE=0)       [1, 1, k_sel*N, K]   experts stacked on rows
+        linear                     [1, 1, M, K]         <- sums the experts
+
+    That last matmul is the combine: stacking the down slabs on their input axis
+    makes the contraction run over experts as well as over N. The caller's
+    all-reduce then completes the sum across devices, exactly as before.
+    """
+    dev = x.device()
+    n = gate_w.shape[-1] // 2                     # intermediate width
+    vals, idx = ttnn.topk(weights_local, k=k_sel, dim=-1, largest=True, sorted=True)
+
+    # The kernel reads its selection as uint32 out of a row-major page.
+    idx_pad = ttnn.pad(
+        ttnn.to_layout(ttnn.typecast(idx, ttnn.uint32), ttnn.ROW_MAJOR_LAYOUT),
+        [(0, 0), (0, 0), (0, 0), (0, _IDX_LEN - k_sel)], 0)
+
+    gu = _gather(gate_w, idx_pad, k_sel, 2, (1, 1, gate_w.shape[-2], k_sel * 2 * n))
+    both = ttnn.linear(x, gu, compute_kernel_config=HIFI4)
+    hidden = fused_swiglu(both, k_sel * n)
+
+    # Broadcast each expert's score across its n columns. `repeat_interleave` is
+    # pathological here (14.4 ms, see `reinject`), so it is one small matmul
+    # against a constant 0/1 block matrix instead.
+    spread = _buf(("spread", k_sel, n), (1, 1, k_sel, k_sel * n), ttnn.bfloat16, dev)
+    if _GATHER_BUF.get(("spread_init", k_sel, n)) is None:
+        blk = torch.zeros(1, 1, k_sel, k_sel * n)
+        for sidx in range(k_sel):
+            blk[0, 0, sidx, sidx * n:(sidx + 1) * n] = 1.0
+        ttnn.copy(ttnn.from_torch(blk, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                  device=dev,
+                                  mesh_mapper=ttnn.ReplicateTensorToMesh(dev)), spread)
+        _GATHER_BUF[("spread_init", k_sel, n)] = True
+    scaled = ttnn.multiply(hidden, ttnn.matmul(vals, spread, compute_kernel_config=HIFI4))
+
+    dw = _gather(down_w, idx_pad, k_sel, 0, (1, 1, k_sel * n, hidden_size))
+    return ttnn.linear(scaled, dw, compute_kernel_config=HIFI4)
 
 
 def shared_expert(

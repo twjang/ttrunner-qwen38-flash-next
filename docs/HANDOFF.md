@@ -2942,3 +2942,53 @@ fills the grid, and an expert axis is not width.
 Not yet wired into `expert_ffn`: the down-projection gather, the router scaling
 between the two matmuls, and removing `_combine`. The kernel supports both
 layouts and is bit-exact; what remains is the plumbing.
+
+### 10.1 Deployed: the wide-gather MoE, and why it is 5 ms rather than 14
+
+`moe.wide_expert_ffn`, gated by `moe.WIDE_EXPERTS` (the selection width, or 0
+for the old path). **96.21 -> 91.22 ms a token.**
+
+The path, for a device holding 128 of the 512 experts:
+
+    topk on the localised router weights   -> k_sel local ids *and* their scores
+    gather gate|up (WIDE=2)                   [1, 1, K, k_sel*2N], gates then ups
+    one linear                                [1, 1, M, k_sel*2N]
+    fused SwiGLU                              [1, 1, M, k_sel*N]
+    scale by the scores                       (one small matmul broadcasts them)
+    gather down (WIDE=0)                      [1, 1, k_sel*N, K], stacked on rows
+    one linear                                [1, 1, M, K]   <- sums the experts
+
+The last matmul *is* `_combine`: stacking the down slabs on their input axis
+makes the contraction run over experts as well as over N. The caller's
+all-reduce completes the sum across devices exactly as before, so nothing
+outside the MoE changed.
+
+Using `ttnn.topk` on the localised weights is what makes a fixed width safe: it
+returns the ids to gather and the scores to scale by together, and entries that
+were not selected have score zero and contribute nothing. k_sel=10 is the exact
+worst case for top-10 over four devices.
+
+Agreement with the path it replaces: **cosine 0.999903**, max abs error 7.6e-06
+on values to 1.0e-03. Quality after: top-1 85.1 % against 83.0, top-5 97.9 %
+both, NLL 0.674 against 0.663.
+
+**Why 5 ms and not the 14 the component numbers implied.** Measured on one real
+layer: `moe_block` went 0.9794 -> 0.8877 ms, 1.10x. The gathers and the two wide
+matmuls do save what section 10 measured, but the path around them gives much of
+it back -- a second `topk` (k=10 over 128, once a layer), the index typecast,
+layout change and pad the kernel's uint32 page needs, the score broadcast, and
+two `generic_op` launches. Roughly 8 extra ops a layer at ~5.5 us each plus the
+topk.
+
+Two of those are removable and neither is hard: the kernel could read uint16
+indices directly, which drops the typecast and the pad, and the router's own
+global `topk` already computes indices that are currently discarded -- using
+them would need the local compaction this design sidesteps, but it would remove
+the second topk.
+
+INVARIANT 53: measuring a replacement's *components* against the components it
+replaces overstates the win. The wide matmuls beat `sparse_matmul` 7x in
+isolation and the whole block moved 1.10x, because a new path brings its own
+glue. Price the block, not the piece.
+
+Session: **146.18 -> 91.22 ms**, 1.60x.
