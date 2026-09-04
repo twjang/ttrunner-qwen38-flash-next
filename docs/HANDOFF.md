@@ -2011,5 +2011,10 @@ pins the arithmetic -- eligible blocks never outnumber the selection slots below
 the budget -- so a change to the budget or the compression ratio cannot break
 the fast path quietly.
 
+Verified empirically, not just argued: `scripts/dev/selection_skip_equivalence.py`
+opens the model above the budget so the indexer engages, greedily decodes the
+same prompt with the selection on and off, and compares. Token ids identical,
+hidden states **bitwise** identical, max abs diff 0.000e+00.
+
 Where the step goes now, on this harness: MoE 42.9, QSA 41.8 (36.8 of it the
 indexer), deltanet 16.4, shared 5.5, sdpa 5.1, allreduce 3.8, PLE 2.8.
