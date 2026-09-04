@@ -79,7 +79,7 @@ and context trade one for one (`TTEngine` refuses combinations over budget).
 | server, 32 concurrent | **70.3 tok/s** sustained generation (median of 3 rounds after a discarded warm one: 70.19 / 70.34 / 70.40); end to end depends on output length — 36.1 tok/s at 32 tokens out, 46.9 at 128 (`bench_server.py`) |
 | prefill, 128 tokens, `moe_chunk=32` | **925 ms** (138.4 tok/s); 2033 ms at the old `moe_chunk=16` default, 1070 ms before routing and expert compute were split |
 | unit tests | `uv run pytest -q` → 202 passed, ~3 s, no hardware needed |
-| **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; float32 reference 80.9 %** — **but only over the first ~128 positions; see the defect below** |
+| **next-token accuracy on real prose** | **decode 83.0 % top-1 / 97.9 % top-5, perplexity 1.98; float32 reference 80.9 %**. Holds across context now: `023` fixed a decode attention config that took accuracy to 0 % past ~224 tokens, and 200 scored positions went 62.3 % → **73.4 %** |
 | chunked prefill, judged against a same-positions decode control | measured back to back in one batch: 32 prefilled, 128 scored **71.9 %** / NLL 1.43 against 71.7 % / 1.48; 128 prefilled, 107 scored **21.5 %** / 6.345 against 22.6 % / 5.996. So a 32-row prefill is slightly ahead of stepping and a 128-row one slightly behind. Earlier readings of the 128 row spanned 21.5–27.1 % and are unexplained — invariant 8 |
 | a sequence's output vs the same sequence alone | identical to **batch 32**; differs above it, and that is arithmetic, not a bug (invariant 13) |
 
@@ -292,7 +292,20 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     rounding falls. End-to-end next-token accuracy cannot do this job: 127
     scored positions do not resolve one bf16 ulp.
 
-21. **A device call on the eager prefill path is worth ~57 us, and its size does
+21. **A knob that changes the answer needs a correctness test at every size it
+    will see, not at the size it was tuned on.** The decode attention's program
+    config was added for speed, measured for speed, and never checked past one
+    k-chunk; it took accuracy to zero past 224 tokens of context and survived
+    because no measurement went that far (`023`). Two habits follow. Look at an
+    accuracy metric *across* its range once before trusting the aggregate -- the
+    run that read 62 % overall read 0 % on half its positions. And when a
+    harness says everything fails, including cases known to work, suspect the
+    harness: the first version of `sdpa_decode_accuracy_check.py` called L=32
+    wrong, where the model scores 84 %, because its reference had the wrong
+    head-to-KV mapping. Comparing an op against *itself* under a parameter that
+    must not matter needs no reference at all, and is what found this.
+
+22. **A device call on the eager prefill path is worth ~57 us, and its size does
     not matter.** Injecting a known number of ops and reading the slope gives
     90 +/- 15 us for the marginal op, and the one clean removal on record
     (`moe_chunk` 32 -> 128, 1008 calls, 918.6 -> 861.7 ms) gives 57 us for a real
@@ -305,48 +318,39 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     that 5.7 used for four iterations is retired: it was one A/B on the decode
     path and it over-predicts both paths by 4-6x (`021`).
 
-## 4b. Open defect: decode quality collapses past ~128 positions
+## 4b. Fixed: decode quality collapsed past ~128 positions
 
-**Found 2026-09-03 and not fixed.** Every accuracy figure in this document,
-including the 83.0 % above, was measured over at most 128 scored positions --
-`device_quality.py` defaults to 48 tokens and its passage is only ~200 long -- so
-nothing ever looked past the point where this starts. Stepping one token at a
-time and scoring per block of positions (`context_decay_check.py`):
+**Found and fixed 2026-09-03/04 (`023`).** Decode's next-token accuracy fell from
+~80 % over the first 128 positions to **0 % past 224**. The cause was the decode
+attention's pinned SDPA program config, and the reason it survived so long is
+that no measurement had ever scored past 128 positions -- `device_quality.py`
+defaults to 48 tokens and its passage is ~200 long.
 
-| positions | top-1 |
-|---|---|
-| 0–127 | 78–84 % |
-| 128–159 | 53.1 % |
-| 160–191 | 12.5 % |
-| 192–223 | 6.2 % |
-| 224 and beyond | **0.0 %** |
+The op's online softmax over the K/V cache must give the same answer however it
+is chunked. It did not: for one fixed set of inputs, changing only
+`k_chunk_size` moved the result by up to **1e7 relative** once the cache spanned
+more than one chunk, growing with the chunk count
+(`sdpa_decode_accuracy_check.py`). The collapse tracked the setting -- k=64 broke
+from ~64 tokens, k=128 from ~128, k=256 decayed from 128 and fell sharply at 256.
 
-Zero top-1 on ordinary English prose is not hard text; a working language model
-gets the common tokens right whatever else it is doing. Treat the model as
-correct only to ~128 tokens of context until this is understood.
+**The fix is to pass no program config and let ttnn choose.** Against the float32
+CPU reference on the same passage, which itself declines on this text, the device
+now tracks it the whole way:
 
-What is established:
+| positions | 0–127 | 128–159 | 160–191 | 192–223 | 224–255 | 256–287 |
+|---|---|---|---|---|---|---|
+| reference | 75–81 % | 62.5 | 62.5 | 50.0 | 46.9 | 50.0 |
+| device now | 78–84 % | 59.4 | 59.4 | 50.0 | 40.6 | 46.9 |
+| device before | 78–84 % | 53.1 | **12.5** | **6.2** | **0.0** | **0.0** |
 
-* **Pure decode.** One `m.step` per token, no prefill in the loop, so it is not
-  the chunked-prefill path and not `prepare_device`.
-* **Predates the `022` MoE work.** Reverting `moe.py` to `4a43a7a` reproduces the
-  curve exactly (78.1 / 53.1 / 9.4 / 3.1 / 0.0). The speed changes in `022` are
-  measured at ≤128 positions and are unaffected either way.
-* **Not `max_seq_len`.** 512 and 2048 collapse at the same positions, so it is
-  not the K/V page table filling up.
-* **Two texts, two harnesses.** `device_quality.py 200` scores 62.3 % where the
-  same harness scores 80.3 % at N=128 — the same collapse, averaged in.
+`device_quality.py 200` goes 62.3 % → **73.4 %**, NLL 2.209 → 1.267. It costs
+nothing at the canonical configuration (262144, indexer off: 173.7 → **173.4 ms**)
+and 3 % on the indexer path (4096: 204.0 → 210.3). Prefill is untouched;
+`_attention_chunk` has its own chunked configs.
 
-Not established: which component. The onset at 128 is suggestive because it is
-both `CHUNK` and `cfg.linear_head_dim`, but decode steps through
-`_linear_attention_step` and uses neither, so the things that actually carry
-position are the DeltaNet recurrent state ([BH, 1, 128, 128]), the conv and PLE
-rings, and the K/V cache. `decode_ablation_check.py` already has seams for all of
-them, and the first cheap experiment is a per-layer diff of decode against the
-CPU reference at position ~160, where the device is 12 % and should be ~78 %.
-
-**This outranks everything in section 5.** A 262144-token context is not worth
-optimising while the answer is wrong after 128 tokens.
+`sdpa_k_chunk` remains a constructor argument because the QSA indexer sizes its
+window from it. It no longer reaches the attention op. `pin_sdpa_config=True`
+restores the old behaviour for an A/B, and it is wrong.
 
 ## 5. Open work, with definition of done
 

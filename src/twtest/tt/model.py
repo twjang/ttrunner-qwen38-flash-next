@@ -112,6 +112,7 @@ class TTModel:
         mesh,
         max_seq_len: int = 4096,
         sdpa_k_chunk: int = 128,
+        pin_sdpa_config: bool = False,
         traceable_kv: bool = False,
         state_dtype=None,
         cache_update_batch: int = 64,
@@ -201,12 +202,37 @@ class TTModel:
         )
         self._block_offsets = None
 
+        # **No program config for the decode attention, deliberately.**
+        #
+        # This used to pin q_chunk_size=32 and k_chunk_size=`sdpa_k_chunk`, and
+        # that was the cause of handoff 4b: decode's next-token accuracy fell from
+        # ~80 % to 0 % past ~224 tokens of context. The op's online softmax over
+        # the K/V cache is supposed to give the same answer however it is chunked,
+        # and with a pinned config it does not -- for one fixed set of inputs,
+        # changing only k_chunk_size moved the result by up to 1e7 relative once
+        # the cache spanned more than one chunk, growing with the chunk count
+        # (`sdpa_decode_accuracy_check.py`). The collapse tracked the setting: at
+        # k=64 accuracy broke from ~64 tokens, at k=128 from ~128, at k=256 it
+        # decayed gently from 128 and sharply at 256.
+        #
+        # Letting ttnn choose fixes it. Against the float32 CPU reference on the
+        # same passage (`reference_context_decay_check.py`), which itself declines
+        # on this text, the device now tracks it the whole way:
+        #
+        #     positions      0-127  128-159  160-191  192-223  224-255  256-287
+        #     reference      75-81%   62.5%    62.5%    50.0%    46.9%    50.0%
+        #     device now     78-84%   59.4%    59.4%    50.0%    40.6%    46.9%
+        #     device before  78-84%   53.1%    12.5%     6.2%     0.0%     0.0%
+        #
+        # `sdpa_k_chunk` is kept because the QSA indexer sizes its window from it;
+        # it no longer reaches the attention op. Set `pin_sdpa_config=True` to get
+        # the old behaviour back for an A/B, and expect it to be wrong.
         self.sdpa_program_config = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(8, 8),
             q_chunk_size=32,
             k_chunk_size=sdpa_k_chunk,
             exp_approx_mode=False,
-        )
+        ) if pin_sdpa_config else None
         # `chunked_scaled_dot_product_attention` requires the chunk's start to be
         # a multiple of *both* chunk sizes, and violating that is silent: at
         # q_chunk_size=128 a start of 32 returns 257 % nonsense rather than an

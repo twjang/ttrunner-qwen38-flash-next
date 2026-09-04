@@ -26,7 +26,7 @@ TT_CACHE = os.environ.get("TWTEST_TT_CACHE", str(Path.home() / "models/qwen38-tt
 
 
 def open_model(max_seq_len: int = 512, preload: bool = True, trace_region_bytes: int | None = None,
-               num_command_queues: int | None = None):
+               num_command_queues: int | None = None, sdpa_k_chunk: int | None = None):
     """Returns (mesh, cfg, model). Preloading everything but the split expert
     halves takes ~1.5 min and makes the first step's timing honest.
 
@@ -47,7 +47,17 @@ def open_model(max_seq_len: int = 512, preload: bool = True, trace_region_bytes:
     cfg = Qwen4ExpConfig.from_gguf(gguf.metadata)
     host = WeightStore(gguf, cache_bytes=2 << 30, row_cache_bytes=8 << 30)
     w = TTWeights(TT_CACHE, mesh)
-    model = TTModel(cfg, w, host, mesh, max_seq_len=max_seq_len, traceable_kv=True)
+    # TWTEST_SDPA_K overrides the decode attention's k_chunk_size. It is the
+    # accumulation width of the online softmax over the K/V cache, and the
+    # handoff already records that it changes the answer.
+    kchunk = sdpa_k_chunk if sdpa_k_chunk is not None else (
+        int(os.environ["TWTEST_SDPA_K"]) if "TWTEST_SDPA_K" in os.environ else None)
+    extra = {} if kchunk is None else {"sdpa_k_chunk": kchunk}
+    # TWTEST_PIN_SDPA=1 restores the pinned decode program config that caused the
+    # context collapse, so the fix can be A/B'd.
+    if os.environ.get("TWTEST_PIN_SDPA"):
+        extra["pin_sdpa_config"] = True
+    model = TTModel(cfg, w, host, mesh, max_seq_len=max_seq_len, traceable_kv=True, **extra)
     model.fuse_expert_gate_up = "blk.0.ffn_gateup_exps.weight" in w
     if preload:
         for name in w.entries:
