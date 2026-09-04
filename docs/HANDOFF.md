@@ -3164,3 +3164,70 @@ class of op.
 
 Reverted, with the measurement kept at the call site so the "obvious"
 simplification is not tried again.
+
+## 13. Where this stands, and what 32.6 ms would actually take
+
+**146.18 -> ~83 ms a token, 1.76x**, with no precision the quality harness can
+see (top-1 85.1 % against 83.0 at the start, top-5 97.9 % throughout, NLL 0.662
+against 0.703 for the float32 reference). 229 tests pass. Bytes moved a step fell
+from 25.29 GB to 4.72.
+
+Deployed, in order of size:
+
+| change | saved |
+|--------|------:|
+| skip the QSA selection below `indexer_budget` (§4f) | 35 ms |
+| fold `hc_inject` into `hc_down`'s matmul (§12) | 7.1 |
+| shard `hc_down` on its reduction axis (§5.3) | 7.3 |
+| the wide-gather expert path (§10.1) | 5.0 |
+| fused gate-and-average kernel (§7.1) | 2.7 |
+| fused SwiGLU kernel (§7) | 2.3 |
+| `bfloat8_b` on the gate/up output (§6.1) | 2.2 |
+| fuse the remaining same-input matmuls (§12.1) | 1.3 |
+| `_l2norm` as an rms_norm identity (§7.2) | 0.5 |
+
+Speculation is built and verified but not wired into the engine: k=6 measures
+54.79 ms a token on a self-quoting prompt and nothing on open prose (§9.2).
+
+### What the remaining 50 ms is made of
+
+From the census and the op timings, the step is roughly `5.5 us x ops` for
+elementwise work plus the linears at three to four times their byte time
+(invariant 54). At 6426 calls that is ~35 ms of floor and ~43 of linears.
+
+And most of the floor is **not** reducible, which took a failed experiment to
+learn (invariant 56): `reshape`, `slice`, `permute` and `concat` are data
+movement and pay for the tile padding, so removing them by restructuring can
+cost more than it saves -- folding the DeltaNet convolution into a concat plus a
+reduce halved its call count and lost 4.5 ms. Only *elementwise* clusters shrink
+reliably, and only through `generic_op`, at roughly 1-2 ms a kernel.
+
+So reaching 32.6 needs, concretely:
+
+1. **The linears saturating.** They run at 25-33 % of bandwidth because their
+   outputs are narrow (invariant 38), and every same-input pair that could be
+   widened has been. What is left needs either DRAM-sharded matmuls -- measured
+   a wash or worse at every width tried (§5.1) -- or a matmul kernel of our own.
+2. **The elementwise floor roughly halved**, one `generic_op` kernel at a time.
+   The two deployed here were worth 2.3 and 2.7 ms; the remaining clusters are
+   smaller.
+3. **Speculation wired**, which divides whatever the fixed cost has become --
+   but only on text the drafter can predict.
+
+None of those is blocked. All three are grinds, and the arithmetic says they are
+long ones: the target is 50 ms away and the unit of progress is now 1-2 ms.
+
+### The two things most worth doing next
+
+Not the smallest remaining items, but the ones with the best ratio:
+
+- **Wire speculation into the engine.** It is built, verified bit-exact
+  (§8.2, 8.3) and measured; what is missing is engine plumbing, not physics. On
+  repetitive text it is worth ~30 ms today and it compounds with everything
+  above, because every millisecond taken off the step is divided by k.
+- **Price a custom matmul kernel for the narrow shapes.** Invariant 38 is the
+  single largest unaddressed effect -- 43 ms of linears at a quarter of
+  bandwidth -- and it is the one thing on this list that has never been
+  attempted. `generic_op` is proven; a GEMV that splits the reduction across
+  cores is the shape to try, and `dram_sharded_gemv_check.py` already has the
+  harness to compare against.
