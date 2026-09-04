@@ -18,6 +18,7 @@ some waste for the same simplicity and is therefore chunked.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
@@ -198,6 +199,49 @@ def moe_block(
         logits = ttnn.linear(x, router_w, compute_kernel_config=HIFI4)
     probs = ttnn.softmax(logits, dim=-1, compute_kernel_config=HIFI4)
 
+    # Routing is global -- the router is replicated and top-k is over all of
+    # `num_experts` -- but the expert stacks are sharded on the expert axis, so
+    # from here on only this device's slice is wanted.
+    #
+    # **The wide path is exact at one row only.** It gathers a single set of
+    # experts for the whole call, and `expert_gather.cpp` reads the selection
+    # from the index tile's first face -- row 0. At M > 1 every row would then
+    # be routed to row 0's experts. `scripts/dev/moe_rows_check.py` measures it:
+    # with the wide path on, row groups of 8 get 55 of 64 rows wrong, worst row
+    # 96.3 %, where group size 1 is exact. That is a real constraint and not a
+    # tuning knob, so the guard is on M rather than on `_MAX_MOE_CHUNK`.
+    # `step_n` (the speculative verifier) runs M = k, so it takes the
+    # `sparse_matmul` path, which is per-row exact.
+    if WIDE_EXPERTS and up_w is None and x.shape[-2] == 1:
+        # Two gathers and two wide matmuls, the second of which also combines.
+        # Falls back below if anything about the shapes is unexpected.
+        # Not a silent fallback: swallowing the exception here would leave the
+        # old path running while every measurement above claimed the new one, and
+        # that is exactly the kind of thing that goes unnoticed. Report once.
+        e_local = gate_w.shape[1]
+        try:
+            # One kernel for the whole routing tail: threshold, tie-admitting
+            # mask, normalisation, this device's slice and its gather indices.
+            # `sparsity` is not built at all -- the wide path never reads it,
+            # and computing it was four discarded ops a layer.
+            sel = fused_router_select(probs, num_experts, e_local, top_k, WIDE_EXPERTS)
+            if sel is None:
+                sel_weights = _route_weights(probs, top_k)
+                w_local = (sel_weights if e_local == num_experts
+                           else ttnn.mesh_partition(sel_weights, dim=-1))
+            else:
+                w_local = None
+            return wide_expert_ffn(x, gate_w, down_w, w_local, WIDE_EXPERTS,
+                                   hidden_size, sel=sel)
+        except Exception as exc:                            # noqa: BLE001
+            global _WIDE_FELL_BACK
+            if not _WIDE_FELL_BACK:
+                _WIDE_FELL_BACK = True
+                import warnings
+                warnings.warn(
+                    f"wide expert path unavailable, using sparse_matmul: "
+                    f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+
     values, _ = ttnn.topk(probs, k=top_k, dim=-1, largest=True, sorted=True)
     v = list(values.shape)
     # the k-th largest probability is the inclusion threshold
@@ -208,9 +252,6 @@ def moe_block(
     kept = ttnn.multiply(probs, keep)
     weights = ttnn.divide(kept, ttnn.sum(kept, dim=-1, keepdim=True))
 
-    # Routing is global -- the router is replicated and top-k is over all of
-    # `num_experts` -- but the expert stacks are sharded on the expert axis, so
-    # from here on only this device's slice is wanted.
     weights, keep, e_local = _localise(weights, keep, gate_w, num_experts)
 
     # union of experts selected by any of the M rows -> [1, 1, 1, E_local]
@@ -218,29 +259,22 @@ def moe_block(
     sparsity = ttnn.max(keep, dim=-2, keepdim=True)
     sparsity = ttnn.to_layout(ttnn.typecast(sparsity, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)
 
-    if WIDE_EXPERTS and up_w is None:
-        # Two gathers and two wide matmuls, the second of which also combines.
-        # Falls back below if anything about the shapes is unexpected.
-        # Not a silent fallback: swallowing the exception here would leave the
-        # old path running while every measurement above claimed the new one, and
-        # that is exactly the kind of thing that goes unnoticed. Report once.
-        try:
-            return wide_expert_ffn(x, gate_w, down_w, weights, WIDE_EXPERTS, hidden_size)
-        except Exception as exc:                            # noqa: BLE001
-            global _WIDE_FELL_BACK
-            if not _WIDE_FELL_BACK:
-                _WIDE_FELL_BACK = True
-                import warnings
-                warnings.warn(
-                    f"wide expert path unavailable, using sparse_matmul: "
-                    f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
-
     per_expert = expert_ffn(
         x, gate_w, up_w, down_w, sparsity, None, e_local, hidden_size, intermediate_size
     )                                                     # [1, E_local, M, K]
 
     # a partial sum over this device's experts; the caller's all-reduce completes it
     return _combine(per_expert, weights, e_local, hidden_size)
+
+
+def _route_weights(probs, top_k: int):
+    """The threshold/mask/normalise tail, for when the fused kernel is not usable."""
+    values, _ = ttnn.topk(probs, k=top_k, dim=-1, largest=True, sorted=True)
+    v = list(values.shape)
+    threshold = ttnn.slice(values, (0, 0, 0, top_k - 1), (v[0], v[1], v[2], top_k))
+    keep = ttnn.ge(probs, threshold, dtype=ttnn.bfloat16)
+    kept = ttnn.multiply(probs, keep)
+    return ttnn.divide(kept, ttnn.sum(kept, dim=-1, keepdim=True))
 
 
 def route(x, router_w, top_k: int):
@@ -494,7 +528,143 @@ def _gather(weights, idx_u32, k_sel: int, wide: int, out_shape, idx16: int = 0):
                     _gather_program(weights, idx_u32, out, k_sel, wide, idx16))
     return out
 
-def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size):
+# --- the routing tail as one kernel ------------------------------------------
+#
+# `decode_ablation_check.py` prices the chain this replaces, against an 82.11 ms
+# step: the global `ttnn.topk` over 512 experts is 5.00 ms a token, the
+# threshold/mask/normalise 0.93, `mesh_partition` 0.73, and the local `topk`
+# below another 2.00 -- 8.66 ms of sorting 512 numbers. Removing four of the
+# chain's ops moved the step 0.24 ms, so this is not op-count overhead; it is
+# those two sorts, and only a kernel gets at them.
+#
+# `scripts/stage7_router_select.py` measures 151.59 -> 27.18 us, **5.58x**, and
+# checks the result three ways: against float64, against the ttnn chain, and --
+# the one that matters -- against the *effective per-expert weight vector*, max
+# diff 3.05e-05. Slot order can differ where two experts tie, which bf16
+# probabilities do often; summing weight x expert makes that difference vanish,
+# which is exactly what the gather and the matmul downstream do.
+_ROUTER_KERNEL = str(Path(__file__).resolve().parents[3] / "scripts" / "kernels"
+                     / "router_select.cpp")
+_ROUTER_BUF: dict = {}
+_ROUTER_FELL_BACK = False
+
+
+def _router_devid(device, n_dev: int):
+    """A per-device constant holding this device's index.
+
+    `generic_op` broadcasts one program to the whole mesh, so runtime args are
+    identical everywhere and cannot say which device is running. A tensor can:
+    sharded on dim 0, each device gets its own page. Sixteen uint32 rather than
+    one, so the page clears DRAM's 64 B alignment.
+    """
+    key = ("devid", id(device))
+    got = _ROUTER_BUF.get(key)
+    if got is None:
+        got = ttnn.from_torch(
+            torch.arange(n_dev, dtype=torch.int32).reshape(n_dev, 1, 1, 1)
+            .expand(n_dev, 1, 1, 16).contiguous(),
+            dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=0))
+        _ROUTER_BUF[key] = got
+    return got
+
+
+def _router_program(probs, devid, vals, idx, m_rows, e_total, e_local, top_k, k_sel):
+    dev = probs.device()
+    core = ttnn.CoreCoord(0, 0)
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(core, core)])
+    acc = {}
+    for tag, t in (("p", probs), ("d", devid), ("v", vals), ("i", idx)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"router select: {tag} must be interleaved")
+        acc[tag] = ct
+    if probs.dtype == ttnn.bfloat16:
+        p_bf16 = 1
+    elif probs.dtype == ttnn.float32:
+        p_bf16 = 0
+    else:
+        raise RuntimeError(f"router select: probs dtype {probs.dtype} unsupported")
+    v_bf16 = 1 if vals.dtype == ttnn.bfloat16 else 0
+
+    # A CB's total size must be a whole number of its page size.
+    probs_cb = acc["p"][1] * (e_total // TILE + 2)
+    misc_cb = 64 * ((4 * acc["v"][1] + 4 * acc["i"][1] + 512 + 63) // 64)
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=probs_cb, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=0, data_format=probs.dtype, page_size=acc["p"][1])]),
+        ttnn.CBDescriptor(
+            total_size=misc_cb, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=1, data_format=ttnn.uint32, page_size=64)]),
+    ]
+    ct = [e_total, e_local, top_k, k_sel, m_rows, p_bf16, v_bf16,
+          acc["p"][1], acc["v"][1], acc["i"][1]]
+    ct += acc["p"] + acc["d"] + acc["v"] + acc["i"]
+    kernel = ttnn.KernelDescriptor(
+        kernel_source=_ROUTER_KERNEL,
+        source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+        core_ranges=crs, compile_time_args=ct,
+        runtime_args=[(core, [probs.buffer_address(), devid.buffer_address(),
+                              vals.buffer_address(), idx.buffer_address()])],
+        config=ttnn.ReaderConfigDescriptor())
+    return ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=cbs)
+
+
+def fused_router_select(probs, e_total: int, e_local: int, top_k: int, k_sel: int):
+    """(weights, local expert ids) for the gather, in one launch. None if unusable.
+
+    Returns exactly what `topk(mesh_partition(normalise(threshold(probs))))`
+    returns, in the layouts `wide_expert_ffn` already consumes: bfloat16 weights
+    [1, 1, M, k_sel] and uint16 ids in a tile's first face, which is what
+    `expert_gather.cpp` reads under IDX16=1.
+    """
+    global _ROUTER_FELL_BACK
+    dev = probs.device()
+    n_dev = e_total // e_local
+    m_rows = probs.shape[-2]
+    try:
+        # An off switch, so the kernel and the chain it replaces can be compared
+        # in one sitting rather than across a code change. Both are the same
+        # distance from float64 (`stage7_router_select.py`), so a difference in
+        # generated text is the tie order and not accuracy -- but that is a
+        # claim worth being able to re-measure.
+        if os.environ.get("TT_NO_FUSED_ROUTER"):
+            return None
+        if m_rows > TILE or k_sel > 16 or top_k > TILE:
+            return None
+        key = (id(dev), m_rows, k_sel, str(probs.dtype))
+        got = _ROUTER_BUF.get(key)
+        if got is None:
+            rep = ttnn.ReplicateTensorToMesh(dev)
+            got = (
+                ttnn.from_torch(torch.zeros(1, 1, m_rows, k_sel), dtype=ttnn.bfloat16,
+                                layout=ttnn.TILE_LAYOUT, device=dev, mesh_mapper=rep),
+                ttnn.from_torch(torch.zeros(1, 1, m_rows, k_sel), dtype=ttnn.uint16,
+                                layout=ttnn.TILE_LAYOUT, device=dev, mesh_mapper=rep),
+            )
+            _ROUTER_BUF[key] = got
+        vals, idx = got
+        devid = _router_devid(dev, n_dev)
+        ttnn.generic_op(
+            [probs, devid, vals, idx],
+            _router_program(probs, devid, vals, idx, m_rows, e_total, e_local,
+                            top_k, k_sel))
+        return vals, idx
+    except Exception as exc:                                    # noqa: BLE001
+        if not _ROUTER_FELL_BACK:
+            _ROUTER_FELL_BACK = True
+            import warnings
+            warnings.warn(
+                f"fused router select unavailable, using the ttnn chain: "
+                f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
+def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
+                    sel=None):
     """The whole MoE for this device: two gathers, two wide matmuls, one SwiGLU.
 
     `weights_local` is the router's normalised weights restricted to this
@@ -518,7 +688,12 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size):
     """
     dev = x.device()
     n = gate_w.shape[-1] // 2                     # intermediate width
-    vals, idx = ttnn.topk(weights_local, k=k_sel, dim=-1, largest=True, sorted=True)
+    if sel is not None:
+        # `fused_router_select` produced both in one launch, replacing this
+        # topk and the whole chain that fed it.
+        vals, idx = sel
+    else:
+        vals, idx = ttnn.topk(weights_local, k=k_sel, dim=-1, largest=True, sorted=True)
 
     # `topk` hands back uint16 in TILE layout, and the kernel reads that tile's
     # first face directly -- columns 0..15 are contiguous there, so k_sel <= 16

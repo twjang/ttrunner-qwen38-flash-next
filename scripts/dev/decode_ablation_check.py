@@ -7,7 +7,9 @@ of the traced step. Prefill is dispatch-bound where the traced step is not
 (invariants 19 and 21), so the two answer different questions -- but "which
 component" is worth knowing on both, and only op counts were known for prefill.
 
-    parts: none moe shared allreduce attn reinject ple
+    parts: none select moe shared allreduce attn reinject ple
+           w:<piece>[+<piece>...]  topk gather gather1 gather2 linear1
+                                   linear2 swiglu scale
            expertffn combine permute routing topk<N>
            qsa deltanet sdpa kvupdate gateup downproj
            prefill-only seams: applyexperts chunkattn chunkqsa chunkdeltanet
@@ -119,12 +121,159 @@ elif PART == "grm":
 
     ops_mod.gated_residual_mix = _grm_stub
     model_mod.gated_residual_mix = _grm_stub
-elif PART == "noselect":
-    # Not an ablation of a component but of a *regime*: the selection is exact
-    # below indexer_budget, where topk returns every visible block, so this is
-    # what a sequence under 2048 tokens could legitimately run. The block cache
-    # is still maintained, which is the part that has to stay.
-    m.selection_active = False
+elif PART.startswith("w:"):
+    # Inside `wide_expert_ffn`, piece by piece. moe_block is 33.28 ms of an
+    # 82.35 ms step -- 40 % -- while its roofline (top-10 experts, 0.516 GB a
+    # device a token) is 1.33 ms at 388 GB/s. So it runs at ~4 % of bandwidth
+    # and the question is which of its seven pieces holds the other 96 %.
+    #
+    # Each piece is replaced by a persistent buffer of the shape it returns,
+    # allocated on the first call and reused, so the timed region gains no op
+    # and no allocation. Compose them with `+`: `w:gather+swiglu`.
+    import ttrunner_qwen38_flash_next.tt.moe as _wm
+    _off = set(PART[2:].split("+"))
+    _known = {"topk", "gather", "gather1", "gather2", "linear1", "linear2",
+              "swiglu", "scale"}
+    _bad = _off - _known
+    if _bad:
+        raise SystemExit(f"unknown w: piece(s) {sorted(_bad)}; known: {sorted(_known)}")
+    _wb = {}
+
+    def _keep(key, real):
+        """Run `real` once to learn the shape, then hand back the same buffer."""
+        if key not in _wb:
+            _wb[key] = real()
+        return _wb[key]
+
+    def _wide(x, gate_w, down_w, weights_local, k_sel, hidden_size):
+        dev = x.device()
+        n = gate_w.shape[-1] // 2
+        lk = (gate_w.shape[1], n, x.shape[-2])
+        if "topk" in _off:
+            vals, idx = _keep(("topk",) + lk, lambda: ttnn.topk(
+                weights_local, k=k_sel, dim=-1, largest=True, sorted=True))
+        else:
+            vals, idx = ttnn.topk(weights_local, k=k_sel, dim=-1, largest=True, sorted=True)
+
+        g1 = "gather" in _off or "gather1" in _off
+        g2 = "gather" in _off or "gather2" in _off
+        gu_shape = (1, 1, gate_w.shape[-2], k_sel * 2 * n)
+        if g1:
+            gu = _keep(("gu",) + lk, lambda: _wm._gather(gate_w, idx, k_sel, 2, gu_shape, 1))
+        else:
+            gu = _wm._gather(gate_w, idx, k_sel, 2, gu_shape, 1)
+
+        if "linear1" in _off:
+            both = _keep(("both",) + lk,
+                         lambda: ttnn.linear(x, gu, compute_kernel_config=_wm.HIFI4))
+        else:
+            both = ttnn.linear(x, gu, compute_kernel_config=_wm.HIFI4)
+
+        if "swiglu" in _off:
+            hidden = _keep(("hid",) + lk, lambda: _wm.fused_swiglu(both, k_sel * n))
+        else:
+            hidden = _wm.fused_swiglu(both, k_sel * n)
+
+        if "scale" in _off:
+            scaled = hidden
+        else:
+            spread = _wm._buf(("spread", k_sel, n), (1, 1, k_sel, k_sel * n),
+                              ttnn.bfloat16, dev)
+            if _wm._GATHER_BUF.get(("spread_init", k_sel, n)) is None:
+                import torch as _t
+                blk = _t.zeros(1, 1, k_sel, k_sel * n)
+                for sidx in range(k_sel):
+                    blk[0, 0, sidx, sidx * n:(sidx + 1) * n] = 1.0
+                ttnn.copy(ttnn.from_torch(blk, dtype=ttnn.bfloat16,
+                                          layout=ttnn.TILE_LAYOUT, device=dev,
+                                          mesh_mapper=ttnn.ReplicateTensorToMesh(dev)),
+                          spread)
+                _wm._GATHER_BUF[("spread_init", k_sel, n)] = True
+            scaled = ttnn.multiply(
+                hidden, ttnn.matmul(vals, spread, compute_kernel_config=_wm.HIFI4))
+
+        dw_shape = (1, 1, k_sel * n, hidden_size)
+        if g2:
+            dw = _keep(("dw",) + lk, lambda: _wm._gather(down_w, idx, k_sel, 0, dw_shape, 1))
+        else:
+            dw = _wm._gather(down_w, idx, k_sel, 0, dw_shape, 1)
+
+        if "linear2" in _off:
+            return _keep(("out",) + lk,
+                         lambda: ttnn.linear(scaled, dw, compute_kernel_config=_wm.HIFI4))
+        return ttnn.linear(scaled, dw, compute_kernel_config=_wm.HIFI4)
+
+    _wm.wide_expert_ffn = _wide
+elif PART.startswith("r:"):
+    # Inside the router chain, piece by piece. `wroute` prices the whole chain
+    # at 9.35 ms, but removing four of its ops moved the step only 0.24 ms --
+    # so the cost is not spread over the op count and a fusion kernel would be
+    # aimed at the wrong thing. This says which ops actually hold it.
+    #
+    # Same rule as `w:`: each piece is replaced by a persistent buffer of the
+    # shape it returns, so the timed region gains no op and no allocation.
+    import ttrunner_qwen38_flash_next.tt.moe as _rm
+    _roff = set(PART[2:].split("+"))
+    _rknown = {"linear", "softmax", "topk", "norm", "partition"}
+    _rbad = _roff - _rknown
+    if _rbad:
+        raise SystemExit(f"unknown r: piece(s) {sorted(_rbad)}; known: {sorted(_rknown)}")
+    _rb = {}
+
+    def _rkeep(key, real):
+        if key not in _rb:
+            _rb[key] = real()
+        return _rb[key]
+
+    def _route(x, router_w, gate_w, up_w, down_w, top_k, E, K, I):
+        lk = (E, x.shape[-2], router_w.shape[-1])
+
+        def _mk_logits():
+            got = _rm.ksplit_linear(x, router_w)
+            if got is None:
+                got = ttnn.linear(x, router_w, compute_kernel_config=_rm.HIFI4)
+            return got
+
+        logits = _rkeep(("lg",) + lk, _mk_logits) if "linear" in _roff else _mk_logits()
+
+        if "softmax" in _roff:
+            probs = _rkeep(("pr",) + lk, lambda: ttnn.softmax(
+                logits, dim=-1, compute_kernel_config=_rm.HIFI4))
+        else:
+            probs = ttnn.softmax(logits, dim=-1, compute_kernel_config=_rm.HIFI4)
+
+        if "topk" in _roff:
+            values = _rkeep(("vl",) + lk, lambda: ttnn.topk(
+                probs, k=top_k, dim=-1, largest=True, sorted=True)[0])
+        else:
+            values = ttnn.topk(probs, k=top_k, dim=-1, largest=True, sorted=True)[0]
+
+        if "norm" in _roff:
+            weights = probs
+        else:
+            v = list(values.shape)
+            threshold = ttnn.slice(values, (0, 0, 0, top_k - 1), (v[0], v[1], v[2], top_k))
+            keep = ttnn.ge(probs, threshold, dtype=ttnn.bfloat16)
+            kept = ttnn.multiply(probs, keep)
+            weights = ttnn.divide(kept, ttnn.sum(kept, dim=-1, keepdim=True))
+
+        e_local = gate_w.shape[1]
+        if e_local == E:
+            w_local = weights
+        elif "partition" in _roff:
+            w_local = _rkeep(("wl",) + lk, lambda: ttnn.mesh_partition(weights, dim=-1))
+        else:
+            w_local = ttnn.mesh_partition(weights, dim=-1)
+        return _rm.wide_expert_ffn(x, gate_w, down_w, w_local, _rm.WIDE_EXPERTS, K)
+
+    _rm.moe_block = _route
+elif PART in ("noselect", "select"):
+    # A regime, not a component -- and since the decode path now defaults to
+    # the shipping regime (selection off, see below), `noselect` is the same
+    # thing as `none` and is kept only so old command lines still run.
+    # `select` is the opposite: turn the selection back on, so its delta
+    # against `none` is what the sparse selection costs.
+    pass
 elif PART == "idxtopk":
     # Only the indexer's topk: k=512 out of 1024 blocks, i.e. half a sort, and
     # it runs in all twelve QSA layers. Substituted by a constant of the shape
@@ -403,6 +552,19 @@ elif PART != "none":
     raise SystemExit(f"unknown part {PART}")
 
 PREFILL = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
+# The shipping regime is the baseline. `engine.py` starts with
+# `model.selection_active = False` and only turns the selection on once a
+# sequence passes `indexer_budget`, so a decode ablation measured with the
+# selection on is not measuring the step the engine runs.
+#
+# Getting this wrong produced a whole table of *negative* component costs:
+# `noselect` was read as the baseline at 82.84 ms while `moe`, `deltanet`,
+# `shared`, `allreduce` and `ple` all ran with the selection ON, so every one
+# of them "cost" less than nothing. Two variables moved at once. Pinning the
+# regime here means a part's delta against `none` is that part alone.
+if not PREFILL:
+    m.selection_active = PART == "select"
 
 if PREFILL:
     prompt = [1000] * PREFILL
