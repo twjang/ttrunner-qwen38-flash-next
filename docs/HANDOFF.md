@@ -1662,3 +1662,38 @@ Still open before this can replace `moe_block`: output slot 4 (`matmul_output`,
 shape `[110, 2, 32, 2560]` at M=32) is sharded per core, and nothing yet maps
 its (core, slot) layout onto the `[1, E, M, K]` our `_combine` consumes. That
 mapping, and a numerics check against float64, are what remain.
+
+### 4c.2 Why the port stops here: `compute_only` has no consumable output
+
+Attempting the integration killed it. `matmul_output` (slot 4, `[110, 2, 32, 2560]`)
+is not the per-expert result for this device's experts. The `2` is a **double
+buffer**, and after the op has walked all `experts_per_device` experts only the
+last two survive in it. Upstream's own validator says so and checks nothing else:
+
+    reshape_func = functools.partial(
+        prepare_output_tensor_from_combine_writer,
+        experts_per_device=2,  # always 2 for double buffer
+        ...)
+    # Calculate which experts are still in the double buffer
+    experts_to_check = [(experts_per_device - 2, 0), (experts_per_device - 1, 1)]
+
+With 128 local experts we would get experts 126 and 127 and nothing else. The
+per-expert results are consumed in place by the fused combine stage as they are
+produced; `compute_only=True` simply skips that stage and lets them be
+overwritten. It is a mode for benchmarking the compute kernels, not a building
+block -- which is consistent with what it is used for upstream (§4c: a hermetic
+regression net for the kernels).
+
+So the only output that carries a whole layer is the combine, slot 5, and that
+needs a `cluster_axis`, which needs CCL, which hangs this box (invariant 28).
+The two constraints close on each other and there is no path between them.
+
+INVARIANT 30: `ttnn.experimental.moe_compute` cannot implement `moe_block` on
+this hardware. Not for want of tuning -- the usable output requires the CCL
+combine, and CCL does not work here. The 1.47 ms/layer measured in §4c.1 was a
+kernel whose result cannot be read back. Revisit only when a tt-metal release
+fixes all-to-all on Blackhole (tt-metal#27859, #30030); the wiring in
+`scripts/dev/moe_compute_check.py` is correct up to that point and is what to
+restart from.
+
+The hand-rolled `sparse_matmul` path stays. Decode remains 109.2 ms/token.
