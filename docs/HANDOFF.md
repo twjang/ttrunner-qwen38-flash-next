@@ -2470,3 +2470,58 @@ because `sparse_matmul`'s mask-independent zero-fill and every downstream
 expert-axis op are both sized by it. But the win is in the *intermediate*, not
 the result: halving the gate/up output is 2.18 ms, halving the down output is
 0.24.
+
+## 7. Deployed: a real fused kernel for the MoE SwiGLU
+
+`scripts/kernels/swiglu_{reader,compute,writer}.cpp` under `ttnn.generic_op`,
+wired into `moe.expert_ffn` as `fused_swiglu`. **101.69 -> 99.38 ms a token.**
+
+What it replaces: `silu(gate) * up` over the `[1, E, M, 2N]` gate|up matmul
+output, which was two slices, a silu and a multiply. That chain is not op
+overhead -- the four ops together move ~30 MB a layer because each reads and
+writes the whole E=128 tensor, and 30 MB at 388 GB/s is the 87 us measured. One
+fused pass reads both halves once and writes the result once:
+
+| | us/layer | 48 layers |
+|---|--------:|----------:|
+| slice + slice + silu + multiply | 87.06 | 4.18 ms |
+| **fused kernel** | **40.05** | **1.92 ms** |
+
+2.17x standalone, 2.31 ms in the model against 2.26 predicted. Quality held:
+top-1 83.0 % and top-5 97.9 % unchanged, NLL **0.663** against 0.672, on a
+float32 reference of 80.9 % / 0.703.
+
+Three kernels, because the compute has to be its own: a reader that turns each
+output tile index into the two input tiles it needs (`gate` at column `nt`, `up`
+at `nt + Nt`), a compute kernel that is `copy_tile` x2, `silu_tile`,
+`mul_binary_tile` -- `silu_tile` is a real SFPU op, so no hand-rolled
+`x * sigmoid(x)` -- and a writer. The intermediate lives in circular buffers and
+never reaches DRAM, which is the entire saving.
+
+Four things that were not obvious and cost a compile or a rerun:
+
+- **Compute kernels use `kernel_main` in this build**, not
+  `namespace NAMESPACE { void MAIN {`. The latter fails with "'kernel_main' was
+  not declared in this scope".
+- **The tile count must be a runtime arg**, not a compile-time one: the work
+  split is balanced but not equal, so cores differ by one.
+- **The output buffer has to be pre-allocated and reused.** `generic_op` takes
+  its output as an io_tensor, and allocating inside a trace capture corrupts the
+  replay. One buffer serves all 48 layers, because a layer's hidden is consumed
+  by its own down projection before the next layer runs and a trace replays in
+  order.
+- **The program descriptor is rebuilt per call, deliberately.** `both` is a
+  fresh allocation out of the matmul so its address is part of the runtime args.
+  The cost is host-side and paid at capture, not at replay -- the recorded
+  commands carry the addresses and a replay puts the tensors back in the same
+  places.
+
+INVARIANT 46: fusing is worth it exactly where a chain of ttnn ops round-trips a
+large intermediate through DRAM, and the measure of the win is the bytes saved,
+not the calls saved. Four ops over a 30 MB tensor became one pass over 16.7 and
+went 2.17x; four ops over a *small* tensor would have gone nowhere, because a
+ttnn op costs ~5.5 us whatever it touches (invariant 42) and a `generic_op`
+launch is not cheaper than that.
+
+Session so far: **146.18 -> 99.38 ms**, 1.47x, no precision spent that the
+quality harness could see.

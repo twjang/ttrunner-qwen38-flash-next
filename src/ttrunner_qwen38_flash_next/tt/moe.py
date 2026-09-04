@@ -18,6 +18,9 @@ some waste for the same simplicity and is therefore chunked.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import torch
 import ttnn
 
 from .ops import HIFI4
@@ -280,6 +283,107 @@ def apply_experts(x, weights, keep, gate_w, up_w, down_w, num_experts: int,
     return _combine(per_expert, weights, e_local, hidden_size)
 
 
+# --- fused SwiGLU ------------------------------------------------------------
+#
+# `silu(gate) * up` over the [1, E, M, 2N] gate|up matmul output used to be four
+# ttnn ops -- two slices, a silu, a multiply -- and that is not op overhead: the
+# four together move ~30 MB a layer, because each reads and writes the whole
+# E=128 tensor, and at 388 GB/s that is the 87 us measured. One fused pass reads
+# both halves once and writes the result once, and measures **40.05 us against
+# 87.06, 2.17x, 2.26 ms a token** (`scripts/stage3_swiglu_fusion.py`).
+#
+# `ttnn.swiglu` does not do this: it is a composite that issues the same four ops
+# (invariant 43). This is three real kernels under `ttnn.generic_op`, with the
+# intermediate living in circular buffers and never reaching DRAM.
+_KDIR = Path(__file__).resolve().parents[3] / "scripts" / "kernels"
+_SWIGLU_OUT: dict = {}
+
+
+def _swiglu_output(src, n_out: int):
+    """The persistent output buffer, one per (device, shape, dtype).
+
+    `generic_op` needs its output pre-allocated, and allocating inside a trace
+    capture corrupts the replay -- so this is made once and reused by all 48
+    layers. That is safe because a layer's hidden is consumed by its own down
+    projection before the next layer runs, and a trace replays in order.
+    """
+    key = (id(src.device()), src.shape[1], src.shape[2], n_out, str(src.dtype))
+    out = _SWIGLU_OUT.get(key)
+    if out is None:
+        out = ttnn.from_torch(
+            torch.zeros(1, src.shape[1], src.shape[2], n_out),
+            dtype=src.dtype, layout=ttnn.TILE_LAYOUT, device=src.device(),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(src.device()),
+        )
+        _SWIGLU_OUT[key] = out
+    return out
+
+
+def _swiglu_program(src, out):
+    """Reader/compute/writer descriptors for this call's buffer addresses.
+
+    Rebuilt per call rather than cached: `src` is a fresh allocation out of the
+    matmul, so its address is part of the runtime args. The cost is host-side and
+    is paid at trace capture, not at replay -- the recorded commands carry the
+    addresses, and a replay puts the tensors back at the same places.
+    """
+    grid = src.device().compute_with_storage_grid_size()
+    cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
+    crs = ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
+    )
+    acc_i = list(ttnn.TensorAccessorArgs(src).get_compile_time_args())
+    acc_o = list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+    if len(acc_i) != 2 or acc_o[1] != acc_i[1]:
+        raise RuntimeError("fused SwiGLU wants interleaved tensors of one dtype")
+    tile_bytes = acc_i[1]
+
+    nt_out = out.shape[-1] // TILE
+    rows = out.shape[1] * max(out.shape[2] // TILE, 1)
+    total = rows * nt_out
+    work = [((total * c) // len(cores), (total * (c + 1)) // len(cores))
+            for c in range(len(cores))]
+
+    cbs = [ttnn.CBDescriptor(
+        total_size=4 * tile_bytes, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=src.dtype, page_size=tile_bytes)])
+        for i in (0, 1, 2)]
+
+    def kern(name, ct, args, cfg):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, a) for c, a in zip(cores, args)], config=cfg)
+
+    return ttnn.ProgramDescriptor(
+        kernels=[
+            kern("swiglu_reader.cpp", [nt_out, tile_bytes] + acc_i,
+                 [[src.buffer_address(), lo, hi] for lo, hi in work],
+                 ttnn.ReaderConfigDescriptor()),
+            kern("swiglu_compute.cpp", [], [[hi - lo] for lo, hi in work],
+                 ttnn.ComputeConfigDescriptor()),
+            kern("swiglu_writer.cpp", [tile_bytes] + acc_o,
+                 [[out.buffer_address(), lo, hi] for lo, hi in work],
+                 ttnn.WriterConfigDescriptor()),
+        ],
+        semaphores=[], cbs=cbs)
+
+
+def fused_swiglu(both, n_out: int):
+    """silu(first half) * second half, in one pass. Falls back to the ops."""
+    try:
+        out = _swiglu_output(both, n_out)
+        ttnn.generic_op([both, out], _swiglu_program(both, out))
+        return out
+    except Exception:                                               # noqa: BLE001
+        e, m = both.shape[1], both.shape[2]
+        gate = ttnn.slice(both, (0, 0, 0, 0), (1, e, m, n_out))
+        up = ttnn.slice(both, (0, 0, 0, n_out), (1, e, m, 2 * n_out))
+        return ttnn.multiply(ttnn.silu(gate), up)
+
+
 def shared_expert(
     x: ttnn.Tensor,
     gate_w: ttnn.Tensor,
@@ -388,13 +492,11 @@ def expert_ffn(
         # device requantises them and changes the output.
         n = gate_w.shape[-1] // 2
         both = _broadcast_matmul(gate_w, 2 * n)
-        e = both.shape[1]
-        gate = ttnn.slice(both, (0, 0, 0, 0), (1, e, m, n))
-        up = ttnn.slice(both, (0, 0, 0, n), (1, e, m, 2 * n))
+        hidden = fused_swiglu(both, n)
     else:
         gate = _broadcast_matmul(gate_w, gate_w.shape[-1])
         up = _broadcast_matmul(up_w, up_w.shape[-1])
-    hidden = ttnn.multiply(ttnn.silu(gate), up)
+        hidden = ttnn.multiply(ttnn.silu(gate), up)
     pc_out = sparse_program_config(m, hidden.shape[-1], hidden_size)
     # Deliberately NOT `dtype=bfloat8_b` here, unlike the gate/up call above.
     # It was tried: 101.69 -> 101.45 ms, which is inside the run-to-run spread,
