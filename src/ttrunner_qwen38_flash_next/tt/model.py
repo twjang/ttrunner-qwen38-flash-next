@@ -37,6 +37,8 @@ from .weights import TTWeights
 
 # K/V page size. One tile, so every cache write stays tile-aligned and a chunk
 # start is a legal `chunk_start_idx` for the chunked SDPA program config below.
+_MISSING = object()
+
 KV_BLOCK = 32
 
 # The DeltaNet op's fixed chunk width, which is also `prefill`'s default chunk
@@ -88,6 +90,12 @@ class TTState:
     Token histories live here rather than per layer: only the PLE layer reads
     them, and they are a property of the sequence, not of a layer.
     """
+
+    # Whether the QSA selection actually runs. A Python bool, so it is baked
+    # into whatever trace gets captured -- which is the point: the two regimes
+    # are two graphs, and the engine recaptures when a sequence crosses
+    # `indexer_budget`. Default on, so nothing changes until that wiring lands.
+    selection_active = True
 
     def __init__(self, num_layers: int, batch: int = 1):
         self.layers = [LayerState() for _ in range(num_layers)]
@@ -196,6 +204,7 @@ class TTModel:
         # budget; TTEngine says so at construction.
         self.indexer_max_seq = 1 << 16
         self._mask_base = None
+        # What each bound input's contents were last derived from; see `_input`.
         self.use_indexer = (
             traceable_kv
             and config.indexer_budget < max_seq_len <= self.indexer_max_seq
@@ -291,11 +300,40 @@ class TTModel:
     def to_dev(self, t: torch.Tensor, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT) -> ttnn.Tensor:
         return ttnn.from_torch(t, dtype=dtype, layout=layout, device=self.mesh, mesh_mapper=self.replicate)
 
-    def _input(self, name: str, host: torch.Tensor, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    @property
+    def _host_memo(self) -> dict:
+        """Host tensors derived from the position alone, cached across the
+        per-layer loop for the same reason `_input` takes a key.
+
+        Lazily created rather than set in `__init__`: the indexer tests build a
+        TTModel without running the full constructor.
+        """
+        m = self.__dict__.get("_host_memo_store")
+        if m is None:
+            m = self.__dict__["_host_memo_store"] = {}
+        return m
+
+    @property
+    def _input_key(self) -> dict:
+        """What each bound input's contents were last derived from; see `_input`."""
+        m = self.__dict__.get("_input_key_store")
+        if m is None:
+            m = self.__dict__["_input_key_store"] = {}
+        return m
+
+    def _input(self, name: str, host: torch.Tensor, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+               key=None):
         """A per-step input, either fresh or written into its bound buffer.
 
         Writing into a persistent buffer is what lets the whole 48-layer step be
         replayed from a captured trace; the copy itself happens outside the trace.
+
+        `key` names what the contents were derived from. Most of these inputs
+        depend on the position and nothing else, but they are built and uploaded
+        inside the per-layer loop, so all twelve QSA layers were writing
+        byte-identical data into the same buffer -- eleven redundant
+        host-to-device copies per tensor per token, and the host-side torch work
+        to build each one. With a key the copy happens once per distinct value.
         """
         if self.bound is None:
             return self.to_dev(host, dtype, layout)
@@ -303,12 +341,16 @@ class TTModel:
         if buf is None:
             buf = self.to_dev(host, dtype, layout)
             self.bound[name] = buf
+            self._input_key[name] = key
             return buf
         if self._skip_copy:
+            return buf
+        if key is not None and self._input_key.get(name, _MISSING) == key:
             return buf
         ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(host, dtype=dtype, layout=layout, mesh_mapper=self.replicate), buf
         )
+        self._input_key[name] = key
         return buf
 
     def from_dev(self, t: ttnn.Tensor) -> torch.Tensor:
@@ -321,6 +363,21 @@ class TTModel:
     # -- rope -------------------------------------------------------------
 
     def rope(self, positions: int | list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        # Two callers per layer with different arguments -- the attention heads
+        # at the position, the indexer at its block's start -- so a single slot
+        # would alternate and never hit. A handful of entries covers both, and
+        # is bounded because the keys repeat across the twelve layers.
+        k = positions if isinstance(positions, int) else tuple(positions)
+        memo = self._host_memo.setdefault("rope", {})
+        if k in memo:
+            return memo[k]
+        if len(memo) >= 8:
+            memo.clear()
+        out = self._rope_uncached(positions)
+        memo[k] = out
+        return out
+
+    def _rope_uncached(self, positions: int | list[int]) -> tuple[torch.Tensor, torch.Tensor]:
         """cos/sin for one absolute position per sequence -> [1, B, 1, rope_dim].
 
         Text-only input uses the same position on all three mrope axes, so the
@@ -646,6 +703,13 @@ class TTModel:
         self, mixed: ttnn.Tensor, layer: int, st: LayerState, positions: list[int],
         q_cos: ttnn.Tensor, q_sin: ttnn.Tensor,
     ) -> ttnn.Tensor:
+        """Maintain the block cache, then select from it. See the two halves."""
+        self._indexer_update(mixed, layer, st, positions)
+        return self._indexer_mask(mixed, layer, st, positions, q_cos, q_sin)
+
+    def _indexer_update(
+        self, mixed: ttnn.Tensor, layer: int, st: LayerState, positions: list[int],
+    ) -> None:
         """QSA's sparse selection, as an additive attention mask.
 
         Returns [B, n_q, max_seq_len] worth of 0 / -1e9 for
@@ -699,8 +763,8 @@ class TTModel:
         b_cos, b_sin = self.rope([ratio * (p // ratio) for p in positions])
         pooled = self._apply_rope_dev(
             pooled,
-            self._input("idx_block_cos", b_cos, ttnn.float32),
-            self._input("idx_block_sin", b_sin, ttnn.float32),
+            self._input("idx_block_cos", b_cos, ttnn.float32, key=tuple(positions)),
+            self._input("idx_block_sin", b_sin, ttnn.float32, key=tuple(positions)),
         )
         if st.indexer_blocks is None:
             st.indexer_blocks = ttnn.zeros(
@@ -711,9 +775,33 @@ class TTModel:
             self._l1_height_sharded(ttnn.typecast(pooled, ttnn.bfloat16), d),
             update_idxs_tensor=self._input(
                 "idx_block_pos", torch.tensor([p // ratio for p in positions], dtype=torch.int32),
-                ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, key=tuple(positions),
             ),
         )
+
+        return None
+
+    def _indexer_mask(
+        self, mixed: ttnn.Tensor, layer: int, st: LayerState, positions: list[int],
+        q_cos: ttnn.Tensor, q_sin: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        """Score the cached blocks, take the top `k`, and paint them into a mask.
+
+        This half is what costs: `ttnn.topk` alone measured **22.3 ms** of a
+        146 ms decode step -- k=512 out of nb=1024 blocks is half a sort, run in
+        all twelve QSA layers. The scatter behind it is only 1.8 ms.
+
+        It is also skippable below the budget. Eligible blocks at position p
+        number p//ratio, so while p < indexer_budget there are fewer than k of
+        them and `topk` returns every visible block plus -inf padding -- the mask
+        it builds is exactly plain causal attention. The block cache still has to
+        be filled on those steps, which is why `_indexer_update` is separate:
+        skip this half, keep that one, and read causally.
+        """
+        cfg = self.cfg
+        d, ratio = cfg.indexer_head_dim, self.indexer_ratio
+        batch = mixed.shape[-2]
+        nb, k = self.max_blocks, self.indexer_topk
 
         # -- scores: sum over heads of relu(q . block), one matmul per head --
         # Contracting the *block* cache against a single query column keeps the
@@ -734,7 +822,7 @@ class TTModel:
             part = ttnn.relu(ttnn.matmul(st.indexer_blocks, qh, compute_kernel_config=HIFI4))
             scores = part if scores is None else ttnn.add(scores, part)
         scores = ttnn.multiply(ttnn.transpose(scores, -2, -1), d**-0.5)   # [B,1,1,nb]
-        scores = ttnn.add(scores, self._input("idx_bias", self._block_bias(positions), ttnn.float32))
+        scores = ttnn.add(scores, self._input("idx_bias", self._block_bias(positions), ttnn.float32, key=tuple(positions)))
 
         # -- select, expand to tokens, and build the mask -------------------
         blocks = ttnn.topk(scores, k, dim=-1)[1]                  # uint16 [B,1,1,k]
@@ -756,7 +844,7 @@ class TTModel:
                 torch.tensor(positions, dtype=torch.float32).reshape(batch, 1, 1, 1).expand(
                     batch, 1, 1, k * ratio
                 ).contiguous(),
-                ttnn.float32,
+                ttnn.float32, key=tuple(positions),
             ),
         )
         # This one comparison covers every case `topk` can hand back: a block
@@ -765,10 +853,10 @@ class TTModel:
         # eligible block has none.
         tail_idx, tail_vis = self._tail_block(positions)
         tokens = ttnn.concat(
-            [tokens, self._input("idx_tail", tail_idx, ttnn.float32)], dim=-1
+            [tokens, self._input("idx_tail", tail_idx, ttnn.float32, key=tuple(positions))], dim=-1
         )
         visible = ttnn.concat(
-            [visible, self._input("idx_tail_vis", tail_vis, ttnn.float32)], dim=-1
+            [visible, self._input("idx_tail_vis", tail_vis, ttnn.float32, key=tuple(positions))], dim=-1
         )
 
         # Mark the selection in a full-length row and hand back an additive mask
@@ -797,6 +885,15 @@ class TTModel:
         return ttnn.repeat(mask, (1, 1, cfg.num_attention_heads, 1))
 
     def _block_bias(self, positions: list[int]) -> torch.Tensor:
+        k = tuple(positions)
+        hit = self._host_memo.get("_block_bias")
+        if hit is not None and hit[0] == k:
+            return hit[1]
+        out = self._block_bias_uncached(positions)
+        self._host_memo["_block_bias"] = (k, out)
+        return out
+
+    def _block_bias_uncached(self, positions: list[int]) -> torch.Tensor:
         """Additive score bias: 0 for blocks this query may select, -inf otherwise.
 
         Eligibility is `ratio*j + ratio - 1 <= p`. The block p sits inside is
@@ -819,6 +916,15 @@ class TTModel:
         return torch.stack(rows).reshape(len(positions), 1, 1, nb)
 
     def _tail_block(self, positions: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        k = tuple(positions)
+        hit = self._host_memo.get("_tail_block")
+        if hit is not None and hit[0] == k:
+            return hit[1]
+        out = self._tail_block_uncached(positions)
+        self._host_memo["_tail_block"] = (k, out)
+        return out
+
+    def _tail_block_uncached(self, positions: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
         """The trailing partial block: cache indices, and which of them are visible.
 
         A whole K chunk rather than `ratio` entries, because sdpa_decode asserts
@@ -882,8 +988,8 @@ class TTModel:
 
         positions_for_rope = list(position) if isinstance(position, (list, tuple)) else [position] * batch
         cos_t, sin_t = self.rope(positions_for_rope)
-        cos = self._input("rope_cos", cos_t, ttnn.float32)
-        sin = self._input("rope_sin", sin_t, ttnn.float32)
+        cos = self._input("rope_cos", cos_t, ttnn.float32, key=tuple(positions_for_rope))
+        sin = self._input("rope_sin", sin_t, ttnn.float32, key=tuple(positions_for_rope))
         q = self._apply_rope_dev(q, cos, sin)
         k = self._apply_rope_dev(k, cos, sin)
 
@@ -906,7 +1012,7 @@ class TTModel:
             # own shape -- L1 height-sharded, with the index tensor in DRAM.
             pos_tensor = self._input(
                 "cur_pos", torch.tensor(positions, dtype=torch.int32), ttnn.int32,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
+                layout=ttnn.ROW_MAJOR_LAYOUT, key=tuple(positions),
             )
             k_s = self._l1_height_sharded(ttnn.typecast(k, ttnn.bfloat16), hd)
             v_s = self._l1_height_sharded(ttnn.typecast(v, ttnn.bfloat16), hd)
@@ -920,13 +1026,19 @@ class TTModel:
             # The paged decode op takes the same `attn_mask` shape the flat one
             # does, so the QSA selection passes through unchanged: the indexer
             # masks *logical* positions and never addresses the cache.
-            mask = (
-                self._indexer_select(mixed, layer, st, positions, cos, sin)
-                if self.use_indexer else None
-            )
+            mask = None
+            if self.use_indexer:
+                if self.selection_active:
+                    mask = self._indexer_select(mixed, layer, st, positions, cos, sin)
+                else:
+                    # Below the budget the selection reduces to plain causal
+                    # attention (see `_indexer_mask`), so skip it and read
+                    # causally -- but keep filling the block cache, because it
+                    # has to be right on the step the selection starts mattering.
+                    self._indexer_update(mixed, layer, st, positions)
             out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
                 q, st.keys, st.values, page_table_tensor=page_table,
-                is_causal=not self.use_indexer, attn_mask=mask,
+                is_causal=mask is None, attn_mask=mask,
                 cur_pos_tensor=pos_tensor,
                 scale=hd**-0.5, program_config=self.sdpa_program_config,
                 compute_kernel_config=HIFI4,

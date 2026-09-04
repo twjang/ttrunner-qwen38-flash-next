@@ -196,6 +196,10 @@ class TTEngine(Engine):
             self.config, self.weights, self.host_store, self.mesh,
             max_seq_len=seq, traceable_kv=True,
         )
+        # Start with the selection off. It is exact below `indexer_budget` (see
+        # `_enable_selection`, which turns it on and recaptures when a sequence
+        # gets there), and leaving it off is worth 35.4 ms a token.
+        self.model.selection_active = False
         # QSA attends to `indexer_budget` selected tokens, not to everything.
         # Below the budget every complete block is retained, so dense causal
         # attention is exactly right and cheaper; above it, dense is a different
@@ -651,6 +655,36 @@ class TTEngine(Engine):
                 # already moved the state either way
                 self.model.restore(state, snap)
 
+        def _enable_selection() -> None:
+            """Turn the QSA selection on, recapturing the trace around it.
+
+            Below `indexer_budget` the selection is provably a no-op: the number
+            of eligible blocks at position p is p // ratio, so while p < budget
+            there are fewer than `indexer_topk` of them and the mask it builds is
+            exactly plain causal attention. Skipping it saved a measured 35.4 ms
+            a token (146.2 -> 110.8) because `ttnn.topk` over 1024 blocks costs
+            22.3 ms across the twelve QSA layers.
+
+            `selection_active` is a Python bool, so the trace bakes in whichever
+            regime was live when it was captured -- which is why crossing the
+            budget needs a new capture rather than a branch. That costs the same
+            ~2.6 s as `_reprefill`, once per sequence that gets that long, and
+            the block cache has been maintained all along so the first selecting
+            step is correct.
+            """
+            self.model.selection_active = True
+            if self._decoder is None:
+                return
+            from .traced import TracedDecoder
+
+            self._decoder.release()
+            self._decoder = None
+            snap = self.model.snapshot(state)
+            try:
+                self._decoder = TracedDecoder(self.model, state)
+            finally:
+                self.model.restore(state, snap)
+
         def admit(seq: _Sequence, slot: int) -> None:
             """Give `seq` a slot, reusing the state already there when it can.
 
@@ -741,6 +775,13 @@ class TTEngine(Engine):
             greedy_only = all(
                 slots[i] is not None and slots[i].request.temperature <= 0 for i in sampling
             )
+            if (
+                self.model.use_indexer
+                and not self.model.selection_active
+                and max(state.positions) + 1 >= self.model.indexer_budget
+            ):
+                _enable_selection()
+
             try:
                 t_plain = time.perf_counter()
                 hidden = advance(tokens)

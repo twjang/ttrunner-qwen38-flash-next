@@ -142,3 +142,50 @@ def test_the_selection_is_off_where_it_cannot_address_the_cache() -> None:
     src = inspect.getsource(TTModel.__init__)
     assert "config.indexer_budget < max_seq_len <= self.indexer_max_seq" in src
     assert "self.indexer_max_seq = 1 << 16" in src
+
+
+# --- why the selection can be skipped below the budget ----------------------
+#
+# `_indexer_mask` is the expensive half of the indexer: `ttnn.topk` over
+# `max_blocks` costs a measured 22.3 ms across the twelve QSA layers, 15 % of a
+# decode step. The engine skips it while a sequence is below `indexer_budget`
+# and recaptures the trace when it crosses (`_enable_selection`).
+#
+# That is only sound if the mask it would have built is exactly plain causal
+# attention there, which holds when every eligible block fits inside the
+# selection budget -- then `topk` returns all of them and the -inf padding
+# contributes nothing that the `index <= p` filter does not already drop.
+#
+# These pin the arithmetic that makes it true, so a change to the budget, the
+# compression ratio, or the eligibility rule cannot quietly break the engine's
+# fast path.
+
+
+@pytest.mark.parametrize("p", [0, 1, 3, 4, 100, 1023, 2044, 2046, BUDGET - 1])
+def test_every_eligible_block_fits_the_budget_below_it(p: int) -> None:
+    m = _model()
+    bias = m._block_bias([p])[0, 0, 0]
+    # Selectable means not pushed to -inf and not the incomplete straddling one.
+    selectable = int((bias == 0.0).sum())
+    assert selectable <= m.indexer_topk, (
+        f"at p={p}, {selectable} blocks compete for {m.indexer_topk} slots -- "
+        "the selection is no longer a no-op below the budget and the engine's "
+        "skip in _enable_selection would change the answer"
+    )
+
+
+def test_the_budget_is_where_that_stops_being_true() -> None:
+    """The first position at which selection genuinely selects.
+
+    Not an implementation detail: it is the threshold `_enable_selection` uses,
+    and it should sit at or above the budget, never below it.
+    """
+    m = _model()
+    first_binding = next(
+        p for p in range(m.max_seq_len)
+        if int((m._block_bias([p])[0, 0, 0] == 0.0).sum()) > m.indexer_topk
+    )
+    assert first_binding >= m.indexer_budget, (
+        f"blocks outnumber slots from p={first_binding}, below the budget "
+        f"{m.indexer_budget} the engine treats as safe"
+    )

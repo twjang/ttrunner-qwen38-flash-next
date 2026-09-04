@@ -1967,3 +1967,49 @@ measured at 109.2 ms earlier in the session (§5.7 work). The two setups differ
 somehow -- harness vs engine configuration -- and the numbers must not be mixed
 until that is explained. All deltas above are internally consistent, being from
 one harness in one session.
+
+## 4f. The QSA selection is skippable below the budget: 146.2 -> 110.8 ms
+
+The ablation harness, run component by component on the traced step, put the
+cost somewhere nobody had looked:
+
+| ablate | median | delta |
+|--------|--------|-------|
+| none | 146.17 ms | -- |
+| `indexer` (all of it) | 109.91 ms | **36.8 ms** |
+| `idxtopk` (its topk only) | 123.84 ms | **22.3 ms** |
+| `idxscatter` | 144.36 ms | 1.8 ms |
+| `noselect` (skip selection, keep the cache) | **110.82 ms** | **35.4 ms** |
+
+`ttnn.topk` is 22.3 ms of a 146 ms step -- 15 % of decode -- because it takes
+k=512 out of `max_blocks`=1024, which is half a sort, in each of the twelve QSA
+layers. The scatter that the call-site comment worried about is 1.8 ms.
+
+**And below `indexer_budget` none of it does anything.** Eligible blocks at
+position p number `p // ratio`, so while `p < budget` there are fewer than
+`indexer_topk` of them: `topk` returns every visible block, the -inf padding is
+dropped by the `index <= p` filter, and the mask is exactly plain causal
+attention. Skipping it is not an approximation.
+
+What made this a change rather than an observation is that the block cache still
+has to be filled on the skipped steps, or the first selecting step reads
+garbage. So `_indexer_select` is split: `_indexer_update` (k_proj, ring, pool,
+rope, `paged_update_cache`) always runs; `_indexer_mask` (q_proj, the per-head
+scores, topk, scatter, repeat) runs only when `selection_active`.
+
+`selection_active` is a plain Python bool, so a trace bakes in the regime it was
+captured under -- which is why crossing the budget takes a new capture, not a
+branch. `TTEngine._enable_selection` does the release/snapshot/capture/restore
+that `_reprefill` already established, ~2.6 s, once per sequence that gets that
+far. Sequences shorter than 2048 tokens never pay it.
+
+INVARIANT 36: the QSA selection is exact *and* skippable below
+`indexer_budget`, and the engine starts with it off. Two things keep that
+honest: `_indexer_update` must keep running while it is off, and the trace must
+be recaptured on the way past the budget. `tests/test_indexer_selection.py`
+pins the arithmetic -- eligible blocks never outnumber the selection slots below
+the budget -- so a change to the budget or the compression ratio cannot break
+the fast path quietly.
+
+Where the step goes now, on this harness: MoE 42.9, QSA 41.8 (36.8 of it the
+indexer), deltanet 16.4, shared 5.5, sdpa 5.1, allreduce 3.8, PLE 2.8.

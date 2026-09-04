@@ -59,6 +59,44 @@ elif PART == "allreduce":
 elif PART == "attn":
     model_mod.TTModel._attention_step = lambda self, mixed, *a, **kw: mixed
     model_mod.TTModel._linear_attention_step = lambda self, mixed, *a, **kw: mixed
+elif PART == "noselect":
+    # Not an ablation of a component but of a *regime*: the selection is exact
+    # below indexer_budget, where topk returns every visible block, so this is
+    # what a sequence under 2048 tokens could legitimately run. The block cache
+    # is still maintained, which is the part that has to stay.
+    m.selection_active = False
+elif PART == "idxtopk":
+    # Only the indexer's topk: k=512 out of 1024 blocks, i.e. half a sort, and
+    # it runs in all twelve QSA layers. Substituted by a constant of the shape
+    # it returns, so the delta is the op alone.
+    _topk_real, _topk_const = ttnn.topk, {}
+
+    def _topk(t, k, dim=-1, *a, **kw):
+        if k != m.indexer_topk:
+            return _topk_real(t, k, dim=dim, *a, **kw)
+        sig = (tuple(t.shape), k)
+        if sig not in _topk_const:
+            import torch as _t
+            shape = list(t.shape)
+            shape[dim] = k
+            _topk_const[sig] = (
+                _topk_real(t, k, dim=dim, *a, **kw)[0],
+                m.to_dev(_t.zeros(shape, dtype=_t.float32), ttnn.uint16),
+            )
+        return _topk_const[sig]
+
+    ttnn.topk = _topk
+elif PART == "idxscatter":
+    # Only the scatter that paints the selection into a max_seq_len-wide row.
+    # The comment at the call site prices it at 0.3-0.7 ms; twelve layers would
+    # make that 3.6-8.4 ms of the 36.8.
+    _scatter_real = ttnn.scatter
+    ttnn.scatter = lambda base, dim, idx, src, *a, **kw: base
+elif PART == "indexer":
+    # QSA's sparse selection only. Dropping it makes the read plain causal, so
+    # `is_causal` flips back on its own and no mask is built -- which is the
+    # point: the mask is [B, n_q, max_seq_len] and is rebuilt every layer.
+    m.use_indexer = False
 elif PART == "qsa":
     # the 12 full-attention layers only
     model_mod.TTModel._attention_step = lambda self, mixed, *a, **kw: mixed
