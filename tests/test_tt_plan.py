@@ -344,21 +344,34 @@ def test_reinject_broadcast_equals_the_slice_form() -> None:
     assert torch.equal(broadcast_form, reference)
 
 
-def test_the_hyper_connection_mix_averages_in_one_op() -> None:
-    """`mean` rather than `sum` then a scalar multiply, 97 times a step.
+def test_the_hyper_connection_mix_averages_by_slicing_not_reshaping() -> None:
+    """Four tile-aligned slices, not a reshape plus `mean`.
 
-    Worth 29.6 ms eager (498.7 -> 469.1) and nothing traced, which is the useful
-    part of the measurement: 0.30 ms per removed op is a host dispatch, and a
-    trace replays with one. Fewer launches is an eager-path optimisation.
+    This test used to assert the opposite, and the reason it flipped is worth
+    keeping. `mean` over a reshaped stream axis is one op against nine, and one
+    op was the right call while the win being chased was *dispatch*: it was
+    worth 29.6 ms eager (498.7 -> 469.1) and nothing traced, because a trace
+    replays with a single dispatch.
+
+    But the op is not free on the device either. Splitting the last dimension in
+    TILE layout re-tiles the tensor rather than relabelling it, and
+    `reshape [1,1,32,10240] -> [1,32,4,2560]` measures **92.30 us** a call
+    against 4.43 for a tile-aligned slice on the same tensor
+    (`tiny_op_cost.py`). At 97 calls a token that is 8.95 ms of a 104 ms step,
+    and the nine-op form is ~40 us.
+
+    The arithmetic is identical -- the flattened layout is stream-major, so
+    stream h is columns [h*hidden, (h+1)*hidden), and a mean over four elements
+    is their sum over four.
     """
     import inspect
 
     from ttrunner_qwen38_flash_next.tt.ops import gated_residual_mix
 
-    src = inspect.getsource(gated_residual_mix)
-    assert "ttnn.mean(per_stream, dim=-2, keepdim=True)" in src
-    assert "ttnn.sum(per_stream" not in src
-    assert "1.0 / hc_count" not in src.split("inject = None")[0]
+    src = inspect.getsource(gated_residual_mix).split("inject = None")[0]
+    assert "ttnn.mean(" not in src, "the reshape+mean form costs 92.3 us a call"
+    assert "1.0 / hc_count" in src, "the sum still has to be scaled"
+    assert "for h in range(hc_count)" in src, "one slice per stream"
 
 
 def test_sparse_matmul_uses_one_k_block_past_a_row_tile() -> None:

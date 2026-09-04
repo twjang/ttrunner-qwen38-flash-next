@@ -145,25 +145,30 @@ def gated_residual_mix(
     mix = ttnn.sigmoid(linear_rows(mix, up_w, compute_kernel_config=HIFI4))
     gated = ttnn.multiply(mix, normed)
 
-    # Mean over the hc_count streams. The flattened layout is stream-major, so a
-    # single reshape to [.., M, hc, hidden] exposes the stream axis directly --
-    # no intermediate reshape needed.
-    shape = list(gated.shape)
-    rows = shape[1] * shape[2]
-    per_stream = ttnn.reshape(gated, (shape[0], rows, hc_count, hidden_size))
-    # `mean` rather than `sum` then a scalar multiply: one op instead of two,
-    # 97 times a step. A/B'd rather than assumed, because op count is a poor
-    # proxy for cost here -- see `reinject`, where a three-op form ran 9.5x
-    # slower than the nine-op one it replaced.
+    # Mean over the hc_count streams, by slicing rather than reshaping.
     #
-    #     eager    498.7 -> 469.1 ms   (-5.9 %)
-    #     traced   236.1 -> 236.0 ms   (unchanged)
+    # The obvious form -- reshape to [.., M, hc, hidden] and `mean` over the
+    # stream axis -- reads well and costs 92.3 us a call, because splitting the
+    # last dimension in TILE layout re-tiles the whole tensor rather than
+    # relabelling it. At 97 calls a token that single reshape was **8.95 ms** of
+    # a 104 ms step (`tiny_op_cost.py`).
     #
-    # 29.6 ms for 97 ops is 0.30 ms apiece, which is a host dispatch. A trace
-    # replays with one dispatch, so it saves nothing there -- fewer launches is
-    # an *eager*-path optimisation, and the traced step is not dispatch-bound.
-    averaged = ttnn.mean(per_stream, dim=-2, keepdim=True)
-    mixed = reshape_to(averaged, (shape[0], shape[1], shape[2], hidden_size))
+    # The flattened layout is stream-major, so stream h is just columns
+    # [h*hidden, (h+1)*hidden) -- and a slice on the last dimension at a
+    # multiple of 32 is tile-aligned, measured at 4.43 us. Four of those plus
+    # three adds and one scalar multiply is ~40 us against ~95, and the output
+    # needs no reshape because the slices already have the right shape.
+    #
+    # Same arithmetic: `mean` over four elements is their sum over four.
+    streams = [
+        ttnn.slice(gated, (0, 0, 0, h * hidden_size),
+                   (gated.shape[0], gated.shape[1], gated.shape[2], (h + 1) * hidden_size))
+        for h in range(hc_count)
+    ]
+    total = streams[0]
+    for nxt in streams[1:]:
+        total = ttnn.add(total, nxt)
+    mixed = ttnn.multiply(total, 1.0 / hc_count)
 
     inject = None
     if inject_w is not None:

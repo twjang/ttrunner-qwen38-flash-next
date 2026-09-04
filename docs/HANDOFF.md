@@ -2287,3 +2287,67 @@ INVARIANT 41: `ttnn.all_reduce` on this box costs ~0.040 ms whatever the width,
 up to 10240. It is latency-bound, so a reduction shard pays for any weight whose
 replicated read costs more than ~0.055 ms -- and does not pay for one that is
 already wide enough to fill the grid.
+
+### 5.4 Where the 104 ms goes, measured: op overhead and full-E elementwise
+
+`step_op_census.py` counts one decode step: **7064 ttnn calls**, and the top of
+the list by *count* moves almost no bytes.
+
+| op | calls | GB moved |
+|----|------:|---------:|
+| multiply | 1297 | 0.107 |
+| reshape | 937 | 0.113 |
+| linear | 784 | 2.419 |
+| slice | 588 | 0.051 |
+| add | 581 | 0.082 |
+| sigmoid + silu | 556 | 0.021 |
+| sparse_matmul | 96 | (22.1 if every expert were read) |
+
+Weight reading is not the problem. Summing the manifest against `plan.py`'s
+residency rules, the dense weights are 9.5 ms of reading and the top-10 experts
+1.3 ms -- **about 11 ms of a 104 ms step**. Every replicated weight put together
+is 6.21 ms, so sharding all of them perfectly would recover at most ~4.7 ms.
+`attn_q` (1.03 ms), `hc_*_up` (1.72), the router (0.65), `attn_output` (0.52)
+and the hc norms/injects (1.30) are the whole of it.
+
+`tiny_op_cost.py` prices the ops **at M=1, which is what decode runs**:
+
+| op | us/call |
+|----|--------:|
+| multiply / add / silu / sigmoid, [1,1,1,2560] | 5.5-6.0 |
+| multiply [1,1,1,10240] | 6.46 |
+| reshape [1,1,1,10240] -> [1,1,4,2560] | 4.43 |
+| **multiply [1,128,1,1280]** | **73.03** |
+| slice [1,128,1,1280] -> 640 | 29.26 |
+| silu [1,128,1,1280] | 51.49 |
+
+Two facts fall out, and they set the plan.
+
+**Elementwise cost is fixed per call, not per byte.** 2560 wide and 10240 wide
+cost the same 5.5-6.5 us, and M=1 costs what M=32 costs. So the 3959 glue calls
+are **~21.8 ms of the step** regardless of how little data they touch, and the
+only thing that removes them is fusing them.
+
+**The expert-wide elementwise ops are driven by E, not by M.** The MoE's SwiGLU
+chain -- two slices, a silu and a multiply over [1, 128, 1, 1280] -- is
+183.0 us a layer, **8.79 ms a token**, on tensors that are 97 % zeros because
+only ~3 of the 128 local experts are selected.
+
+So the MoE block is `sparse_matmul` 30.8 (of which 1.51 GB is zero-fill,
+section 5.2) plus 8.79 of full-E elementwise: **~39.6 ms of 104**, against
+1.87 ms for reading the bytes the routing actually asks for (section 4g). It is
+the largest single block and one fused kernel addresses all of it: gather the
+selected experts, gate/up, SwiGLU, down, score-weighted accumulate -- replacing
+~7 ops a layer and writing `[1, k_sel, 1, N]` instead of `[1, 128, 1, N]`.
+
+INVARIANT 42: on this box an elementwise or data-movement op costs ~5.5 us
+whatever its shape, up to at least 10240 wide, and expert-axis ops cost with E
+whatever M is. Op *count* is therefore the currency at batch 1, not bytes --
+7064 calls at 5.5 us is 39 ms of pure per-op cost. Optimising bytes without
+reducing calls will keep missing.
+
+CAUTION, and it cost a wrong prediction: **benchmark at M=1.** The same reshape
+that costs 4.43 us at M=1 costs 92.30 at M=32, and pricing it at 32 predicted a
+5.3 ms saving from replacing it where the measured result was 0.23 ms. Storage
+pads a row to a 32-row tile; the op still walks only the tile-rows the logical
+shape has.
