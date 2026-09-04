@@ -429,7 +429,7 @@ def _buf(key, shape, dtype, device):
     return got
 
 
-def _gather_program(weights, indices, out, k_sel: int, wide: int):
+def _gather_program(weights, indices, out, k_sel: int, wide: int, idx16: int = 0):
     grid = weights.device().compute_with_storage_grid_size()
     cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
     crs = ttnn.CoreRangeSet(
@@ -459,7 +459,7 @@ def _gather_program(weights, indices, out, k_sel: int, wide: int):
                 buffer_index=1, data_format=ttnn.uint32, page_size=64)]),
     ]
     ct_args = [tpe, tile_bytes, _READ_BATCH, idx_bytes,
-               weights.shape[1], k_sel, nt, wide]
+               weights.shape[1], k_sel, nt, wide, idx16]
     ct_args += acc["w"] + acc["i"] + acc["o"]
     addrs = (weights.buffer_address(), indices.buffer_address(), out.buffer_address())
     kernel = ttnn.KernelDescriptor(
@@ -471,11 +471,11 @@ def _gather_program(weights, indices, out, k_sel: int, wide: int):
     return ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=cbs)
 
 
-def _gather(weights, idx_u32, k_sel: int, wide: int, out_shape):
+def _gather(weights, idx_u32, k_sel: int, wide: int, out_shape, idx16: int = 0):
     out = _buf(("g", wide, out_shape, str(weights.dtype)), out_shape,
                weights.dtype, weights.device())
     ttnn.generic_op([weights, idx_u32, out],
-                    _gather_program(weights, idx_u32, out, k_sel, wide))
+                    _gather_program(weights, idx_u32, out, k_sel, wide, idx16))
     return out
 
 def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size):
@@ -504,12 +504,15 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size):
     n = gate_w.shape[-1] // 2                     # intermediate width
     vals, idx = ttnn.topk(weights_local, k=k_sel, dim=-1, largest=True, sorted=True)
 
-    # The kernel reads its selection as uint32 out of a row-major page.
-    idx_pad = ttnn.pad(
-        ttnn.to_layout(ttnn.typecast(idx, ttnn.uint32), ttnn.ROW_MAJOR_LAYOUT),
-        [(0, 0), (0, 0), (0, 0), (0, _IDX_LEN - k_sel)], 0)
+    # `topk` hands back uint16 in TILE layout, and the kernel reads that tile's
+    # first face directly -- columns 0..15 are contiguous there, so k_sel <= 16
+    # needs no typecast, no layout change and no pad. Three ops a layer, 144 a
+    # token, gone. Validated against a torch gather rather than assumed.
+    idx_pad = idx
+    if k_sel > 16:
+        raise ValueError(f"k_sel {k_sel} exceeds a tile face; widen the index path")
 
-    gu = _gather(gate_w, idx_pad, k_sel, 2, (1, 1, gate_w.shape[-2], k_sel * 2 * n))
+    gu = _gather(gate_w, idx_pad, k_sel, 2, (1, 1, gate_w.shape[-2], k_sel * 2 * n), 1)
     both = ttnn.linear(x, gu, compute_kernel_config=HIFI4)
     hidden = fused_swiglu(both, k_sel * n)
 
@@ -527,7 +530,7 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size):
         _GATHER_BUF[("spread_init", k_sel, n)] = True
     scaled = ttnn.multiply(hidden, ttnn.matmul(vals, spread, compute_kernel_config=HIFI4))
 
-    dw = _gather(down_w, idx_pad, k_sel, 0, (1, 1, k_sel * n, hidden_size))
+    dw = _gather(down_w, idx_pad, k_sel, 0, (1, 1, k_sel * n, hidden_size), 1)
     return ttnn.linear(scaled, dw, compute_kernel_config=HIFI4)
 
 

@@ -60,8 +60,14 @@
 //                          runtime args only by count -- handoff 4g)
 //   6: NT                 (tiles across one expert's output, N/32)
 //   7: WIDE               (1: concatenate on the output axis, for gate/up;
-//                          0: stack on rows, for the down projection)
-//   8..: TensorAccessorArgs for weights, then indices, then output
+//                          0: stack on rows, for the down projection;
+//                          2: as 1 with the gate|up halves split)
+//   8: IDX16              (1: the selection is uint16 straight out of
+//                          `ttnn.topk`, read from the first face of its
+//                          tile -- which holds columns 0..15 contiguously,
+//                          so k_sel <= 16 needs no typecast, no layout
+//                          change and no pad. 0: a uint32 row-major page.)
+//   9..: TensorAccessorArgs for weights, then indices, then output
 //
 // Per-core runtime args:
 //   0: weights.buffer_address()
@@ -82,6 +88,7 @@ void kernel_main() {
     constexpr uint32_t K_SEL = get_compile_time_arg_val(5);
     constexpr uint32_t NT = get_compile_time_arg_val(6);
     constexpr uint32_t WIDE = get_compile_time_arg_val(7);
+    constexpr uint32_t IDX16 = get_compile_time_arg_val(8);
     constexpr uint32_t OUT_ROW_TILES = K_SEL * NT;
 
     static_assert(TILES_PER_EXPERT > 0, "TILES_PER_EXPERT must be non-zero");
@@ -97,7 +104,7 @@ void kernel_main() {
     const uint32_t work_lo = get_arg_val<uint32_t>(3);
     const uint32_t work_hi = get_arg_val<uint32_t>(4);
 
-    constexpr auto w_ta = TensorAccessorArgs<8>();
+    constexpr auto w_ta = TensorAccessorArgs<9>();
     const auto w_acc = TensorAccessor(w_ta, w_addr);
     constexpr auto i_ta = TensorAccessorArgs<w_ta.next_compile_time_args_offset()>();
     const auto i_acc = TensorAccessor(i_ta, idx_addr);
@@ -113,14 +120,20 @@ void kernel_main() {
 
     noc_async_read_page(0, i_acc, idx_l1);
     noc_async_read_barrier();
-    volatile tt_l1_ptr uint32_t* idx = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(idx_l1);
+    // Either a uint32 row-major page, or the raw first face of a uint16 tile
+    // straight out of `ttnn.topk` -- which is what lets the host skip a
+    // typecast, a layout change and a pad, three ops a layer.
+    volatile tt_l1_ptr uint32_t* idx32 =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(idx_l1);
+    volatile tt_l1_ptr uint16_t* idx16 =
+        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(idx_l1);
 
     uint32_t w = work_lo;
     while (w < work_hi) {
         const uint32_t slot = w / TILES_PER_EXPERT;
         const uint32_t t = w - slot * TILES_PER_EXPERT;
         // The one data-dependent expression in the whole kernel.
-        const uint32_t expert_id = idx[slot];
+        const uint32_t expert_id = IDX16 ? (uint32_t)idx16[slot] : idx32[slot];
         // Clamped rather than asserted: ASSERT expands to `while (1) { ; }`
         // under WATCHER_ENABLED, so a guard against a bad index would hang the
         // card, and a hang costs a device reset. A clamped read stays in bounds
