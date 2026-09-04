@@ -1,5 +1,5 @@
 [project]
-name = "twtest"
+name = "ttrunner_qwen38_flash_next"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -13,10 +13,22 @@ dependencies = [
     "torch @ https://download.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl",
     "torch-xla @ https://pypi.eng.aws.tenstorrent.com/torch-xla/torch_xla-2.9.0%2Bgit56f8e61-cp312-cp312-linux_x86_64.whl",
     "tt_lang @ https://pypi.eng.aws.tenstorrent.com/2026-07/tt-lang/tt_lang-1.1.5.dev20260704%2Blight-cp312-cp312-manylinux_2_34_x86_64.whl",
+    # These four were installed ad hoc rather than declared, so `uv sync` -- which
+    # enforces the lockfile exactly -- removed them. Declaring them makes the
+    # environment reproducible. All permissive: fastapi MIT, uvicorn BSD-3-Clause,
+    # tokenizers Apache-2.0, gguf MIT.
+    "fastapi",
+    "uvicorn",
+    "tokenizers",
+    "gguf",
 ]
 
+[dependency-groups]
+# pytest MIT
+dev = ["pytest"]
+
 [project.scripts]
-twtest = "twtest:main"
+ttrunner_qwen38_flash_next = "ttrunner_qwen38_flash_next:main"
 
 [build-system]
 requires = ["uv_build>=0.12.7,<0.13.0"]

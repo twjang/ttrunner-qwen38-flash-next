@@ -26,7 +26,7 @@ import torch
 
 pytest.importorskip("ttnn")
 
-from twtest.tt.model import TTModel  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.model import TTModel  # noqa: E402
 
 RATIO, BUDGET, MAX_SEQ, K_CHUNK = 4, 2048, 4096, 128
 
@@ -125,7 +125,7 @@ def test_the_engine_says_when_the_selection_cannot_run() -> None:
     something a caller discovers from the output."""
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
     assert "not self.model.use_indexer and seq > self.config.indexer_budget" in src
@@ -137,7 +137,7 @@ def test_the_selection_is_off_where_it_cannot_address_the_cache() -> None:
     reach; and below the budget dense is exactly right and cheaper."""
     import inspect
 
-    from twtest.tt.model import TTModel
+    from ttrunner_qwen38_flash_next.tt.model import TTModel
 
     src = inspect.getsource(TTModel.__init__)
     assert "config.indexer_budget < max_seq_len <= self.indexer_max_seq" in src

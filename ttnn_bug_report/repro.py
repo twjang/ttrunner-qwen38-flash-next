@@ -25,12 +25,12 @@ import ttnn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twtest.gguf.reader import GGUFModel               # noqa: E402
-from twtest.reference.config import Qwen4ExpConfig     # noqa: E402
-from twtest.reference.weights import WeightStore       # noqa: E402
-from twtest.tt.model import TTModel                    # noqa: E402
-from twtest.tt.traced import TracedStepN               # noqa: E402
-from twtest.tt.weights import TTWeights                # noqa: E402
+from ttrunner_qwen38_flash_next.gguf.reader import GGUFModel               # noqa: E402
+from ttrunner_qwen38_flash_next.reference.config import Qwen4ExpConfig     # noqa: E402
+from ttrunner_qwen38_flash_next.reference.weights import WeightStore       # noqa: E402
+from ttrunner_qwen38_flash_next.tt.model import TTModel                    # noqa: E402
+from ttrunner_qwen38_flash_next.tt.traced import TracedStepN               # noqa: E402
+from ttrunner_qwen38_flash_next.tt.weights import TTWeights                # noqa: E402
 
 K_A = int(sys.argv[1]) if len(sys.argv) > 1 else 2
 K_B = int(sys.argv[2]) if len(sys.argv) > 2 else 4

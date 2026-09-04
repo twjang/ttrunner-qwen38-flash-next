@@ -21,7 +21,7 @@ import ttnn
 
 from _device_model import open_model
 
-from twtest.tt import moe
+from ttrunner_qwen38_flash_next.tt import moe
 
 LAYER = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 ROWS = 64

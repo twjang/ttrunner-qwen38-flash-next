@@ -20,7 +20,7 @@ import pytest
 
 pytest.importorskip("ttnn")
 
-from twtest.tt.model import TTModel  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.model import TTModel  # noqa: E402
 
 
 def test_only_the_convolution_and_the_recurrence_are_unrolled() -> None:
@@ -111,7 +111,7 @@ def test_the_capture_warms_the_single_token_step_too() -> None:
     hung on its first eager step and the boards needed `tt-smi -r`."""
     import inspect
 
-    from twtest.tt.traced import TracedStepN
+    from ttrunner_qwen38_flash_next.tt.traced import TracedStepN
 
     src = inspect.getsource(TracedStepN.__init__)
     warm = src[: src.index("begin_trace_capture")]
@@ -133,7 +133,7 @@ def test_step_n_refuses_k_past_one_tile_of_rows() -> None:
     """
     import inspect
 
-    from twtest.tt.model import TTModel
+    from ttrunner_qwen38_flash_next.tt.model import TTModel
 
     src = inspect.getsource(TTModel.step_n)
     assert "else 32" in src, "the guard must stop at one tile of rows by default"

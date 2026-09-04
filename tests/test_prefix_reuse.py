@@ -22,7 +22,7 @@ import pytest
 
 pytest.importorskip("ttnn")
 
-from twtest.tt.engine import TTEngine, reusable_prefix  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.engine import TTEngine, reusable_prefix  # noqa: E402
 
 
 def test_exact_prefix_with_a_token_left_over_is_reusable() -> None:

@@ -14,7 +14,7 @@ import pytest
 # TTState lives in tt.model, which imports ttnn at module scope.
 pytest.importorskip("ttnn")
 
-from twtest.tt.model import LayerState, TTState  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.model import LayerState, TTState  # noqa: E402
 
 
 def test_state_is_per_sequence_not_per_layer() -> None:

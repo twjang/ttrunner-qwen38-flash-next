@@ -28,8 +28,8 @@ import ttnn
 
 from _device_model import open_model, tokenizer
 
-from twtest.reference.cache import HybridCache
-from twtest.reference.model import Qwen4ExpModel
+from ttrunner_qwen38_flash_next.reference.cache import HybridCache
+from ttrunner_qwen38_flash_next.reference.model import Qwen4ExpModel
 
 TOTAL = int(sys.argv[1]) if len(sys.argv) > 1 else 48
 PRE = int(sys.argv[2]) if len(sys.argv) > 2 else 16

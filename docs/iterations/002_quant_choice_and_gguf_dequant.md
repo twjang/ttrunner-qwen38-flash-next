@@ -90,7 +90,7 @@ in a way no shape check would catch.
 
 **Remedy** — `scripts/gen_codebooks.py` parses the `GGML_TABLE_BEGIN(...)`
 blocks straight out of `ggml-common.h`, asserts the parsed count matches the
-declared count, and emits `src/twtest/gguf/_codebooks.py`.
+declared count, and emits `src/ttrunner_qwen38_flash_next/gguf/_codebooks.py`.
 
 **Result** — 512/512 and 16/16 entries parsed and asserted.
 
@@ -99,7 +99,7 @@ declared count, and emits `src/twtest/gguf/_codebooks.py`.
 ## Observation 5 — the dequantiser is bit-exact
 
 Implemented vectorised numpy dequantisation for all seven formats in the
-checkpoint (`src/twtest/gguf/quants.py`), following `ggml-quants.c` exactly.
+checkpoint (`src/ttrunner_qwen38_flash_next/gguf/quants.py`), following `ggml-quants.c` exactly.
 IQ3_S is the delicate one: a 9th grid-index bit comes from `qh` via
 `qs[2l] | ((qh << (8-2l)) & 256)`, and each group of eight values carries its
 own sign byte.
@@ -142,9 +142,9 @@ comment confirming two things worth knowing before writing the model:
 ---
 
 ## State at end of iteration
-- `src/twtest/gguf/reader.py` — GGUF v3 parser, mmap-backed, split-shard aware.
-- `src/twtest/gguf/quants.py` — 7 formats, bit-exact vs `gguf`.
-- `src/twtest/gguf/_codebooks.py` — generated from ggml source.
+- `src/ttrunner_qwen38_flash_next/gguf/reader.py` — GGUF v3 parser, mmap-backed, split-shard aware.
+- `src/ttrunner_qwen38_flash_next/gguf/quants.py` — 7 formats, bit-exact vs `gguf`.
+- `src/ttrunner_qwen38_flash_next/gguf/_codebooks.py` — generated from ggml source.
 - UD-IQ4_XS downloading (~24/98 GB at time of writing).
 
 ## Next

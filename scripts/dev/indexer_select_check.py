@@ -21,9 +21,9 @@ import ttnn
 
 from _device_model import host_row, open_model
 
-from twtest.reference.cache import HybridCache
-from twtest.reference.model import Qwen4ExpModel
-from twtest.tt.model import LayerState
+from ttrunner_qwen38_flash_next.reference.cache import HybridCache
+from ttrunner_qwen38_flash_next.reference.model import Qwen4ExpModel
+from ttrunner_qwen38_flash_next.tt.model import LayerState
 
 T = int(sys.argv[1]) if len(sys.argv) > 1 else 2600
 LAYER = int(sys.argv[2]) if len(sys.argv) > 2 else 3
@@ -80,7 +80,7 @@ import math
 
 import torch.nn.functional as F
 
-from twtest.reference.layers import apply_rotary, rms_norm
+from ttrunner_qwen38_flash_next.reference.layers import apply_rotary, rms_norm
 
 ratio, dim = cfg.indexer_compress_ratio, cfg.indexer_head_dim
 q = F.linear(hidden.float(), m.host.get(f"blk.{LAYER}.indexer.q_proj.weight").float())

@@ -20,9 +20,9 @@ import ttnn
 
 from _device_model import host_row, open_model
 
-from twtest.reference.cache import HybridCache
-from twtest.reference.model import Qwen4ExpModel
-from twtest.tt.model import LayerState
+from ttrunner_qwen38_flash_next.reference.cache import HybridCache
+from ttrunner_qwen38_flash_next.reference.model import Qwen4ExpModel
+from ttrunner_qwen38_flash_next.tt.model import LayerState
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 SEQ = 8

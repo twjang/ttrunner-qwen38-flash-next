@@ -8,8 +8,8 @@ import pytest
 gguf = pytest.importorskip("gguf")
 from gguf.quants import dequantize as gguf_dequantize  # noqa: E402
 
-from twtest.gguf.quants import SUPPORTED_TYPES, dequantize  # noqa: E402
-from twtest.gguf.reader import TYPE_TRAITS, GGMLType  # noqa: E402
+from ttrunner_qwen38_flash_next.gguf.quants import SUPPORTED_TYPES, dequantize  # noqa: E402
+from ttrunner_qwen38_flash_next.gguf.reader import TYPE_TRAITS, GGMLType  # noqa: E402
 
 # Formats we can synthesise random blocks for (all of them: the bytes are
 # opaque to the dequantiser, so random bytes exercise every code path).

@@ -24,7 +24,7 @@ import time
 import torch
 import ttnn
 
-from twtest.tt.moe import sparse_program_config, HIFI4
+from ttrunner_qwen38_flash_next.tt.moe import sparse_program_config, HIFI4
 
 M, N, K = 1, 160, 2560
 TOPK = 12

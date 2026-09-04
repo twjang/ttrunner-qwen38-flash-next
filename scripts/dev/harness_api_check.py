@@ -21,8 +21,8 @@ import sys
 
 
 def _targets():
-    from twtest.tt.engine import TTEngine
-    from twtest.tt.model import TTModel
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.model import TTModel
 
     return {"TTModel": TTModel, "TTEngine": TTEngine}, TTModel, TTEngine
 

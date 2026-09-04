@@ -140,7 +140,7 @@ FAILURES: 0
 ## Modules written
 
 ```
-src/twtest/reference/
+src/ttrunner_qwen38_flash_next/reference/
   config.py     Qwen4ExpConfig.from_gguf() + validate() cross-checks
   weights.py    WeightStore: LRU dense cache + block-aligned row slicing
   layers.py     norms, interleaved mRoPE, causal conv1d, both delta rules

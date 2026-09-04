@@ -25,7 +25,7 @@ import ttnn
 
 from _device_model import open_model, synthetic_prompt
 
-from twtest.tt.engine import accepted_prefix, prompt_lookup_draft
+from ttrunner_qwen38_flash_next.tt.engine import accepted_prefix, prompt_lookup_draft
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 48
 K = int(sys.argv[2]) if len(sys.argv) > 2 else 4

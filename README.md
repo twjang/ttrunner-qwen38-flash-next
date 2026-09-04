@@ -166,7 +166,7 @@ batch cannot express.
 ## Layout
 
 ```
-src/twtest/
+src/ttrunner_qwen38_flash_next/
   gguf/       GGUF v3 reader + 10 dequantisation formats (bit-exact vs `gguf`)
   reference/  the plain PyTorch CPU model
   tt/         the Blackhole engine:
@@ -192,8 +192,8 @@ docs/iterations/  observation -> remedy -> result log for every step
 ```bash
 # CPU reference, greedy
 PYTHONPATH=src .venv/bin/python -c "
-from twtest.reference.loader import load
-from twtest.reference.generate import generate, SamplingParams
+from ttrunner_qwen38_flash_next.reference.loader import load
+from ttrunner_qwen38_flash_next.reference.generate import generate, SamplingParams
 m, tok, cfg = load('/home/twjang/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS',
                    '/home/twjang/models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json')
 ids = tok.encode('The capital of France is')
@@ -202,17 +202,17 @@ print(''.join(tok.decode([t]) for t in generate(m, ids, SamplingParams(max_token
 
 # convert weights for the device (once, ~30 min)
 PYTHONPATH=src .venv/bin/python -c "
-from twtest.tt.convert import convert
+from ttrunner_qwen38_flash_next.tt.convert import convert
 convert('/home/twjang/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS',
         '/home/twjang/models/qwen38-tt-cache')"
 
 # server on the CPU reference
-PYTHONPATH=src .venv/bin/python -m twtest.server \
+PYTHONPATH=src .venv/bin/python -m ttrunner_qwen38_flash_next.server \
   --model /home/twjang/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS \
   --tokenizer /home/twjang/models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json
 
 # server on the 4 x Blackhole mesh
-PYTHONPATH=src .venv/bin/python -m twtest.server --backend tt \
+PYTHONPATH=src .venv/bin/python -m ttrunner_qwen38_flash_next.server --backend tt \
   --model /home/twjang/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS \
   --tokenizer /home/twjang/models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json \
   --tt-cache /home/twjang/models/qwen38-tt-cache --max-concurrency 8

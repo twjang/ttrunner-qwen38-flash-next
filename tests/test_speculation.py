@@ -18,7 +18,7 @@ import pytest
 
 pytest.importorskip("ttnn")
 
-from twtest.tt.engine import accepted_prefix, prompt_lookup_draft  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.engine import accepted_prefix, prompt_lookup_draft  # noqa: E402
 
 
 def test_draft_is_what_followed_the_last_earlier_occurrence() -> None:
@@ -75,7 +75,7 @@ def test_the_engine_records_that_speculation_is_exact() -> None:
     """
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
     assert "**Identical** to decoding one token at a time" in src, (
@@ -91,7 +91,7 @@ def test_speculation_refuses_rather_than_wedging_the_device() -> None:
     import inspect
     import os
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
     assert "raise NotImplementedError" in src
@@ -118,7 +118,7 @@ def test_the_second_command_queue_is_not_reintroduced() -> None:
     """
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
     # Positive anchor: this is an "X is absent" test, which a gutted or renamed
@@ -145,7 +145,7 @@ def test_acceptance_is_bounded_by_whichever_is_shorter() -> None:
 def test_the_engine_refuses_speculation_it_cannot_serve() -> None:
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
     # batched decoding has no single sequence to verify
@@ -161,7 +161,7 @@ def test_speculate_counts_tokens_fed_not_tokens_drafted() -> None:
     a token against a 240 ms baseline."""
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
     assert "drafts\n        # `speculate - 1`" in src or "speculate - 1" in src
@@ -184,7 +184,7 @@ def test_the_verifier_is_eager_and_needs_no_capture() -> None:
     """
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     loop = inspect.getsource(TTEngine._device_loop)
     # Comments stripped: the code explains *why* the verifier is eager by naming
@@ -206,7 +206,7 @@ def test_speculation_snapshots_before_it_verifies() -> None:
     K/V cache can, so a rejected draft has to be rolled back."""
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine._device_loop)
     block = src[src.index("def speculate_round("):]
@@ -223,7 +223,7 @@ def test_close_releases_every_capture_before_closing_the_mesh() -> None:
     Two engines in one process is enough to hit it."""
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.close)
     assert "trace.release()" in src
@@ -240,7 +240,7 @@ def test_snapshot_buffers_are_allocated_before_any_capture() -> None:
     one thing the standalone harnesses never do, which is why they never hang."""
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine._device_loop)
     alloc = src.index('snap_buf["s"] = self.model.snapshot(state)')

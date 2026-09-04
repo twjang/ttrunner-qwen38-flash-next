@@ -19,7 +19,7 @@ the model actually uses.
 import torch
 import ttnn
 
-from twtest.tt.ops import HIFI4
+from ttrunner_qwen38_flash_next.tt.ops import HIFI4
 
 # The shapes the model's dense prefill linears actually use, per device.
 # hidden 2560, hc_count 4 (so the hyper-connection mixes are 10240 wide), 24 q

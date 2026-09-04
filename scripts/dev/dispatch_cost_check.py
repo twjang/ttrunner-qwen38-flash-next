@@ -34,7 +34,7 @@ import time
 
 import ttnn
 
-import twtest.tt.ops as ops
+import ttrunner_qwen38_flash_next.tt.ops as ops
 from _device_model import open_model
 
 TOKENS = int(sys.argv[1]) if len(sys.argv) > 1 else 128
@@ -60,7 +60,7 @@ def counting(*a, **kw):
 
 ops.gated_residual_mix = counting
 # model.py imported the name directly, so rebind it there too
-import twtest.tt.model as model_mod
+import ttrunner_qwen38_flash_next.tt.model as model_mod
 if getattr(model_mod, "gated_residual_mix", None) is _real:
     model_mod.gated_residual_mix = counting
 

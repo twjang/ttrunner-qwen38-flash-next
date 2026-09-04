@@ -20,7 +20,7 @@ built from the same data.
 import torch
 import ttnn
 
-from twtest.tt.deltanet import CHUNK, prepare_device
+from ttrunner_qwen38_flash_next.tt.deltanet import CHUNK, prepare_device
 
 H, NC, D = 12, 4, CHUNK
 

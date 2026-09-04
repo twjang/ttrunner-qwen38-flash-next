@@ -12,7 +12,7 @@ import argparse
 import torch
 import ttnn
 
-from twtest.tt.deltanet import CHUNK, prepare, prepare_device
+from ttrunner_qwen38_flash_next.tt.deltanet import CHUNK, prepare, prepare_device
 
 
 def rel(a: torch.Tensor, b: torch.Tensor) -> float:

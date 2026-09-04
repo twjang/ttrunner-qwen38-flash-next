@@ -12,7 +12,7 @@ import ttnn
 
 from _device_model import open_model
 
-from twtest.tt.bench import benchmark_step
+from ttrunner_qwen38_flash_next.tt.bench import benchmark_step
 
 ITERS = int(sys.argv[1]) if len(sys.argv) > 1 else 25
 SEQ = int(sys.argv[2]) if len(sys.argv) > 2 else 262144
@@ -24,7 +24,7 @@ eager = benchmark_step(m, state, 1000, iters=ITERS)
 print(f"RESULT eager  {eager}", flush=True)
 del state
 
-from twtest.tt.traced import TracedDecoder  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder  # noqa: E402
 
 state = m.new_state(batch=1)
 dec = TracedDecoder(m, state)

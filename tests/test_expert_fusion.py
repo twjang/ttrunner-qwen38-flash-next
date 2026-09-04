@@ -20,9 +20,9 @@ import pytest
 
 pytest.importorskip("ttnn")
 
-from twtest.tt import moe  # noqa: E402
-from twtest.tt.model import TTModel  # noqa: E402
-from twtest.tt.weights import TTWeights  # noqa: E402
+from ttrunner_qwen38_flash_next.tt import moe  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.model import TTModel  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.weights import TTWeights  # noqa: E402
 
 
 def test_fused_path_does_not_concat_quantised_weights_on_device() -> None:

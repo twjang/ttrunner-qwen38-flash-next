@@ -17,8 +17,8 @@ import pytest
 
 pytest.importorskip("ttnn")
 
-from twtest.tt.engine import TTEngine  # noqa: E402
-from twtest.tt.model import TTModel  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.engine import TTEngine  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.model import TTModel  # noqa: E402
 
 
 def test_chunk_paths_speak_the_ring_representation() -> None:
@@ -260,7 +260,7 @@ def test_prefill_refuses_a_moe_chunk_past_the_cliff() -> None:
     silent 10-point loss for a 1.2x speedup is not a trade a caller can make by
     accident.
     """
-    import twtest.tt.model as model_mod
+    import ttrunner_qwen38_flash_next.tt.model as model_mod
 
     assert model_mod._MAX_MOE_CHUNK == 32
     src = _prefill_source()

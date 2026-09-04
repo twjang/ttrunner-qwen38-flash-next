@@ -63,7 +63,7 @@ checkpoint is `per_layer_token_embd`, a pure gather touching 16 rows per token.*
 It belongs in host RAM regardless of quantisation, and only the gathered rows
 (16 × 160 floats per token) cross PCIe.
 
-`src/twtest/tt/plan.py` encodes the resulting policy. Precision per tensor
+`src/ttrunner_qwen38_flash_next/tt/plan.py` encodes the resulting policy. Precision per tensor
 follows the sensitivity ordering measured from Unsloth's imatrix-calibrated
 UD-IQ4_XS in iteration 002, rather than being invented:
 

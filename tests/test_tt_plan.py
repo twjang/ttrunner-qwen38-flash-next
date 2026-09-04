@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 import torch
 
-from twtest.tt.blockfloat import MANTISSA_BITS, round_trip
-from twtest.tt.convert import SHARD_DIM, device_layout
-from twtest.tt.plan import BYTES_PER_ELEMENT, PLAN, Residency, Shard, plan_for
+from ttrunner_qwen38_flash_next.tt.blockfloat import MANTISSA_BITS, round_trip
+from ttrunner_qwen38_flash_next.tt.convert import SHARD_DIM, device_layout
+from ttrunner_qwen38_flash_next.tt.plan import BYTES_PER_ELEMENT, PLAN, Residency, Shard, plan_for
 
 # One representative name per tensor role in the checkpoint.
 ROLES = [
@@ -118,7 +118,7 @@ def test_qkv_split_gives_each_device_the_heads_its_v_heads_pair_with() -> None:
     order, so the pairing is local and needs no expansion at all. Chunking cost
     the engine 25.5 % next-token accuracy against the reference's 80.9 %.
     """
-    from twtest.tt.convert import split_qkv_channels
+    from ttrunner_qwen38_flash_next.tt.convert import split_qkv_channels
 
     hd, n_k, n_v, n_dev = 128, 16, 48, 4
     key_dim, value_dim = n_k * hd, n_v * hd
@@ -346,7 +346,7 @@ def test_the_hyper_connection_mix_averages_in_one_op() -> None:
     """
     import inspect
 
-    from twtest.tt.ops import gated_residual_mix
+    from ttrunner_qwen38_flash_next.tt.ops import gated_residual_mix
 
     src = inspect.getsource(gated_residual_mix)
     assert "ttnn.mean(per_stream, dim=-2, keepdim=True)" in src
@@ -368,7 +368,7 @@ def test_sparse_matmul_uses_one_k_block_past_a_row_tile() -> None:
     accumulation order -- doing it unconditionally moved prefill's NLL from
     5.648 to 6.301 at the default `moe_chunk=32`.
     """
-    from twtest.tt.moe import sparse_program_config
+    from ttrunner_qwen38_flash_next.tt.moe import sparse_program_config
 
     k, n = 2560, 320
     k_tiles = k // 32

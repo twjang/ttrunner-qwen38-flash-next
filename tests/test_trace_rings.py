@@ -20,8 +20,8 @@ import pytest
 
 pytest.importorskip("ttnn")
 
-from twtest.tt.model import TTModel  # noqa: E402
-from twtest.tt.traced import TracedDecoder  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.model import TTModel  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder  # noqa: E402
 
 
 def test_traced_decoder_enables_trace_safe_rings_before_capture() -> None:
@@ -69,8 +69,8 @@ def test_engine_enables_trace_for_the_single_user_path() -> None:
     """
     import inspect
 
-    from twtest.tt.engine import TTEngine
-    from twtest.tt.traced import TracedDecoder
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder
 
     sig = inspect.signature(TTEngine.__init__)
     assert sig.parameters["use_trace"].default is True

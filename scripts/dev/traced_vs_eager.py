@@ -15,7 +15,7 @@ import ttnn
 
 from _device_model import open_model, tokenizer
 
-from twtest.tt.traced import TracedDecoder
+from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 12
 SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "8192"))

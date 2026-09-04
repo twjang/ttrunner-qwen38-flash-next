@@ -18,7 +18,7 @@ import ttnn
 
 from _device_model import open_model, synthetic_prompt
 
-import twtest.tt.model as model_mod
+import ttrunner_qwen38_flash_next.tt.model as model_mod
 
 REPEATS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 SIZES = [16, 32, 64, 128]

@@ -20,7 +20,7 @@ import pytest
 
 pytest.importorskip("ttnn")
 
-from twtest.tt.model import TTModel, TTState  # noqa: E402
+from ttrunner_qwen38_flash_next.tt.model import TTModel, TTState  # noqa: E402
 
 
 def test_reset_slot_clears_only_its_own_bookkeeping() -> None:
@@ -53,7 +53,7 @@ def test_update_cache_path_refuses_divergent_positions() -> None:
 
 def test_engine_selects_the_per_sequence_cache_path() -> None:
     """The server admits slots independently, so it must not use the int path."""
-    spec = importlib.util.find_spec("twtest.tt.engine")
+    spec = importlib.util.find_spec("ttrunner_qwen38_flash_next.tt.engine")
     src = open(spec.origin).read()
     assert "traceable_kv=True" in src, (
         "TTEngine must build TTModel(traceable_kv=True): paged_update_cache takes "
@@ -83,7 +83,7 @@ def test_engine_warns_above_one_row_tile() -> None:
     """
     import inspect
 
-    from twtest.tt.engine import TTEngine
+    from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
     src = inspect.getsource(TTEngine.__init__)
     assert "max_concurrency > 32" in src, "the boundary must be checked"

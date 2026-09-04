@@ -15,11 +15,11 @@ import torch
 
 from _device_model import GGUF_DIR, tokenizer
 
-from twtest.gguf.reader import GGUFModel
-from twtest.reference.cache import HybridCache
-from twtest.reference.config import Qwen4ExpConfig
-from twtest.reference.model import Qwen4ExpModel
-from twtest.reference.weights import WeightStore
+from ttrunner_qwen38_flash_next.gguf.reader import GGUFModel
+from ttrunner_qwen38_flash_next.reference.cache import HybridCache
+from ttrunner_qwen38_flash_next.reference.config import Qwen4ExpConfig
+from ttrunner_qwen38_flash_next.reference.model import Qwen4ExpModel
+from ttrunner_qwen38_flash_next.reference.weights import WeightStore
 
 LIMIT = int(sys.argv[1]) if len(sys.argv) > 1 else 300
 BLOCK = int(sys.argv[2]) if len(sys.argv) > 2 else 32

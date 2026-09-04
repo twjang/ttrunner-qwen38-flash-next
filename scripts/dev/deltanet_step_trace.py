@@ -19,15 +19,15 @@ import ttnn
 
 from _device_model import open_model
 
-from twtest.reference.layers import (
+from ttrunner_qwen38_flash_next.reference.layers import (
     causal_conv1d_step,
     l2norm,
     recurrent_gated_delta_rule,
     rms_norm_gated,
 )
-from twtest.tt import linear_attn
-from twtest.tt.model import LayerState
-from twtest.tt.ops import HIFI4
+from ttrunner_qwen38_flash_next.tt import linear_attn
+from ttrunner_qwen38_flash_next.tt.model import LayerState
+from ttrunner_qwen38_flash_next.tt.ops import HIFI4
 
 LAYER = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 mesh, cfg, m = open_model()

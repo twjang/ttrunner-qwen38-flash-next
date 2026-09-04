@@ -13,11 +13,11 @@ from pathlib import Path
 import torch
 import ttnn
 
-from twtest.gguf.reader import GGUFModel
-from twtest.reference.config import Qwen4ExpConfig
-from twtest.reference.weights import WeightStore
-from twtest.tt.model import TTModel
-from twtest.tt.weights import TTWeights
+from ttrunner_qwen38_flash_next.gguf.reader import GGUFModel
+from ttrunner_qwen38_flash_next.reference.config import Qwen4ExpConfig
+from ttrunner_qwen38_flash_next.reference.weights import WeightStore
+from ttrunner_qwen38_flash_next.tt.model import TTModel
+from ttrunner_qwen38_flash_next.tt.weights import TTWeights
 
 GGUF_DIR = os.environ.get(
     "TWTEST_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS")
@@ -82,7 +82,7 @@ def synthetic_prompt(n: int) -> list[int]:
 
 def tokenizer(cfg):
     """The real tokenizer, from TWTEST_TOKENIZER (default ~/models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json)."""
-    from twtest.reference.tokenizer import Qwen4ExpTokenizer
+    from ttrunner_qwen38_flash_next.reference.tokenizer import Qwen4ExpTokenizer
 
     path = os.environ.get(
         "TWTEST_TOKENIZER",

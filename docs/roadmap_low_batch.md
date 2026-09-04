@@ -54,7 +54,7 @@ length tried (4, 16, 64). The remaining error is small per layer and grows with
 depth, which is what both "bf16 noise through 48 MoE layers" and "a small bug in
 the attention chunk" look like. **Decide which before touching code:** run the
 same per-layer diff of the *decode* path against the CPU reference
-(`twtest.reference`) on the same 4 tokens. If decode-vs-reference is also ~5 %
+(`ttrunner_qwen38_flash_next.reference`) on the same 4 tokens. If decode-vs-reference is also ~5 %
 at layer 3 and ~30 % at layer 47, prefill is at the noise floor and the token
 mismatch is routing sensitivity (top-10 of 512 experts flips on small
 perturbations) -- then measure agreement rate over a few hundred tokens instead

@@ -19,8 +19,8 @@ import sys
 import time
 from pathlib import Path
 
-from twtest.engine import GenerationRequest
-from twtest.tt.engine import TTEngine
+from ttrunner_qwen38_flash_next.engine import GenerationRequest
+from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
 CONC = int(sys.argv[1]) if len(sys.argv) > 1 else 32
 MAX_TOKENS = int(sys.argv[2]) if len(sys.argv) > 2 else 32

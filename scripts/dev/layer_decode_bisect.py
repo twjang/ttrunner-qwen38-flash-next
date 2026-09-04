@@ -18,10 +18,10 @@ import ttnn
 
 from _device_model import host_row, open_model
 
-from twtest.reference.cache import HybridCache
-from twtest.reference.model import Qwen4ExpModel
-from twtest.tt import moe
-from twtest.tt.ops import gated_residual_mix, reinject
+from ttrunner_qwen38_flash_next.reference.cache import HybridCache
+from ttrunner_qwen38_flash_next.reference.model import Qwen4ExpModel
+from ttrunner_qwen38_flash_next.tt import moe
+from ttrunner_qwen38_flash_next.tt.ops import gated_residual_mix, reinject
 
 LAYERS = [int(x) for x in sys.argv[1:]] or [0, 1, 3]
 mesh, cfg, m = open_model()

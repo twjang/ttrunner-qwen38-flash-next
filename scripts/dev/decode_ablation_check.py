@@ -39,8 +39,8 @@ import time
 
 import ttnn
 
-import twtest.tt.moe as moe
-import twtest.tt.model as model_mod
+import ttrunner_qwen38_flash_next.tt.moe as moe
+import ttrunner_qwen38_flash_next.tt.model as model_mod
 from _device_model import open_model
 
 PART = sys.argv[1] if len(sys.argv) > 1 else "none"
@@ -93,7 +93,7 @@ elif PART in ("combine", "routing", "permute"):
     # expert axis -- [1, 512, 1, 2560], which TILE_LAYOUT pads to 32 rows, so it
     # is 84 MB a layer rather than 2.6. `routing` keeps the combine but feeds it
     # a constant gate, dropping the router linear/softmax/topk/threshold chain.
-    from twtest.tt.moe import expert_ffn as _ef, HIFI4 as _H
+    from ttrunner_qwen38_flash_next.tt.moe import expert_ffn as _ef, HIFI4 as _H
     _cache = {}
 
     def _patched(x, router_w, gate_w, up_w, down_w, top_k, E, K, I):
@@ -179,7 +179,7 @@ elif PART in ("grm", "reinjectp", "sharedp"):
             return _seen[key]
         return wrapper
 
-    import twtest.tt.ops as ops_mod
+    import ttrunner_qwen38_flash_next.tt.ops as ops_mod
     if PART == "grm":
         ops_mod.gated_residual_mix = _stub(ops_mod.gated_residual_mix)
         model_mod.gated_residual_mix = ops_mod.gated_residual_mix
@@ -211,7 +211,7 @@ elif PART in ("gdas", "prepare"):
         ttnn.transformer.gated_delta_attn_seq = _shape_stub(
             ttnn.transformer.gated_delta_attn_seq)
     else:
-        import twtest.tt.deltanet as dn
+        import ttrunner_qwen38_flash_next.tt.deltanet as dn
         dn.prepare_device = _shape_stub(dn.prepare_device)
         if getattr(model_mod, "prepare_device", None) is not None:
             model_mod.prepare_device = dn.prepare_device
@@ -242,7 +242,7 @@ elif PART in ("gateup", "downproj"):
     # split expert_ffn's two matmuls. `gateup` stubs the fused gate|up and keeps
     # the down projection; `downproj` the reverse. The stub is one cached buffer,
     # so neither measures an allocation.
-    from twtest.tt.moe import sparse_program_config as _spc, HIFI4 as _H2
+    from ttrunner_qwen38_flash_next.tt.moe import sparse_program_config as _spc, HIFI4 as _H2
     _buf = {}
 
     def _zeros(shape):
@@ -292,7 +292,7 @@ if PREFILL:
         st = m.new_state(batch=1)
         m.prefill(prompt, st)
 else:
-    from twtest.tt.traced import TracedDecoder  # noqa: E402
+    from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder  # noqa: E402
 
     state = m.new_state(batch=1)
     dec = TracedDecoder(m, state)

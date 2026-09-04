@@ -20,8 +20,8 @@ import os
 import time
 from pathlib import Path
 
-from twtest.engine import GenerationRequest
-from twtest.tt.engine import TTEngine
+from ttrunner_qwen38_flash_next.engine import GenerationRequest
+from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
 GGUF = os.environ.get("TWTEST_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS"))
 CACHE = os.environ.get("TWTEST_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))

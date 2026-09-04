@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from twtest.tt.deltanet import BLOCK, CHUNK, prepare
+from ttrunner_qwen38_flash_next.tt.deltanet import BLOCK, CHUNK, prepare
 
 
 def _inputs(seq: int = 256, heads: int = 2, seed: int = 0):
@@ -90,7 +90,7 @@ def test_block_inverse_matches_linalg_inv() -> None:
     translates to ttnn -- unlike `linalg.inv`, which would force the whole
     preparation onto the host.
     """
-    from twtest.tt.deltanet import block_inverse
+    from ttrunner_qwen38_flash_next.tt.deltanet import block_inverse
 
     torch.manual_seed(0)
     # BLOCK (32) is the size actually used; 64 is included to show the method
@@ -108,7 +108,7 @@ def test_block_inverse_matches_linalg_inv() -> None:
 
 
 def test_block_inverse_rejects_non_power_of_two() -> None:
-    from twtest.tt.deltanet import block_inverse
+    from ttrunner_qwen38_flash_next.tt.deltanet import block_inverse
 
     with pytest.raises(ValueError, match="power of two"):
         block_inverse(torch.eye(48).expand(1, 48, 48))
@@ -131,7 +131,7 @@ def test_block_inverse_survives_correlated_keys() -> None:
     that; on device, where a matmul carries ~1e-3 relative error rather than
     ~1e-7, the same cancellation left 6209.
     """
-    from twtest.tt.deltanet import BLOCK, block_inverse
+    from ttrunner_qwen38_flash_next.tt.deltanet import BLOCK, block_inverse
 
     torch.manual_seed(0)
     rows = torch.arange(BLOCK)
@@ -153,7 +153,7 @@ def test_block_inverse_survives_correlated_keys() -> None:
 
 def test_block_diag_inverse_is_block_diagonal() -> None:
     """One pass over the 128-wide matrix must yield exactly the four 32-blocks."""
-    from twtest.tt.deltanet import BLOCK, CHUNK, block_diag_inverse
+    from ttrunner_qwen38_flash_next.tt.deltanet import BLOCK, CHUNK, block_diag_inverse
 
     torch.manual_seed(0)
     unit = torch.eye(CHUNK) + torch.randn(2, CHUNK, CHUNK).tril(-1) * 0.5

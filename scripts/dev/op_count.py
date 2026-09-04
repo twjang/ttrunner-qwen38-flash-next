@@ -10,7 +10,7 @@ go after and, just as usefully, which are already negligible.
 Counting, not profiling: an instrumented profile inflates totals ~40 % with
 per-section syncs, and the question here is "how many", not "how long".
 
-`--by-caller` attributes each call to the `twtest` line that issued it, which is
+`--by-caller` attributes each call to the `ttrunner_qwen38_flash_next` line that issued it, which is
 what actually says where to cut -- "multiply, 3241" does not.
 
 `--prefill N` counts one N-token chunked prefill instead. Multiply by ~57 us --
@@ -54,10 +54,10 @@ def wrap(ns, prefix=""):
             def counted(*a, **kw):
                 counts[key] = counts.get(key, 0) + 1
                 if BY_CALLER:
-                    # the innermost twtest frame is the line that issued this op
+                    # the innermost ttrunner_qwen38_flash_next frame is the line that issued this op
                     for fr in reversed(traceback.extract_stack()[:-1]):
-                        if "/twtest/" in fr.filename and "op_count" not in fr.filename:
-                            site = f"{fr.filename.split('/twtest/')[-1]}:{fr.lineno} {fr.name}"
+                        if "/ttrunner_qwen38_flash_next/" in fr.filename and "op_count" not in fr.filename:
+                            site = f"{fr.filename.split('/ttrunner_qwen38_flash_next/')[-1]}:{fr.lineno} {fr.name}"
                             by_caller[site] = by_caller.get(site, 0) + 1
                             break
                 return fn(*a, **kw)

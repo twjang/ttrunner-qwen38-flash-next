@@ -27,7 +27,7 @@ import ttnn
 
 from _device_model import open_model, tokenizer
 
-import twtest.tt.model as model_mod
+import ttrunner_qwen38_flash_next.tt.model as model_mod
 
 argv = sys.argv[1:]
 PREFILL = 0

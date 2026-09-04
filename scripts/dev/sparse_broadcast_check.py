@@ -27,7 +27,7 @@ import torch
 import ttnn
 
 from _device_model import GGUF_DIR  # noqa: F401  (keeps env contract in one place)
-from twtest.tt.moe import sparse_program_config, HIFI4
+from ttrunner_qwen38_flash_next.tt.moe import sparse_program_config, HIFI4
 
 import sys
 E = int(sys.argv[1]) if len(sys.argv) > 1 else 512

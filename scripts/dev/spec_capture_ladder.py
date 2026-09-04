@@ -84,7 +84,7 @@ import ttnn
 
 from _device_model import open_model, synthetic_prompt
 
-from twtest.tt.traced import TracedDecoder, TracedStepN
+from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder, TracedStepN
 
 STAGE = sys.argv[1] if len(sys.argv) > 1 else "snapshot"
 K = int(sys.argv[2]) if len(sys.argv) > 2 else 2

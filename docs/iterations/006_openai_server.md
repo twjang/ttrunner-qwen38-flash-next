@@ -15,7 +15,7 @@ already works. Binding the HTTP layer to the ttnn engine would mean nothing is
 demonstrable until the very end, and would bake device assumptions into request
 handling.
 
-**Remedy** — `src/twtest/engine.py` defines an `Engine` interface: encode,
+**Remedy** — `src/ttrunner_qwen38_flash_next/engine.py` defines an `Engine` interface: encode,
 decode, chat template, `stats`, and `generate(request) -> AsyncIterator[TokenEvent]`.
 The server talks only to that. `--backend reference` serves the CPU model today;
 `--backend tt` is the same server once the ttnn engine lands.
@@ -75,7 +75,7 @@ prefill. Correct, and slow exactly where expected.
 ## Run it
 
 ```
-python -m twtest.server \
+python -m ttrunner_qwen38_flash_next.server \
   --model    /home/twjang/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS \
   --tokenizer /home/twjang/models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json \
   --port 8000

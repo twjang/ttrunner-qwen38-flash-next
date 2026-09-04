@@ -1,6 +1,6 @@
 """Run the OpenAI-compatible server.
 
-    python -m twtest.server --model /path/to/UD-IQ4_XS --tokenizer /path/to/tokenizer.json
+    python -m ttrunner_qwen38_flash_next.server --model /path/to/UD-IQ4_XS --tokenizer /path/to/tokenizer.json
 
 By default this serves the CPU reference engine, which is correct but slow
 (~12 s/token). Pass --backend tt once the ttnn engine is available.
@@ -15,7 +15,7 @@ import uvicorn
 
 from .api import create_app
 
-logger = logging.getLogger("twtest.server")
+logger = logging.getLogger("ttrunner_qwen38_flash_next.server")
 
 
 def build_engine(args: argparse.Namespace):
@@ -56,7 +56,7 @@ def build_engine(args: argparse.Namespace):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(prog="twtest.server")
+    p = argparse.ArgumentParser(prog="ttrunner_qwen38_flash_next.server")
     p.add_argument("--model", required=True, help="directory holding the GGUF shards")
     p.add_argument("--tokenizer", help="path to tokenizer.json")
     p.add_argument("--backend", default="reference", choices=("reference", "tt"))

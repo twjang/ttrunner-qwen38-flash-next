@@ -27,8 +27,8 @@ import sys
 import time
 from pathlib import Path
 
-from twtest.engine import GenerationRequest
-from twtest.tt.engine import TTEngine
+from ttrunner_qwen38_flash_next.engine import GenerationRequest
+from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
 # TWTEST_STACK_DUMP=<seconds> dumps every thread's stack on a timer. The
 # speculative engine spins somewhere in the serve loop -- setup completes and no

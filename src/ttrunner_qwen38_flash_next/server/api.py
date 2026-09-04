@@ -310,7 +310,7 @@ async def completions(body: CompletionRequest, request: Request):
 
 
 def create_app(engine: Engine | None = None) -> FastAPI:
-    app = FastAPI(title="twtest Qwen3.8-Flash-Next server", version="0.1.0")
+    app = FastAPI(title="ttrunner_qwen38_flash_next Qwen3.8-Flash-Next server", version="0.1.0")
     app.state.engine = engine
     app.include_router(router)
     return app

@@ -48,11 +48,11 @@ Four engines for `unsloth/Qwen3.8-Flash-Next-GGUF` (arch `qwen4exp`, UD-IQ4_XS):
 
 | piece | where | state |
 |---|---|---|
-| GGUF reader + bit-exact dequant | `src/twtest/gguf/` | done, tested (`tests/test_quants.py`) |
-| CPU PyTorch reference | `src/twtest/reference/` | done; **the oracle** for everything device-side |
-| Device model (ttnn, 4 × p150a) | `src/twtest/tt/model.py` (+ `moe.py`, `linear_attn.py`, `deltanet.py`, `ops.py`) | decode verified token-for-token vs reference; prefill *not* |
-| Engine + trace | `src/twtest/tt/engine.py`, `traced.py` | continuous batching, device argmax, single-user trace |
-| OpenAI-style server | `src/twtest/server/` | works on both backends |
+| GGUF reader + bit-exact dequant | `src/ttrunner_qwen38_flash_next/gguf/` | done, tested (`tests/test_quants.py`) |
+| CPU PyTorch reference | `src/ttrunner_qwen38_flash_next/reference/` | done; **the oracle** for everything device-side |
+| Device model (ttnn, 4 × p150a) | `src/ttrunner_qwen38_flash_next/tt/model.py` (+ `moe.py`, `linear_attn.py`, `deltanet.py`, `ops.py`) | decode verified token-for-token vs reference; prefill *not* |
+| Engine + trace | `src/ttrunner_qwen38_flash_next/tt/engine.py`, `traced.py` | continuous batching, device argmax, single-user trace |
+| OpenAI-style server | `src/ttrunner_qwen38_flash_next/server/` | works on both backends |
 
 Model facts you will need constantly: 48 layers = 36 Gated DeltaNet + 12
 sparse attention (every 4th: layers 3, 7, …, 47); 512 experts, top-10,
@@ -110,7 +110,7 @@ every other on them.
 ## 3. Environment and how long things take
 
 ```bash
-cd ~/twtest
+cd ~/ttrunner_qwen38_flash_next
 uv run pytest -q tests                           # 3 s, CPU only, run before every commit
 uv run python scripts/dev/prefill_check.py 4 16  # ~4 min: 1.5 min weight load + steps at ~0.5 s each
 uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
@@ -978,7 +978,7 @@ the embedding, the elementwise work -- amortises over four times the tokens.
 `deltanet_batch` stays at 1 because a 512-wide chunk already gives the scan its
 four chunks; grouping further measured no gain.
 
-`--by-caller` attributes each call to the `twtest` line that issued it, which is
+`--by-caller` attributes each call to the `ttrunner_qwen38_flash_next` line that issued it, which is
 what says where to cut; "multiply, 1993" does not. The distribution is flat --
 the largest single site is 4.2 % -- so expect many small wins rather than one
 big one.

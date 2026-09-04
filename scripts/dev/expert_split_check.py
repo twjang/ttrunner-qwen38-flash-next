@@ -21,7 +21,7 @@ import time
 import torch
 import ttnn
 
-from twtest.tt.moe import sparse_program_config, HIFI4
+from ttrunner_qwen38_flash_next.tt.moe import sparse_program_config, HIFI4
 
 E, K, N = 512, 2560, 160
 TOPK = 64          # a 128-row chunk selects a wide union

@@ -91,9 +91,9 @@ wedging the session.
 Where it stops, from `faulthandler.dump_traceback_later`:
 
 ```
-  twtest/tt/traced.py:130  in step_n          ttnn.execute_trace(...)
-  twtest/tt/engine.py:565  in speculate_round
-  twtest/tt/engine.py:691  in _device_loop
+  ttrunner_qwen38_flash_next/tt/traced.py:130  in step_n          ttnn.execute_trace(...)
+  ttrunner_qwen38_flash_next/tt/engine.py:565  in speculate_round
+  ttrunner_qwen38_flash_next/tt/engine.py:691  in _device_loop
 ```
 
 **A minimal standalone script does *not* reproduce it**:

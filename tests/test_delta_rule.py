@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from twtest.reference.layers import chunk_gated_delta_rule, recurrent_gated_delta_rule
+from ttrunner_qwen38_flash_next.reference.layers import chunk_gated_delta_rule, recurrent_gated_delta_rule
 
 
 def _inputs(seq: int, decay_scale: float, seed: int = 0):

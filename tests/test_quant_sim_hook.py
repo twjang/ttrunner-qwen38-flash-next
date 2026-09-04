@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import inspect
 
-from twtest.reference.weights import WeightStore
+from ttrunner_qwen38_flash_next.reference.weights import WeightStore
 
 
 def test_every_dequantisation_path_applies_quant_sim() -> None:

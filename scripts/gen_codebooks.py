@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate src/twtest/gguf/_codebooks.py from ggml-common.h.
+"""Regenerate src/ttrunner_qwen38_flash_next/gguf/_codebooks.py from ggml-common.h.
 
 The IQ3_S grid is 512 uint32 constants and IQ4_NL's codebook is 16 int8s.
 Hand-copying them risks a silent single-digit corruption that no shape check
@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 SOURCE_URL = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/ggml/src/ggml-common.h"
-OUT = Path(__file__).resolve().parent.parent / "src" / "twtest" / "gguf" / "_codebooks.py"
+OUT = Path(__file__).resolve().parent.parent / "src" / "ttrunner_qwen38_flash_next" / "gguf" / "_codebooks.py"
 
 
 def parse_table(src: str, name: str) -> list[int]:

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import torch
 
-from twtest.reference.model import Qwen4ExpModel
+from ttrunner_qwen38_flash_next.reference.model import Qwen4ExpModel
 
 HIDDEN, DIM, HEADS, RATIO, BUDGET = 8, 4, 2, 4, 16
 

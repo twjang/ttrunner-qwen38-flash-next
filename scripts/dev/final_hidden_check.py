@@ -20,8 +20,8 @@ import ttnn
 
 from _device_model import host_row, open_model, synthetic_prompt
 
-from twtest.reference.cache import HybridCache
-from twtest.reference.model import Qwen4ExpModel
+from ttrunner_qwen38_flash_next.reference.cache import HybridCache
+from ttrunner_qwen38_flash_next.reference.model import Qwen4ExpModel
 
 lengths = [int(x) for x in sys.argv[1:]] or [1, 4, 8]
 mesh, cfg, m = open_model()
