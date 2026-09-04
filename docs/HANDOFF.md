@@ -2164,3 +2164,69 @@ each device's read 4x but add an all_reduce to all 96 calls, and at 3.77 ms per
 48 all_reduces today that is ~7.5 ms of new cost against ~10 ms saved. Measure
 it before believing either number, but it is marginal by construction and it
 does nothing about the narrow output.
+
+### 5.2 The roofline, corrected again; and `sparse_matmul` zero-fills its whole output
+
+Two corrections to numbers earlier in this file, both from a 15-agent audit that
+worked from `plan.py`'s residency rules rather than from a division.
+
+**The floor is 9.4 ms, not 5.2 and not 7.5.** Dense weight read per device per
+token is **2.960 GB**, not 1.285 (which divided replicated tensors by four) and
+not the 2.18 I estimated by hand from one layer's files. Everything with no
+`.devN` suffix is REPLICATE: attn_q 401 MB, attn_qkv 451, router 252, hc
+down/up 668, hc norm/inject 252, shared expert 251, attn_output 201. With the
+lm head 0.169 GB and top-10 experts 0.516 GB that is **3.645 GB/device/token ->
+9.39 ms at 388 GB/s, 13.35 at 273**.
+
+So 110.8 ms is **11.8x the floor**, and 32.6 ms is **3.5x the floor**. The target
+is demanding rather than comfortable, and every earlier framing in this file
+that called it roomy was working from the wrong denominator.
+
+**`ttnn.sparse_matmul` unconditionally zero-fills its entire output**, verified in
+`sparse_matmul_device_operation.cpp`: `create_output_tensors` calls
+
+    output_tensor = ttnn::zeros_like(output_tensor, ..., std::optional<Tensor>(output_tensor));
+
+in **both** branches -- lines 268-278 and 286-295 -- so supplying your own output
+tensor does not escape it. Our two calls per layer allocate
+`[1, 128, 32, 1280]` and `[1, 128, 32, 2560]` in bfloat16, so the fill writes
+**31.5 MB a layer, 1.51 GB/device/token**, independently of the sparsity mask.
+At the fill rate measured on this box that is ~18.9 ms of `expert_ffn`'s 30.83.
+
+This corrects INVARIANT 27, which blamed the matmul's writer for the [1, E, M, K]
+waste. The writer is innocent: it `continue`s on a zero sparsity page and never
+touches unselected slots. The cost is the *allocation*, and the fix is fewer
+output bytes rather than fewer experts per device.
+
+`dtype` is a bound kwarg on `sparse_matmul`, so halving the output would take
+~10 ms off the step for one keyword in two places -- and it is **not the move**,
+because the first call's output feeds SwiGLU and the standing constraint on this
+work is not to spend accuracy. The principled fix is the same stage-2 kernel that
+handoff 4g's read side already argues for: writing `[1, k_sel, M, N]` instead of
+`[1, 128, M, N]` removes the fill entirely, 42x smaller, with no precision cost.
+
+INVARIANT 40: `ttnn.sparse_matmul` costs 1.51 GB/device/token in zero-fill alone,
+before it reads a single weight. Any accounting of the MoE that starts from the
+weights is wrong by ~19 ms. Do not try to dodge it by passing
+`optional_output_tensor` -- that path re-zeros too.
+
+Other findings from the audit worth having, none of them measured by me yet:
+
+- The seam semantics were verified against the harness source, and my earlier
+  arithmetic double-counted. `moe` patches `moe_block` **only**, so
+  `shared_expert` (5.47) and the 48 `_moe_block` all_reduces sit *outside* the
+  42.93. `attn` patches both attention kinds, so its 59.57 **contains** the
+  DeltaNet 16.35. Measured deltas sum to **74.64 ms of 110.8**, leaving 36.16
+  unattributed -- not the ~16 I had been quoting.
+- The hyper-connection block (97 `gated_residual_mix` + 96 `reinject`,
+  ~2.30 GB/device/token) is modelled at 22-31 ms and is probably the largest
+  single item in the model. My own measurement puts `hc_down` alone at 18.77,
+  which is consistent, and section 5.1 already names it.
+- `shared_expert`'s 5.47 ms includes 3.19 for a single N=1 sigmoid-gate column:
+  328 KB read on **one** core to use 10 KB of weight.
+- The LM head, argmax and host gathers are **not** in the 110.8 -- the harness
+  times `dec.step` only. I measured them separately at 2.00 ms in situ.
+- The traced `step_n` curve fits **t ~= 162 + 12.8k**, so k=8 accepted tokens per
+  step would be 33.1 ms/token with no kernel work at all. That is the cheapest
+  path to the target on paper, and it is blocked on the trace-alternation defect
+  in `ttnn_bug_report/`. Worth more than any single op here if it can be unblocked.
