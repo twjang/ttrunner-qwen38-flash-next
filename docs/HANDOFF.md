@@ -2668,3 +2668,41 @@ INVARIANT 48: the decode step costs `82.7 + 12.37k` ms for k tokens, so at batch
 1 roughly 87 % of it is fixed cost paid for one token. Speculation is worth more
 than any fusion on this list, and the two compound: fusion shrinks the fixed
 term, speculation divides it.
+
+### 8.2 The accept mask is exact; the conv ring is the last piece
+
+`_linear_attention_step_n` now takes an optional `accept` tensor, and `step_n`
+builds it from a `list[float]` bound like any other per-step input -- so it is
+**data, not shape**, and one capture serves every acceptance count. That is the
+whole point: two capture widths are what provokes the alternation hang.
+
+    g_exp <- g_exp * acc + (1 - acc)    -> 1 where rejected
+    beta  <- beta * acc                 -> 0 where rejected
+
+so `state = state * 1 + k^T * 0 = state`. Verified in
+`scripts/dev/accept_mask_identity.py`, and the control is the one that matters --
+same k, same graph, same accepted prefix, only the *rejected* tokens changed:
+
+| | diff |
+|---|---|
+| recurrent state, rejected tokens changed | **0.0000e+00** |
+| the accepted rows' outputs | 0.0000e+00 |
+| the same change **without** the mask | 2.3584e-01 |
+| **conv ring, rejected tokens changed** | **1.4350e+01** |
+
+So the recurrence is bit-exactly inert on rejected steps, and **the convolution
+ring is not**. It holds the last `kernel-1` qkv columns and a rejected step still
+shifts one in.
+
+Not worth masking the shift itself: the ring is three slots deep on 36 layers, so
+a per-step blend is 3 x k x 36 blends -- 864 ops at k=8, ~14 ms, more than the
+verify. The columns are all still in hand, though: `qkv_col` is `[1, k, C, 1]`
+and the correct ring after accepting j is columns `j-2, j-1, j`. That selection
+is one small matmul a layer against a `[3, k]` selection matrix -- 36 matmuls of
+`[3,8] x [8,2560]`, and the matrix is a bound tensor, so it stays data.
+
+One thing to be honest about: a masked k=4 state is **not** bit-identical to a
+genuine k=2 run (measured 1.68e-02 relative). That is the k=2-vs-k=4 matmul
+blocking, not the mask -- the isolating control above is exactly 0. It is the
+same class of difference as any tile-blocking change, and the quality harness is
+what should judge it.

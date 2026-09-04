@@ -1105,7 +1105,8 @@ class TTModel:
     # -- k tokens of one sequence, in one step --------------------------------
 
     def _linear_attention_step_n(
-        self, mixed: ttnn.Tensor, layer: int, st: LayerState, k: int
+        self, mixed: ttnn.Tensor, layer: int, st: LayerState, k: int,
+        accept: ttnn.Tensor | None = None,
     ) -> ttnn.Tensor:
         """DeltaNet over `k` consecutive tokens of *one* sequence.
 
@@ -1152,6 +1153,29 @@ class TTModel:
         kk = self._l2norm(kk)
         g_exp = ttnn.reshape(ttnn.exp(g), (k * n_v, 1, 1, 1))
         beta = ttnn.reshape(ttnn.sigmoid(b), (k * n_v, 1, 1, 1))
+
+        # Speculative acceptance, as data rather than as a shape.
+        #
+        # A captured trace advances the state by exactly its k, and two capture
+        # widths are the one thing that provokes the alternation hang (see
+        # `ttnn_bug_report/`: "B superset of A is safe; B and A disagreeing about
+        # a shape is not"). So the *advance* has to be maskable instead.
+        #
+        # The recurrence is `state = state * g + k^T delta` with
+        # `delta = (v - predicted) * beta`, so a step with `g = 1` and
+        # `beta = 0` leaves the state exactly as it was. Both come from tensors,
+        # and `_input` binds them, so one capture serves every acceptance count:
+        #
+        #     g_exp <- g_exp * acc + (1 - acc)      -> 1 where rejected
+        #     beta  <- beta * acc                   -> 0 where rejected
+        #
+        # Rejected steps still pollute the convolution ring, but only for later
+        # steps that are themselves rejected (acceptance is a prefix), and the
+        # ring is rebuilt from the columns this call already computed.
+        if accept is not None:
+            g_exp = ttnn.add(ttnn.multiply(g_exp, accept),
+                             ttnn.subtract(ttnn.full_like(accept, 1.0), accept))
+            beta = ttnn.multiply(beta, accept)
 
         if st.recurrent is None:
             st.recurrent = ttnn.zeros(
@@ -1498,7 +1522,8 @@ class TTModel:
         state.positions = [p + 1 for p in state.positions]
         return mixed
 
-    def step_n(self, tokens: list[int], state: TTState) -> ttnn.Tensor:
+    def step_n(self, tokens: list[int], state: TTState,
+               accept: list[float] | None = None) -> ttnn.Tensor:
         """Advance one sequence by `k` tokens in a single step.
 
         Returns the mixed hidden for all k positions, [1, 1, k, hidden], so a
@@ -1565,6 +1590,22 @@ class TTModel:
                 "step_n does not carry the QSA selection yet; construct the model "
                 f"with max_seq_len <= {self.cfg.indexer_budget} to use it"
             )
+        # The acceptance mask, broadcast to the (k * n_v) rows the recurrence
+        # works over. Bound like every other per-step input, so it is data and
+        # one capture serves any acceptance count -- see
+        # `_linear_attention_step_n` for why that matters.
+        acc = None
+        if accept is not None:
+            if len(accept) != k:
+                raise ValueError(f"accept has {len(accept)} entries, expected k={k}")
+            n_v = self.n_v_local
+            acc = self._input(
+                "accept_mask",
+                torch.tensor(accept, dtype=torch.float32)
+                .repeat_interleave(n_v).reshape(k * n_v, 1, 1, 1),
+                ttnn.bfloat16, key=tuple(accept),
+            )
+
         start = state.positions[0]
 
         # Each row's PLE n-gram hash reads that row's own history, so the
@@ -1592,7 +1633,7 @@ class TTModel:
             branch = (
                 self._attention_step_n(mixed, layer, st, start, k)
                 if cfg.is_full_attention(layer)
-                else self._linear_attention_step_n(mixed, layer, st, k)
+                else self._linear_attention_step_n(mixed, layer, st, k, acc)
             )
             hidden = reinject(hidden, branch, inject, cfg.hc_count)
 
