@@ -1688,12 +1688,38 @@ So the only output that carries a whole layer is the combine, slot 5, and that
 needs a `cluster_axis`, which needs CCL, which hangs this box (invariant 28).
 The two constraints close on each other and there is no path between them.
 
+There are three modes, not two -- worth stating exactly, because the third is
+newer than the build we run:
+
+    enum class MoEComputePath : uint8_t { FullCcl = 0, FullLocal = 2, ComputeOnly = 1 };
+
+- `FullCcl` (compute_only=false + a cluster_axis): matmul plus fused
+  selective_reduce_combine over fabric. The production path, and the one that
+  hangs here.
+- `FullLocal` (compute_only=false, cluster_axis=None): matmul plus a *local*
+  combine, no fabric, no semaphores. Returns 6 tensors like FullCcl. Guarded by
+  `TT_FATAL(num_devices == 1, ...)` -- 1x1 meshes only.
+- `ComputeOnly`: no combine cores, no fabric; 5 tensors, and see above for why
+  the 5th is not usable.
+
+Our build predates `FullLocal`. The failure we saw quoted
+`moe_compute_device_operation.cpp:473`, which on current main is the 1x1-mesh
+assert; on ours that line was still the unconditional "requires cluster_axis".
+
 INVARIANT 30: `ttnn.experimental.moe_compute` cannot implement `moe_block` on
-this hardware. Not for want of tuning -- the usable output requires the CCL
-combine, and CCL does not work here. The 1.47 ms/layer measured in §4c.1 was a
-kernel whose result cannot be read back. Revisit only when a tt-metal release
-fixes all-to-all on Blackhole (tt-metal#27859, #30030); the wiring in
-`scripts/dev/moe_compute_check.py` is correct up to that point and is what to
-restart from.
+the build we run. The usable output requires a combine, and both combines are
+closed to us: FullCcl needs CCL, which hangs here, and FullLocal does not exist
+in this build. The 1.47 ms/layer measured in §4c.1 was a kernel whose result
+cannot be read back.
+
+Two things could reopen it, in increasing order of speculation. A tt-metal
+release that fixes all-to-all on Blackhole (tt-metal#27859, #30030) restores
+FullCcl directly. Failing that, a build new enough to have `FullLocal`, driven
+per card through a 1x1 submesh (`create_submesh`), would give a fused combine
+with no fabric at all -- but whether a submesh satisfies `num_devices == 1` and
+whether the surrounding 1x4 tensors can meet it there is unverified, and is the
+first thing to check before spending more on this. The wiring in
+`scripts/dev/moe_compute_check.py` is correct up to the combine and is what to
+restart from either way.
 
 The hand-rolled `sparse_matmul` path stays. Decode remains 109.2 ms/token.
