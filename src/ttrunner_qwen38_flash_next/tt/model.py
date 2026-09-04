@@ -617,6 +617,15 @@ class TTModel:
         # so the graph is the same every step and can be captured.
         taps = self.conv_taps(("ssm", layer), weight, channels, k)
         if self.trace_safe_rings:
+            # Four multiplies and three adds, deliberately, and *not* the
+            # obvious "concat the pieces and the taps, one multiply and one
+            # reduce". That form has half the calls and measured **4.5 ms a
+            # token slower** (82.73 -> 87.26): each piece is [1, 1, C, 1], which
+            # TILE layout pads to [C, 32], so concatenating four of them repacks
+            # four tensors' worth of tiles, and `sum` over the padded width is a
+            # full-tile reduction. Invariant 42's ~5.5 us floor is for
+            # *elementwise* ops; `concat` and `sum` are data movement and cost
+            # with the padding, so fewer calls is not automatically less work.
             acc = None
             for tap in range(k):
                 age = depth - tap                   # 3, 2, 1, 0 steps back

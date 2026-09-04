@@ -3144,3 +3144,23 @@ one matmul call for two slices, and only pays when the matmul costs more than
 about 11 us. At 31.5 it pays comfortably; at 8 it would not.
 
 Session: **146.18 -> 82.73 ms**, 1.77x.
+
+### 12.2 Fewer calls is not automatically less work
+
+The DeltaNet convolution is `sum_t w_t * p_t` written as four multiplies and
+three adds. Folding it into one multiply and one reduction -- concatenate the
+four pieces, concatenate the four taps once, `sum` over the last axis -- halves
+the call count, and **measured 4.5 ms a token slower**: 82.73 -> 87.26.
+
+Each piece is `[1, 1, C, 1]`, which TILE layout pads to `[C, 32]`. Concatenating
+four of them repacks four tensors' worth of tiles into one, and `sum` over that
+padded width is a full-tile reduction. Neither is elementwise.
+
+INVARIANT 56: invariant 42's ~5.5 us floor is for **elementwise** ops, whose cost
+really is independent of shape. `concat`, `sum`, `reshape` and friends are data
+movement and pay for the tile padding, so replacing seven elementwise ops with
+two movement ops can cost more than it saves. Count calls only within the same
+class of op.
+
+Reverted, with the measurement kept at the call site so the "obvious"
+simplification is not tried again.
