@@ -373,7 +373,31 @@ is back to 236.1 ms from 239.1; attn_qkv costs ~200 MB more per device.
 what any change to the plan or the shard layout needs.
 
 
-### 5.2 Chunked prefill alongside the trace — **done**, though not by capturing it
+### 5.2 Chunked prefill alongside the trace — **NOT done**; a previous claim that it was is retracted
+> **Retracted 2026-09-04.** This item was marked done on the strength of a
+> `prefix_reuse_check.py --chunked --trace` run. That run never had a trace: the
+> engine forces `_use_trace` off whenever `chunked_prefill` is on
+> (`engine.py`, the `and not self._chunked_prefill` term, which dates from
+> `87fb00b` and was never actually removed), and it prints
+> "[tt] chunked_prefill needs eager execution; trace capture is off" when it does
+> so. The improvement attributed to the trace -- cold TTFT 11.40 -> 6.3 s -- came
+> from prefill itself getting faster (2033 -> 919 ms a chunk), not from the two
+> coexisting. A contract test, `test_chunked_prefill_turns_the_trace_off`, says
+> exactly this and was passing the whole time.
+>
+> Removing the exclusion and running the same check settles it the other way. The
+> pre-capture warm-up added for this (`_device_loop`, "warming the prefill chunk
+> graph") is **not sufficient**: with the trace genuinely on, the *warm* path is
+> right and the *cold* one is wrong -- turn 2 replayed cold returns
+> `[2250, 10478, 11, ...]` where every other configuration returns
+> `[10782, 303, 220, ...]`, and `turn2 warm == cold` goes YES -> **NO**. That is
+> the same corruption the original note describes.
+>
+> So the allocation hazard was a real hazard and warming one chunk does not cover
+> it. What the engine does today is correct: chunked prefill runs eager. The
+> practical consequence for a server is a genuine choice, not a bug --
+> `--chunked-prefill` buys ~11x on prompt ingestion and costs ~3.3x on every
+> generated token (588 ms/token measured against 176).
 
 Chunked prefill works and is on for one-slot engines, but it turns the trace off:
 it runs eagerly, and a captured prefill graph replayed as token 0 repeated.

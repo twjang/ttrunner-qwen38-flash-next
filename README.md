@@ -124,10 +124,11 @@ against 236.1 dense; the extra is almost all `ttnn.topk` at k=512, see
 `docs/iterations/015`.)
 
 For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
-**7.2 ms/token** instead of ~500, and no longer costs the trace: the two run
-together, so generated tokens still take ~174 ms. Turning it on took a
-73-token turn's cold time to first token from 11.40 s to **6.3 s**, with the
-same tokens.
+**7.2 ms/token** instead of ~500. It still costs the trace -- the engine runs
+eager while it is on, and a generated token goes from ~176 ms to ~588. So it is a
+real trade: worth it for long prompts and short answers, wrong for the reverse.
+(An earlier version of this file claimed the two now run together. They do not;
+see handoff 5.2.)
 
 `speculate=k` drafts from the prompt and verifies k tokens in one pass. It is
 **exact** — the output is identical to decoding one token at a time — and worth
