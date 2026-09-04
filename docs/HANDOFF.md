@@ -1860,3 +1860,65 @@ to 1.19e-01, cosine 0.980. Whether that is acceptable is an end-to-end question
 (quality today is 102/127 top-1, NLL 0.887), not one this harness can settle,
 because our own `sparse_matmul` path is 4-bit too and has never been measured
 this way on the same inputs.
+
+## 4d. The real bottleneck is read amplification, and it needs a custom kernel
+
+Measured from the actual weight files, not estimated:
+
+| | |
+|---|---|
+| expert weights per layer | 1.8 GB (459 MB per device) |
+| `moe_compute` at 1.20 ms/layer | ~382 GB/s per device -- i.e. DRAM bandwidth |
+| what decode actually needs | top-10 = 35.8 MB/layer, **2.0 % of the bytes** |
+| floor if only those are read | 0.033 ms/layer -> **1.6 ms for all 48 layers** |
+
+`moe_compute` is dense over the expert axis: it reads all 512 experts every
+layer and saturates DRAM doing it. That is the right design for throughput,
+where a large batch activates most experts, and the wrong one for batch-1
+latency, where 10 of 512 are wanted. No amount of tuning removes a 50x read
+amplification.
+
+Which settles the ceiling of that whole avenue: **the MoE alone costs 57.7 ms
+while an RTX 5090 emits an entire token in 32.6 ms.** Even with everything else
+free, this path cannot reach the target. llama.cpp is fast there because it
+gathers the selected experts and does a small dense matmul.
+
+INVARIANT 34: for batch-1 decode the MoE is bound by *how many expert bytes get
+read*, not by kernel efficiency. 2 % of the weights are needed. Any design that
+touches the whole expert axis is already 50x off the floor, however well it runs.
+
+### 4d.1 A custom kernel is possible from Python, and trace-compatible
+
+No tt-metal rebuild is needed. `ttnn.generic_op(io_tensors, program_descriptor)`
+runs user kernels, described entirely from Python:
+
+- `ttnn.KernelDescriptor(kernel_source, source_type=FILE_PATH | SOURCE_CODE,
+  core_ranges, compile_time_args, named_compile_time_args, defines,
+  runtime_args, common_runtime_args, config, compiler_include_paths)`
+- `ttnn.CBFormatDescriptor(buffer_index, data_format, page_size, tile)`
+- `ttnn.ComputeConfigDescriptor(math_fidelity=...)` -- HiFi4 costs nothing here
+  (invariant 12), so use it
+- `ttnn.ProgramDescriptor(kernels, semaphores, cbs)`, with
+  `custom_program_hash` for the program cache, and `MeshProgramDescriptor` when
+  devices need different programs
+- output tensors are pre-allocated and passed last in `io_tensors`
+
+The trace objection does not apply. A trace fixes the program and the buffer
+addresses, not the data in them. Pass the top-k indices as an **io_tensor**
+rather than as host-set runtime args, and the kernel recomputes expert addresses
+from that tensor on every replay -- so one capture serves any routing. This is
+the property that makes sparse expert reads and tracing compatible, and it is
+why the dense expert axis was never actually forced on us.
+
+`moe_compute`'s own kernels ship in the wheel and are the model to work from:
+`.../operations/experimental/ccl/moe_compute/device/kernels/{dm0,dm1,compute,
+tilize_*}.cpp` plus `moe_ring_common.h`. Its `dm0.cpp` bank-run loop is exactly
+the dense read to make index-driven.
+
+Staging, so the premise is tested before the arithmetic is built on:
+
+1. A read-only `generic_op`: take the index tensor, read just those experts'
+   tiles, reduce to a checksum. If it lands near 0.033 ms/layer the premise
+   holds; if it does not, nothing further is worth building.
+2. Then gate/up + SwiGLU + down, scores applied per expert, accumulating into
+   the hidden vector.
