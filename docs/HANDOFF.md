@@ -1618,3 +1618,47 @@ INVARIANT 28: no multi-device CCL op (`all_to_all_dispatch*`, `all_to_all_combin
 `moe_compute` with a `cluster_axis`) works on this Blackhole box. They do not
 error -- they hang at the next synchronisation point, which makes them look like
 a bug in whatever ran afterwards. Keep `cluster_axis=None` and stay local.
+
+### 4c.1 What `moe_compute` costs, and the two constraints that shape the port
+
+Measured on the local path (`scripts/dev/moe_compute_sweep.py`, one row count per
+process -- an unsupported one aborts the interpreter rather than raising, so a
+single in-process loop loses every measurement after the first bad one).
+
+| rows | per layer |
+|------|-----------|
+| 1    | aborts in `CircularBufferConfig::set_page_size` |
+| 32   | **1.47 ms** |
+| 64   | 2.22 ms |
+| 128  | **2.50 ms** |
+| 256  | rejected, L1 circular buffers over budget |
+| 512  | rejected: "grow to 2532240 B which is beyond max L1 size of 1572864 B" |
+
+Against the 2.78 ms/layer the `sparse_matmul` path costs at M=1, so the op is
+worth having even though decode has to pad 1 row up to 32.
+
+**Constraint 1: the row count must be 32..128.** Below a tile row the op aborts;
+above ~128 its circular buffers exceed L1. Decode pads to 32. Prefill's 512-row
+chunks split into four 128-row calls (4 x 2.50 = 10.0 ms/layer), which is worth
+re-measuring against the current path before committing to it.
+
+**Constraint 2: the fused combine is out of reach.** `compute_only=False` looked
+like it would replace our `_combine` too, and upstream's single-card test does
+run it with `cluster_axis=None`. This build disagrees:
+
+    TT_FATAL: moe_compute(compute_only=false) requires cluster_axis to be provided
+    (moe_compute_device_operation.cpp:473)
+
+and any `cluster_axis` pulls in the CCL path that hangs this box (invariant 28).
+So we stay on `compute_only=True` and keep our own combine -- which is no loss:
+it is one matmul against the router weights at M=1 and measured *more* accurate
+than the alternative it replaced (invariant 25).
+
+INVARIANT 29: `moe_compute` is usable here only as `compute_only=True` with
+32..128 rows and `cluster_axis=None`. Both bounds are hard: one aborts the
+process, the other fails compilation.
+
+Still open before this can replace `moe_block`: output slot 4 (`matmul_output`,
+shape `[110, 2, 32, 2560]` at M=32) is sharded per core, and nothing yet maps
+its (core, slot) layout onto the `[1, E, M, K]` our `_combine` consumes. That
+mapping, and a numerics check against float64, are what remain.
