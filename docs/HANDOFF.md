@@ -3069,3 +3069,43 @@ roughly halved *and* the linears saturating. Both are known-possible -- the two
 fused kernels deployed here each removed the ops they replaced, and the wide
 gather showed what widening an output does -- but it is a long grind of the same
 two moves, not one more insight.
+
+## 12. The narrowest matmul in the model: `hc_inject` was 7.7 ms
+
+`ttnn.linear` is 880 calls and roughly 43 ms of the step, and 288 of those are
+the hyper-connection block. Priced at their real shapes
+(`scripts/dev/hc_linear_cost.py`):
+
+| | us a call | x96 a token |
+|---|---------:|------------:|
+| **`hc_inject` [10240, 4] fp32** | **80.35** | **7.71 ms** |
+| `hc_down` [2560, 320] bf8 | 31.50 | 3.02 ms |
+| `hc_up` [320, 10240] bf8 | 14.45 | 1.39 ms |
+
+`inject_w` is 164 KB. At 388 GB/s that is 0.4 us, and it costs 80.35 -- **200x
+its byte time**. Four output columns is one tile, so all but one core sits idle.
+It is the sharpest instance of invariant 38 in the model and it had never been
+measured because it is a tiny weight that looks harmless.
+
+It also takes the *same* `normed` that `down_w` does, so the two are one matmul
+with a wider output. Concatenating them takes 320 columns to 352 -- four real,
+the rest padding to a tile -- and the pair then costs about what `down` alone
+did. `inject_w` is mesh-partitioned to match `down_w`'s row shard, so its half is
+a partial sum too, which is fine because the all_reduce `down` already needs
+comes before anything nonlinear touches either.
+
+**91.09 -> 84.01 ms**, against 7.1 predicted. The concatenated weight is built
+once per layer at first use and cached; paying a device concat every token would
+be the same mistake the fusion is fixing.
+
+Quality held, and it had to be checked because `inject_w` goes from float32 to
+`down_w`'s bfloat8_b: top-1 85.1 % and top-5 97.9 % unchanged, NLL **0.662**
+against 0.674 -- slightly better, which is noise on 47 tokens but certainly not
+a regression.
+
+INVARIANT 55: a weight being small is not a reason to leave it alone. The
+cheapest weight in the hyper-connection block was its most expensive matmul,
+because cost here follows output *width* and not size. Look for narrow outputs,
+not big tensors -- and prefer widening an existing matmul over adding one.
+
+Session: **146.18 -> 84.01 ms**, 1.74x.

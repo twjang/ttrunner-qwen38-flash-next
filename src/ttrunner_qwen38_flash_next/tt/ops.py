@@ -224,6 +224,41 @@ def fused_gated_mean(mix, normed, hc_count: int, hidden_size: int):
         return ttnn.multiply(total, 1.0 / hc_count)
 
 
+# --- down and inject as one matmul -------------------------------------------
+#
+# `inject_w` is [10240, 4]: four output columns, one tile, and the narrowest
+# shape in the model. Invariant 38 says achieved bandwidth tracks the output
+# width, and this is where that bites hardest -- 80.35 us a call against 0.4 us
+# of bytes, **200x**, and it runs 96 times a token for 7.71 ms
+# (`scripts/dev/route_cost.py`'s sibling, hc_inject).
+#
+# It takes the same `normed` that `down_w` does, so the two are one matmul with a
+# wider output. Concatenating them costs 320 -> 352 columns (four real, the rest
+# padding to a tile boundary) and the pair then costs about what `down` alone
+# did. `inject_w` is mesh-partitioned to match `down_w`'s row shard, so its
+# result is a partial sum too -- which is fine, because the all_reduce that
+# `down` already needs comes before anything nonlinear touches either.
+_DOWNINJ: dict = {}
+
+
+def down_inject_weight(down_w, inject_w, hidden_span: int):
+    """`[K_local, span + 32]` with inject in the first four of the tail columns.
+
+    Built once per layer at first use and cached: it is a device concat of two
+    tensors that never change, so paying it every token would be the same
+    mistake the fusion is fixing.
+    """
+    key = (id(down_w), id(inject_w))
+    got = _DOWNINJ.get(key)
+    if got is None:
+        local = ttnn.mesh_partition(inject_w, dim=-2)      # match down_w's row shard
+        n_inj = local.shape[-1]
+        if n_inj < 32:
+            local = ttnn.pad(local, [(0, 0), (0, 0), (0, 0), (0, 32 - n_inj)], 0.0)
+        got = ttnn.concat([down_w, ttnn.typecast(local, down_w.dtype)], dim=-1)
+        _DOWNINJ[key] = got
+    return got
+
 def gated_residual_mix(
     hyper: ttnn.Tensor,
     norm_w: ttnn.Tensor,
@@ -259,10 +294,20 @@ def gated_residual_mix(
     # split the same way -- `normed` is replicated 10240 wide and this device's
     # `down_w` is only [2560, 320]. `mesh_partition` is the inverse of
     # all_gather: device d keeps columns [d*2560, (d+1)*2560).
-    part = linear_rows(
-        ttnn.mesh_partition(normed, dim=-1), down_w, compute_kernel_config=HIFI4
+    span = down_w.shape[-1]
+    local = ttnn.mesh_partition(normed, dim=-1)
+    if inject_w is None:
+        part = linear_rows(local, down_w, compute_kernel_config=HIFI4)
+    else:
+        # One matmul for both: see `down_inject_weight`.
+        part = linear_rows(local, down_inject_weight(down_w, inject_w, span),
+                           compute_kernel_config=HIFI4)
+    whole = ttnn.all_reduce(part, cluster_axis=1, topology=ttnn.Topology.Linear)
+    mix = ttnn.silu(
+        whole if inject_w is None
+        else ttnn.slice(whole, (0, 0, 0, 0),
+                        (whole.shape[0], whole.shape[1], whole.shape[2], span))
     )
-    mix = ttnn.silu(ttnn.all_reduce(part, cluster_axis=1, topology=ttnn.Topology.Linear))
     mix = ttnn.sigmoid(linear_rows(mix, up_w, compute_kernel_config=HIFI4))
     gated = ttnn.multiply(mix, normed)
 
@@ -273,7 +318,10 @@ def gated_residual_mix(
 
     inject = None
     if inject_w is not None:
-        inject = linear_rows(normed, inject_w, compute_kernel_config=HIFI4)
+        # Already computed, in the tail of the fused matmul above.
+        n_inj = inject_w.shape[-1]
+        inject = ttnn.slice(whole, (0, 0, 0, span),
+                            (whole.shape[0], whole.shape[1], whole.shape[2], span + n_inj))
         inject = ttnn.multiply(ttnn.sigmoid(inject), 2.0)
         # Hand it back channel-major, [.., hc, M, 1], so `reinject` can broadcast
         # against the branch without materialising anything. The permute is on a
