@@ -34,6 +34,13 @@ class Shard(Enum):
     ROW = "row"  # split input features (dim 1) -- output needs all-reduce
     EXPERT_COLUMN = "expert_column"  # (E, out, in): split `out`
     EXPERT_ROW = "expert_row"  # (E, out, in): split `in`, all-reduce after
+    # (E, out, in): split `E`. Every device gets whole experts instead of a slice
+    # of all of them, which is the difference between `sparse_matmul` writing
+    # [1, 512, M, K] a layer and [1, 128, M, K] -- 84 MB against 21. Same bytes of
+    # weight per device either way; a quarter of the output nobody reads. Each
+    # device then holds a partial sum over its own experts, so the MoE's existing
+    # all-reduce is what makes it whole.
+    EXPERT = "expert"
     # The 10240-wide DeltaNet channel axis is [q(2048) | k(2048) | v(6144)];
     # a flat 4-way split at 2560 cuts through the q/k boundary and mispairs
     # heads, so each part is split by head and re-concatenated per device.
@@ -62,15 +69,15 @@ PLAN: tuple[TensorPlan, ...] = (
     # -- MoE experts: the bulk of the weights ---------------------------------
     # gate/up are the least sensitive (Unsloth spends 3.4 bpw here), down gets more.
     TensorPlan(
-        r"^blk\.\d+\.ffn_gate_exps\.weight$", Residency.DEVICE, "bfloat4_b", Shard.EXPERT_COLUMN,
+        r"^blk\.\d+\.ffn_gate_exps\.weight$", Residency.DEVICE, "bfloat4_b", Shard.EXPERT,
         "IQ3_S upstream -- lowest-sensitivity tensor in the model",
     ),
     TensorPlan(
-        r"^blk\.\d+\.ffn_up_exps\.weight$", Residency.DEVICE, "bfloat4_b", Shard.EXPERT_COLUMN,
+        r"^blk\.\d+\.ffn_up_exps\.weight$", Residency.DEVICE, "bfloat4_b", Shard.EXPERT,
         "IQ3_S upstream",
     ),
     TensorPlan(
-        r"^blk\.\d+\.ffn_down_exps\.weight$", Residency.DEVICE, "bfloat8_b", Shard.EXPERT_ROW,
+        r"^blk\.\d+\.ffn_down_exps\.weight$", Residency.DEVICE, "bfloat8_b", Shard.EXPERT,
         "IQ4_NL upstream and Q8_0 for layers 0-4; down_proj carries more error weight",
     ),
     # -- routers stay in f32: a wrong expert is not a small perturbation -------

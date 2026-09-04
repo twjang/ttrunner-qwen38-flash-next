@@ -51,12 +51,14 @@ SHARD_DIM = {
     Shard.ROW: -2,
     Shard.EXPERT_COLUMN: -1,
     Shard.EXPERT_ROW: -2,
+    # device layout is [1, E, K, N], so the expert axis is 1
+    Shard.EXPERT: 1,
     Shard.HEAD_QKV_COLUMN: -1,
     Shard.HEAD_QKV_ROW: -2,
 }
 HEAD_QKV = {Shard.HEAD_QKV_COLUMN, Shard.HEAD_QKV_ROW}
 # Whether the consumer must all-reduce after using the tensor.
-NEEDS_ALL_REDUCE = {Shard.ROW, Shard.EXPERT_ROW}
+NEEDS_ALL_REDUCE = {Shard.ROW, Shard.EXPERT_ROW, Shard.EXPERT}
 
 
 def split_qkv_channels(t, dim: int, n_dev: int, key_dim: int, value_dim: int, head_dim: int):

@@ -88,6 +88,29 @@ def sparse_program_config(m: int, k: int, n: int, grid_x: int = 10, grid_y: int 
     )
 
 
+def _localise(weights, keep, gate_w, num_experts: int):
+    """Cut the routing down to the experts this device actually holds.
+
+    The expert stacks are sharded on the expert axis, so a device has
+    `gate_w.shape[1]` of the `num_experts` and needs exactly that slice of the
+    mask. Every device computed the same `num_experts` logits -- the router is
+    replicated, and softmax and top-k are global by definition -- so what is
+    wanted is a partition of a replicated tensor, which is what
+    `ttnn.mesh_partition` is: the inverse of all_gather, device 0 taking columns
+    0..E/n and device 1 the next, matching how `ShardTensorToMesh` laid the
+    weights out.
+
+    Each device then produces a partial sum over its own experts, and the
+    all-reduce the MoE already does adds them up.
+    """
+    e_local = gate_w.shape[1]
+    if e_local == num_experts:
+        return weights, keep, e_local
+    return (ttnn.mesh_partition(weights, dim=-1),
+            ttnn.mesh_partition(keep, dim=-1),
+            e_local)
+
+
 def _combine(per_expert, weights, num_experts: int, hidden_size: int):
     """Weighted sum over the expert axis: [1, E, M, K] x [1, 1, M, E] -> [1, 1, M, K].
 
@@ -176,17 +199,22 @@ def moe_block(
     kept = ttnn.multiply(probs, keep)
     weights = ttnn.divide(kept, ttnn.sum(kept, dim=-1, keepdim=True))
 
-    # union of experts selected by any of the M rows -> [1, 1, 1, E]
+    # Routing is global -- the router is replicated and top-k is over all of
+    # `num_experts` -- but the expert stacks are sharded on the expert axis, so
+    # from here on only this device's slice is wanted.
+    weights, keep, e_local = _localise(weights, keep, gate_w, num_experts)
+
+    # union of experts selected by any of the M rows -> [1, 1, 1, E_local]
     # sparse_matmul wants the mask rank-4, row-major and bfloat16
     sparsity = ttnn.max(keep, dim=-2, keepdim=True)
     sparsity = ttnn.to_layout(ttnn.typecast(sparsity, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)
 
     per_expert = expert_ffn(
-        x, gate_w, up_w, down_w, sparsity, None, num_experts, hidden_size, intermediate_size
-    )                                                     # [1, E, M, K]
+        x, gate_w, up_w, down_w, sparsity, None, e_local, hidden_size, intermediate_size
+    )                                                     # [1, E_local, M, K]
 
-    # [1, 1, M, E] -> [1, E, M, 1] so it broadcasts over the hidden axis
-    return _combine(per_expert, weights, num_experts, hidden_size)
+    # a partial sum over this device's experts; the caller's all-reduce completes it
+    return _combine(per_expert, weights, e_local, hidden_size)
 
 
 def route(x, router_w, top_k: int):
@@ -241,14 +269,15 @@ def apply_experts(x, weights, keep, gate_w, up_w, down_w, num_experts: int,
                                       num_experts, hidden_size, intermediate_size))
         return ttnn.concat(outs, dim=-2)
 
+    weights, keep, e_local = _localise(weights, keep, gate_w, num_experts)
     sparsity = ttnn.to_layout(
         ttnn.typecast(ttnn.max(keep, dim=-2, keepdim=True), ttnn.bfloat16),
         ttnn.ROW_MAJOR_LAYOUT,
     )
     per_expert = expert_ffn(
-        x, gate_w, up_w, down_w, sparsity, None, num_experts, hidden_size, intermediate_size
+        x, gate_w, up_w, down_w, sparsity, None, e_local, hidden_size, intermediate_size
     )
-    return _combine(per_expert, weights, num_experts, hidden_size)
+    return _combine(per_expert, weights, e_local, hidden_size)
 
 
 def shared_expert(
