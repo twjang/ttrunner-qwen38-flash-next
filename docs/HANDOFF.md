@@ -1763,3 +1763,55 @@ Open before this replaces `moe_block`: the combine output is
 back as `(10, 8, 2560)` per device. Our hidden state is replicated and reduced
 with all-reduce, so the data flow changes: sum over k, then all-gather on the
 token axis instead. That plus a float64 numerics check is what remains.
+
+### 4c.4 The integration contract, read off the reference flow
+
+Taken from `tests/nightly/tg/ccl/moe/test_moe_compute_6U.py`, which the module
+docstring names as the full flow. It should have been read end to end before any
+of §4c was written; grepping it piecemeal is what produced the wrong turns above.
+
+**It traces.** The reference captures the op with `begin_trace_capture` /
+`execute_trace`, which is the thing that matters most here -- our decode is a
+single traced replay, and an op that could not be captured would be useless
+regardless of its kernel time.
+
+**One packed weight tensor for every layer.** `layer_id` selects the layer
+inside it, so the packers take `num_layers` and all 48 layers' experts live in
+one DRAM-sharded tensor per projection. Use
+`ttnn.experimental.get_weight_mem_configs(mesh_device, num_layers=,
+experts_per_device=, hidden_size=, intermediate_size=, has_bias=)`, which
+returns `.w0_w1` / `.w2` -- the intended API, not the Python
+`moe_compute_utils.get_weight_mem_configs` that takes shard maps.
+
+**The semaphore belongs on the combine cores, not the whole grid:**
+
+    output_shard_cores = ttnn.experimental.get_moe_combine_cores(
+        mesh_device, output_height_shard_dim, output_width_shard_dim,
+        hidden_size, mux_core_range_set=mux_core_range_set)
+    combine_core_range_set = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in output_shard_cores])
+    combine_barrier_semaphore = ttnn.create_global_semaphore(mesh_device, combine_core_range_set, 0)
+
+`mux_core_range_set` feeds three placement helpers -- `get_moe_tilize_drain_core`,
+`get_moe_combine_cores`, `get_moe_worker_mcast_bounding_box` -- so it has to be
+decided first and passed to all of them. Upstream default `((1,1),(3,3))`,
+`num_links=4` (we measured with 1).
+
+**L1 is the binding constraint for a 48-layer model.** The reference says it
+outright:
+
+    # NOTE: we're extremely tight on L1 for a single invocation of the op.
+    # When running multiple layers, all inputs go to DRAM and get moved to L1
+    # per-layer via to_memory_config.
+
+So per layer: inputs `to_memory_config` DRAM->L1, run, deallocate the L1 inputs,
+move outputs back to DRAM, free the L1 outputs. Outputs unpack as
+`(per_expert, activation, e_t, _, matmul, combine)` -- slot 3 skipped, which is
+the shared-buffer rule from §4c.2 seen from the other side.
+
+**The combine output is preallocated per layer**, `[k, total_tokens, hidden]`
+with `ShardTensorToMesh(dim=1)`, and passed as `optional_output_tensor`.
+
+INVARIANT 32: read the reference flow a docstring points at before wiring
+against the op, not after. Every wrong turn in §4c -- "CCL is broken here",
+"the port is closed", the missing mux cores -- was already answered in
+`test_moe_compute_6U.py`.
