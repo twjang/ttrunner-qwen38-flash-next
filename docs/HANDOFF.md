@@ -2444,3 +2444,29 @@ Both are the same change: make everything after the first `sparse_matmul` work
 over the selection instead of over E. The gather kernel is the piece that was
 missing and it now exists and is exact; what it should gather is the activations
 and the down weights, not the gate/up weights.
+
+### 6.1 Deployed: the gate/up output is bfloat8_b
+
+`sparse_matmul` zero-fills its whole `[1, E, M, N]` output on every call whatever
+the mask (invariant 40), and the SwiGLU chain then reads that output over all 128
+experts. Both costs are set by the element width, so `dtype=ttnn.bfloat8_b` on
+the gate/up call halves both: **103.87 -> 101.69 ms**.
+
+Quality held, and that is the only reason it stayed: top-1 83.0 % unchanged,
+top-5 97.9 % unchanged, NLL **0.672** against 0.687 before, on a float32
+reference of 80.9 % / 0.703. The tensor is the product of bfloat4_b weights, so
+its low bits were already noise, and it feeds silu and a multiply rather than an
+accumulation.
+
+The same change on the **down** projection was tried and reverted:
+101.69 -> 101.45 ms, inside the spread, because `hidden` is already bfloat8_b so
+that matmul's input had halved already and only the output fill remained.
+Quality was unchanged there too -- it is not a correctness call but a
+proportionality one. That output is what `_combine` weights and sums into the
+layer's answer, and 0.24 ms does not buy precision on the output path.
+
+INVARIANT 45: element width on an intermediate is worth more than it looks,
+because `sparse_matmul`'s mask-independent zero-fill and every downstream
+expert-axis op are both sized by it. But the win is in the *intermediate*, not
+the result: halving the gate/up output is 2.18 ms, halving the down output is
+0.24.

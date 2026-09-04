@@ -396,4 +396,11 @@ def expert_ffn(
         up = _broadcast_matmul(up_w, up_w.shape[-1])
     hidden = ttnn.multiply(ttnn.silu(gate), up)
     pc_out = sparse_program_config(m, hidden.shape[-1], hidden_size)
+    # Deliberately NOT `dtype=bfloat8_b` here, unlike the gate/up call above.
+    # It was tried: 101.69 -> 101.45 ms, which is inside the run-to-run spread,
+    # because `hidden` is already bfloat8_b so this matmul's input had already
+    # halved and only the output fill was left. Quality was unchanged, but this
+    # tensor is what `_combine` weights and sums into the layer's answer rather
+    # than an intermediate, and 0.24 ms is not a reason to spend precision on
+    # the output path.
     return ttnn.sparse_matmul(hidden, down_w, program_config=pc_out, compute_kernel_config=HIFI4, **kw)
