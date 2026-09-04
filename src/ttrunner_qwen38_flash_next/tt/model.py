@@ -91,12 +91,6 @@ class TTState:
     them, and they are a property of the sequence, not of a layer.
     """
 
-    # Whether the QSA selection actually runs. A Python bool, so it is baked
-    # into whatever trace gets captured -- which is the point: the two regimes
-    # are two graphs, and the engine recaptures when a sequence crosses
-    # `indexer_budget`. Default on, so nothing changes until that wiring lands.
-    selection_active = True
-
     def __init__(self, num_layers: int, batch: int = 1):
         self.layers = [LayerState() for _ in range(num_layers)]
         self.batch = batch
@@ -112,6 +106,12 @@ class TTState:
 
 
 class TTModel:
+    # Whether the QSA selection actually runs. A Python bool, so it is baked
+    # into whatever trace gets captured -- which is the point: the two regimes
+    # are two graphs, and the engine recaptures when a sequence crosses
+    # `indexer_budget`. Default on, so nothing changes until that wiring lands.
+    selection_active = True
+
     def __init__(
         self,
         config: Qwen4ExpConfig,
