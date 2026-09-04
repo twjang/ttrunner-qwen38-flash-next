@@ -2690,8 +2690,8 @@ same k, same graph, same accepted prefix, only the *rejected* tokens changed:
 | the same change **without** the mask | 2.3584e-01 |
 | **conv ring, rejected tokens changed** | **1.4350e+01** |
 
-So the recurrence is bit-exactly inert on rejected steps, and **the convolution
-ring is not**. It holds the last `kernel-1` qkv columns and a rejected step still
+So the recurrence is bit-exactly inert on rejected steps, and the convolution
+ring was not -- until the rewind below. **Both are now 0.0000e+00.** It holds the last `kernel-1` qkv columns and a rejected step still
 shifts one in.
 
 Not worth masking the shift itself: the ring is three slots deep on 36 layers, so
@@ -2706,3 +2706,45 @@ genuine k=2 run (measured 1.68e-02 relative). That is the k=2-vs-k=4 matmul
 blocking, not the mask -- the isolating control above is exactly 0. It is the
 same class of difference as any tile-blocking change, and the quality harness is
 what should judge it.
+
+### 8.3 The conv ring rewind closes it: a rejected token now costs nothing
+
+The ring holds the last `kernel-1` qkv columns and a rejected step still shifts
+one in. Masking the shift would be three blends a step a layer -- 864 ops at
+k=8, ~14 ms, more than the verify. So instead the columns are kept and the ring
+is rewound once at the end.
+
+`_linear_attention_step_n` builds a `history` before the conv loop: the entry
+ring, oldest first, followed by this call's k columns. History index `h` then
+holds the column from time `h - depth`, so after accepting j tokens slot s --
+0 is newest -- must hold time `j - 1 - s`, i.e. index `depth + j - 1 - s`. That
+is a gather, written as one small matmul against a `[depth, depth + k]`
+selection matrix, and the matrix is a bound tensor: **data, not shape**, so one
+capture serves any j.
+
+Cost is ~15 ops a layer, ~3 ms at k=8, against a 181 ms verify.
+
+Measured, with the control that isolates it -- same k, same graph, same accepted
+prefix, only the *rejected* tokens changed (`scripts/dev/accept_mask_identity.py`):
+
+| | diff |
+|---|---|
+| recurrent state | **0.0000e+00** |
+| conv ring | **0.0000e+00** |
+| accepted rows' outputs | **0.0000e+00** |
+| the same change with no mask (control) | 2.3584e-01 |
+
+A rejected token has bit-exactly no effect on anything carried forward. One
+capture at width k, and the state advances by exactly the number accepted.
+
+Two things that cost a run each: the rewind must build the ring itself when
+`st.conv` is None, because `_causal_conv_step` would otherwise create it *inside*
+the loop and the history has to be captured before the loop touches it -- with a
+fresh state the rewind silently did nothing. And `accept` must be a prefix of
+ones; `step_n` rejects anything else rather than computing a `j` that does not
+mean what the caller thinks.
+
+INVARIANT 49: speculative acceptance is expressible entirely as bound tensors on
+this model -- an accept mask for the recurrence and a selection matrix for the
+convolution ring. Neither changes a shape, so the ladder of capture widths that
+provokes the alternation hang is not needed and must not be reintroduced.

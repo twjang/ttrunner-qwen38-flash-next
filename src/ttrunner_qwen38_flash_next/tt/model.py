@@ -1106,7 +1106,7 @@ class TTModel:
 
     def _linear_attention_step_n(
         self, mixed: ttnn.Tensor, layer: int, st: LayerState, k: int,
-        accept: ttnn.Tensor | None = None,
+        accept: ttnn.Tensor | None = None, conv_sel: ttnn.Tensor | None = None,
     ) -> ttnn.Tensor:
         """DeltaNet over `k` consecutive tokens of *one* sequence.
 
@@ -1135,6 +1135,39 @@ class TTModel:
         # [1,1,k,conv_dim] -> [1,k,conv_dim,1]; one column per token
         qkv_col = ttnn.transpose(ttnn.permute(qkv, (0, 2, 1, 3)), -2, -1)
         conv_w = self.w.blk(layer, "ssm_conv1d.weight")
+
+        # The convolution ring is the one piece the accept mask cannot make
+        # inert: a rejected step still shifts a column in, and masking the shift
+        # itself would be three blends a step a layer -- 864 ops at k=8, ~14 ms,
+        # more than the verify it is protecting.
+        #
+        # Instead, keep every column this call could possibly need. The ring
+        # after accepting j is columns j-2, j-1, j, and when j < depth the older
+        # ones come from *before* this call -- so the history is the entry ring
+        # followed by the k new columns, captured here while the ring is still
+        # intact. One small matmul against a selection matrix picks the right
+        # three out at the end (see below); the matrix is a bound tensor, so the
+        # choice stays data and one capture serves any j.
+        history = None
+        if accept is not None:
+            depth = self.cfg.conv_kernel - 1
+            if st.conv is None:
+                # `_causal_conv_step` would make this on its first call, but the
+                # history has to be captured *before* the loop touches it.
+                st.conv = [
+                    ttnn.zeros((1, 1, self.conv_dim_local, 1), dtype=ttnn.bfloat16,
+                               layout=ttnn.TILE_LAYOUT, device=self.mesh)
+                    for _ in range(depth)
+                ]
+            prior = [
+                ttnn.reshape(ttnn.transpose(st.conv[d], -2, -1),
+                             (1, 1, 1, self.conv_dim_local))
+                for d in range(depth - 1, -1, -1)          # oldest first
+            ]
+            fresh = ttnn.reshape(ttnn.transpose(qkv_col, -2, -1),
+                                 (1, 1, k, self.conv_dim_local))
+            history = ttnn.concat(prior + [fresh], dim=-2)  # [1,1,depth+k,C]
+
         cols = []
         for i in range(k):
             col = ttnn.slice(qkv_col, (0, i, 0, 0), (1, i + 1, self.conv_dim_local, 1))
@@ -1145,6 +1178,20 @@ class TTModel:
             cols.append(out_i)
         conv_out = cols[0] if k == 1 else ttnn.concat(cols, dim=1)
         qkv = ttnn.permute(ttnn.transpose(conv_out, -2, -1), (0, 2, 1, 3))
+
+        # Rewind the ring to where accepting j tokens would have left it. `sel`
+        # is [depth, depth+k] with one 1 a row, so this is a gather written as a
+        # matmul -- and being a bound tensor it is data, which is the whole point.
+        if history is not None:
+            depth = self.cfg.conv_kernel - 1
+            picked = ttnn.matmul(conv_sel, history)        # [1,1,depth,C]
+            for slot in range(depth):
+                col = ttnn.reshape(
+                    ttnn.slice(picked, (0, 0, slot, 0),
+                               (1, 1, slot + 1, self.conv_dim_local)),
+                    (1, 1, self.conv_dim_local, 1),
+                )
+                ttnn.copy(col, st.conv[slot])
 
         q = ttnn.reshape(self._slice_last(qkv, 0, kd), (k * n_v, 1, 1, hd))
         kk = ttnn.reshape(self._slice_last(qkv, kd, 2 * kd), (k * n_v, 1, 1, hd))
@@ -1594,7 +1641,7 @@ class TTModel:
         # works over. Bound like every other per-step input, so it is data and
         # one capture serves any acceptance count -- see
         # `_linear_attention_step_n` for why that matters.
-        acc = None
+        acc = csel = None
         if accept is not None:
             if len(accept) != k:
                 raise ValueError(f"accept has {len(accept)} entries, expected k={k}")
@@ -1605,6 +1652,25 @@ class TTModel:
                 .repeat_interleave(n_v).reshape(k * n_v, 1, 1, 1),
                 ttnn.bfloat16, key=tuple(accept),
             )
+
+            # The convolution ring's rewind, as a gather written as a matmul.
+            #
+            # `history` inside the layer is the entry ring (oldest first) then
+            # this call's k columns, so history index h holds the column from
+            # time `h - depth`. After accepting j tokens the ring's slot s -- 0
+            # is newest -- must hold time `j - 1 - s`, i.e. history index
+            # `depth + j - 1 - s`. One 1 a row, and being bound it is data, so
+            # one capture serves any j.
+            j = int(sum(accept))
+            if j < 1 or accept[:j] != [1.0] * j or any(accept[j:]):
+                raise ValueError(
+                    f"accept must be a prefix of ones then zeros, got {accept}"
+                )
+            depth = self.cfg.conv_kernel - 1
+            sel = torch.zeros(1, 1, depth, depth + k, dtype=torch.float32)
+            for slot in range(depth):
+                sel[0, 0, slot, depth + j - 1 - slot] = 1.0
+            csel = self._input("conv_sel", sel, ttnn.bfloat16, key=(k, j))
 
         start = state.positions[0]
 
@@ -1633,7 +1699,7 @@ class TTModel:
             branch = (
                 self._attention_step_n(mixed, layer, st, start, k)
                 if cfg.is_full_attention(layer)
-                else self._linear_attention_step_n(mixed, layer, st, k, acc)
+                else self._linear_attention_step_n(mixed, layer, st, k, acc, csel)
             )
             hidden = reinject(hidden, branch, inject, cfg.hc_count)
 
