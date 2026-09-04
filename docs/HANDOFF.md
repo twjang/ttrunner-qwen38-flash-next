@@ -2351,3 +2351,50 @@ that costs 4.43 us at M=1 costs 92.30 at M=32, and pricing it at 32 predicted a
 5.3 ms saving from replacing it where the measured result was 0.23 ms. Storage
 pads a row to a 32-row tile; the op still walks only the tile-rows the logical
 shape has.
+
+### 5.5 Stock fusion is exhausted: what was tried and what it measured
+
+Every fusion ttnn offers for these shapes was tried and none of it helps. Each
+of these is a measurement, so none of them needs trying again.
+
+| candidate | today | fused | verdict |
+|-----------|-------|-------|---------|
+| `ttnn.swiglu` vs slice+slice+silu+multiply, [1,128,1,1280] | 142.24 us | 142.20 us | **no gain** |
+| `ttnn.linear(activation="sigmoid")` vs `sigmoid(linear(...))`, [320,10240] | 19.27 us | 19.27 us | **no gain** |
+| `MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig` | see 5.1 | 0.81-1.12x | no gain, refused for hc shapes |
+
+`ttnn.swiglu` and friends are *composites*: they issue the same ops behind one
+Python call, so they cut the host's call count and nothing the device sees. At
+batch 1 in a trace the host call count is already free -- what costs is the
+per-op device cost (invariant 42) -- so composites buy exactly nothing.
+
+INVARIANT 43: ttnn's fused-looking ops (`swiglu`, `glu`, `geglu`, `reglu`, and
+`linear`'s `activation=`) are composites, not fused kernels. They do not reduce
+device-side op count and measure identical to writing the chain out. Real fusion
+here means `ttnn.generic_op` (invariant 37), not a stock kwarg.
+
+Also measured while looking: the four-op SwiGLU chain costs 142 us as a unit,
+not the 183 that summing its ops individually suggested -- consecutive ops
+pipeline, so per-op timings over-add. Treat a sum of individual op costs as an
+upper bound.
+
+### 5.6 Where the 7413 calls live
+
+Counted by stubbing one component at a time and diffing the call count:
+
+| component | calls | at 5.5 us |
+|-----------|------:|----------:|
+| **everything else** (hyper-connections, PLE, norms, embed) | **3033** | 16.7 ms |
+| DeltaNet, 36 layers (60 a layer) | 2160 | 11.9 ms |
+| QSA, 12 layers (105 a layer) | 1260 | 6.9 ms |
+| MoE block, 48 layers (20 a layer) | 960 | 5.3 ms |
+
+DeltaNet's measured ablation is 16.35 ms against 11.9 of pure op cost, so
+roughly three quarters of it is overhead rather than work -- but `decode_step`
+itself is already tight (12 ops, with the k/q matmuls deliberately fused into
+one). The 60 a layer is mostly the surrounding projections, the conv ring, and
+four layout ops (`permute`+`transpose` there and back) that exist only to feed
+the convolution.
+
+"Everything else" being the largest bucket is the finding: no single component
+owns it, so no single ablation was ever going to show it.
