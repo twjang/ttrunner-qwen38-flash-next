@@ -154,6 +154,13 @@ def convert(
     n_dev: int = 4,
     only: str | None = None,
     force: bool = False,
+    # Where to record what was written. Conversion is single-threaded and CPU
+    # bound -- one core of the host's forty-eight -- so the practical way to
+    # rebuild the cache is several processes over disjoint tensors. They cannot
+    # share `manifest.json`: each loads it whole and writes it back whole, so the
+    # last one to finish would erase the others. Each writes its own instead and
+    # a merge folds them in.
+    manifest_name: str = MANIFEST,
     progress=print,
 ) -> ConvertStats:
     import ttnn
@@ -173,7 +180,7 @@ def convert(
         "float32": ttnn.float32,
     }
     stats = ConvertStats()
-    manifest_path = out / MANIFEST
+    manifest_path = out / manifest_name
     if manifest_path.exists():
         stats.entries = json.loads(manifest_path.read_text()).get("tensors", {})
 
