@@ -59,6 +59,50 @@ elif PART == "allreduce":
 elif PART == "attn":
     model_mod.TTModel._attention_step = lambda self, mixed, *a, **kw: mixed
     model_mod.TTModel._linear_attention_step = lambda self, mixed, *a, **kw: mixed
+elif PART == "grmlinear":
+    # Only the two linears inside the hyper-connection mixing, keeping the norm,
+    # the silu/sigmoid and the mean. Standalone those two shapes (10240x640 and
+    # 640x10240) time at 0.139 + 0.022 ms, which over 96 calls a token would be
+    # 15.4 ms -- but ablating the whole of gated_residual_mix saved only 2.54.
+    # One of those numbers is wrong and this says which.
+    import ttrunner_qwen38_flash_next.tt.ops as ops_mod
+
+    _lr_real = ops_mod.linear_rows
+
+    def _lr_stub(x, w, max_rows=128, **kw):
+        # Same [.., rows, N] the real one returns, sliced out of a tensor that
+        # already has the rows -- so no weight is read and no op is added
+        # beyond the slice.
+        n = w.shape[-1]
+        rows = x.shape[-2]
+        if x.shape[-1] >= n:
+            return ttnn.slice(x, (0, 0, 0, 0), (1, 1, rows, n))
+        return _lr_real(x, w, max_rows=max_rows, **kw)
+
+    ops_mod.linear_rows = _lr_stub
+elif PART == "grm":
+    # The hyper-connection mixing, twice per layer: grouped_rms_norm plus two
+    # linears plus silu plus sigmoid, over an hc_count*hidden = 10240-wide
+    # stream. Its weights (hc_*) carry no .devN suffix, so they are replicated
+    # -- every device reads all ~24 MB a layer. Nothing in the ablation list
+    # covered it, and ~32 ms of the step is unattributed.
+    import ttrunner_qwen38_flash_next.tt.ops as ops_mod
+
+    def _grm_stub(hyper, norm_w, down_w, up_w, inject_w, eps, hc, hidden):
+        # The shapes the real one returns: mixed [.., M, hidden] and inject
+        # [.., hc, M, 1] (which is what `reinject` broadcasts against). Both are
+        # carved out of the input, so the stand-in costs nothing.
+        rows = hyper.shape[-2]
+        mixed = ttnn.slice(hyper, (0, 0, 0, 0), (1, 1, rows, hidden))
+        if inject_w is None:
+            return mixed, None
+        inj = ttnn.reshape(
+            ttnn.slice(hyper, (0, 0, 0, 0), (1, 1, rows, hc)), (1, hc, rows, 1)
+        )
+        return mixed, inj
+
+    ops_mod.gated_residual_mix = _grm_stub
+    model_mod.gated_residual_mix = _grm_stub
 elif PART == "noselect":
     # Not an ablation of a component but of a *regime*: the selection is exact
     # below indexer_budget, where topk returns every visible block, so this is

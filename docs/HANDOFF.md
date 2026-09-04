@@ -2072,3 +2072,58 @@ whole tile row from DRAM, indexing only inside L1, which is precisely the
 amplification being removed. `ttnn.tosa_gather` is a thin wrapper over it.
 `ttnn.sparse_matmul` skips reads by a *mask*, walking E in order without
 permuting, and that is the 0.64 ms/layer path we already run.
+
+## 5. Where the decode step actually goes: small-N matmuls at 5-7 % of bandwidth
+
+Component ablation was the wrong frame and cost most of a session to disprove.
+It accounts for 113.5 ms of a 146.2 ms step -- attention 59.6, MoE 42.9, PLE
+2.8, all_reduce 3.8, reinject 1.9 -- and every hunt for the remaining ~33 ms
+inside a component came back small. Then two measurements reframed it.
+
+**The host is not the problem.** `step_host_split.py`: whole step 144.81 ms,
+`execute_trace` alone 141.70, `_fill_inputs` alone 2.56. The host is 1.8 %.
+`model.embed` and the n-gram lookup, which read host memory, are 0.01 ms.
+
+**The device is running at 5 % of its bandwidth.** Per device per token the
+model must read 2.92 GB: dense 2.18 (the `hc_*` and router weights carry no
+`.devN` suffix -- they are *replicated*, so they do not divide by four; an
+earlier roofline in this file divided them and was wrong), top-10 experts 0.52,
+head 0.22. In 141.7 ms that is **20.6 GB/s**, against 273 GB/s measured on
+bfloat4_b and 388 GB/s reached by the stage-1 kernel.
+
+`gemv_saturation.py` prices the real weight shapes inside a trace, and the
+pattern is entirely about the output width N:
+
+| shape (K x N) | GB/s | % of 388 |
+|---------------|------|----------|
+| lm_head 2560 x 62080 | 275.8 | 71 % |
+| hc_up 640 x 10240 | 167.9 | 43 % |
+| attn_qkv 2560 x 4608 | 128.3 | 33 % |
+| attn_output 6144 x 2560 | 71.2 | 18 % |
+| ssm_out 4096 x 2560 | 70.2 | 18 % |
+| **hc_down 10240 x 640** | **26.6** | **7 %** |
+| **router 2560 x 512** | **19.7** | **5 %** |
+
+N sets how many output tiles there are to spread across cores, so a narrow
+output starves the grid regardless of how much weight has to be read. And M=1
+and M=32 time *identically* at every shape, which is the 32-row tile padding
+showing up exactly as expected: decode wastes 32x of the compute, but since a
+GEMV has arithmetic intensity ~1 op/byte that is not what binds -- the schedule
+is.
+
+The model is full of narrow-output matmuls. `hc_down` (10240 x 640, replicated)
+runs **96 times a token**, two per layer inside `gated_residual_mix`, and
+ablating it alone costs **18.77 ms** of the step -- consistent with 96 x 0.139 ms
+standalone.
+
+INVARIANT 38: decode is bound by matmul scheduling, not by bandwidth or compute.
+Achieved bandwidth tracks the output width N: ~270 GB/s at N=62080, ~20 GB/s at
+N=512. Any fix that does not widen the effective output or split the reduction
+space across cores will not move the step, however few bytes it reads.
+
+CAUTION on method: ablating a whole `gated_residual_mix` measured 2.54 ms while
+ablating just its first linear measured 18.77 ms, which cannot both be right.
+The stand-in returned a `ttnn.slice` view where the real function returns a
+fresh tensor, and the downstream matmuls appear to have paid for that -- its
+samples spread 135-145 ms where every other ablation held within 2 ms. Prefer
+the narrower ablation, and distrust any delta whose spread is wide.
