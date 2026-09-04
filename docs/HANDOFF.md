@@ -373,7 +373,31 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     2.6 s capture, so this needs either the upstream fix or a design where
     `step_n` is the only trace.
 
-25. **A device call on the eager prefill path is worth ~57 us, and its size does
+25. **A GEMV does reach DRAM bandwidth; a small one is hidden behind a launch
+    floor, and only outside a trace.** Sweeping the weight of a decode projection
+    (`gemv_bandwidth_check.py`) shows the kernel is fine -- it streams at
+    **273 GB/s** for bfloat4_b and **393 GB/s** for bfloat16 once the weight is
+    big enough, against 332 GB/s for a plain elementwise read+write. What it also
+    shows is a fixed **~33 us per op** eagerly: a 0.37 MB weight and a 4.42 MB
+    weight take 0.033 and 0.061 ms. Our projections are 1-4 MB per device --
+    4-bit and sharded four ways -- so eagerly they sit in the floor-dominated
+    regime and *look* like 73 GB/s.
+
+    Inside a trace that floor is **1.4 us**, measured by injecting ops into the
+    capture and reading the slope (`traced_step_op_floor_check.py`): 2328 extra
+    ops move a 210 ms step by 3.3 ms. So 6095 ops account for ~9 ms of it, and
+    invariant 19 stands -- the traced step is real device work, not per-op
+    overhead. An arithmetic coincidence (6095 x 28 us = 171 ms against a 173 ms
+    step) suggested otherwise and did not survive being measured.
+
+    And "a GEMV runs at a thirty-second of a GEMM" is about FLOPs, not bandwidth.
+    A GEMV has an arithmetic intensity of ~1 op/byte where a 32-row GEMM has ~32,
+    so at the *same* bandwidth it does 1/32 the arithmetic. Saturating DRAM is
+    the ceiling for a GEMV, not a shortfall from one. The two real losses here are
+    bfloat4_b unpacking (273 against bfloat16's 393 GB/s) and the launch floor on
+    small weights.
+
+26. **A device call on the eager prefill path is worth ~57 us, and its size does
     not matter.** Injecting a known number of ops and reading the slope gives
     90 +/- 15 us for the marginal op, and the one clean removal on record
     (`moe_chunk` 32 -> 128, 1008 calls, 918.6 -> 861.7 ms) gives 57 us for a real
