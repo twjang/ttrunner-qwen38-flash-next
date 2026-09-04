@@ -2018,3 +2018,57 @@ hidden states **bitwise** identical, max abs diff 0.000e+00.
 
 Where the step goes now, on this harness: MoE 42.9, QSA 41.8 (36.8 of it the
 indexer), deltanet 16.4, shared 5.5, sdpa 5.1, allreduce 3.8, PLE 2.8.
+
+## 4g. Stage 1: index-driven sparse expert reads work, at 1.87 ms for 48 layers
+
+`scripts/stage1_expert_gather_bw.py` plus `scripts/kernels/expert_gather_checksum.cpp`
+-- one data-movement kernel under `ttnn.generic_op`, no compute kernel, no
+semaphores -- reads only the selected experts' tiles, driven by an index tensor
+rather than host runtime args. Per device, gate|up and down summed:
+
+| K | ms/layer | 48 layers | vs dense | ideal |
+|---|----------|-----------|----------|-------|
+| 0 (launch floor) | 0.0117 | 0.56 ms | -- | -- |
+| **3** (the real per-device budget, ceil(10/4)) | **0.0390** | **1.87 ms** | 0.0274 | 0.0234 |
+| 10 | 0.1171 | 5.62 ms | 0.0823 | 0.0781 |
+| 128 (dense control) | 1.4236 | 68.33 ms | -- | -- |
+
+246-389 GB/s per device, so it is bandwidth-bound rather than sitting on the
+launch floor, and the ratio against the dense control lands within 17 % of the
+ideal fraction. The read amplification is gone.
+
+Against **30.8 ms** for the whole of `expert_ffn` today (§4e), reading just the
+bytes the routing asks for costs **1.87 ms**.
+
+The measurement is hardened, because four critics went at it before any device
+time was spent and every one of them found something:
+
+- The `ASSERT` guarding a bad expert index expands to `while (1) { ; }` under
+  WATCHER_ENABLED. The safety check would have hung the card. Clamped instead.
+- `tt::CBIndex` is declared in a header `dataflow_api.h` does not include --
+  a compile error for an enum whose values `CBFormatDescriptor` already fixes.
+- `generic_op` hashes `compile_time_args` by value but `runtime_args` only by
+  *count*, so all three K values shared one program: the sweep would have
+  measured K=3 three times and reported it as a scaling curve. `k_sel` now
+  rides along as a trailing compile-time arg.
+- `sum_data != 0` could not distinguish landed bytes from whatever L1 held.
+  The landing slots are poisoned with `0xDEADBExx` before each read, `verify()`
+  rejects that sentinel, and it now actually performs the per-device
+  disagreement check its docstring had been claiming.
+
+`sum_tid` -- every core folding `tile_id` for each page it reads, against a
+closed form the host computes independently -- matched exactly at every K, which
+is what makes "only the intended tiles were read" a measurement rather than an
+assumption.
+
+INVARIANT 37: `ttnn.generic_op` runs user kernels with no tt-metal rebuild, and
+an index tensor passed as an io_tensor keeps expert selection data-dependent
+under trace replay. Stage 1 proves the read side. What is unbuilt is stage 2:
+gate/up, SwiGLU, down, and the router weighting, on top of these reads.
+
+There is no existing ttnn op to use instead. `ttnn.gather` is element-wise --
+its device op requires output shape == index shape and its writer reads the
+whole tile row from DRAM, indexing only inside L1, which is precisely the
+amplification being removed. `ttnn.tosa_gather` is a thin wrapper over it.
+`ttnn.sparse_matmul` skips reads by a *mask*, walking E in order without
+permuting, and that is the 0.64 ms/layer path we already run.
