@@ -1922,3 +1922,48 @@ Staging, so the premise is tested before the arithmetic is built on:
    holds; if it does not, nothing further is worth building.
 2. Then gate/up + SwiGLU + down, scores applied per expert, accumulating into
    the hidden vector.
+
+## 4e. moe_compute is rejected: it is slower than what we already have
+
+The ablation harness settles it. Each part replaces one component with an
+identity of the same shape, so the delta against `none` is that component's
+device time inside the traced step and nothing else.
+
+| ablate | median | delta |
+|--------|--------|-------|
+| none | 145.66 ms | -- |
+| `expertffn` | 114.83 ms | **30.83 ms** |
+| `moe` (whole block) | 102.73 ms | **42.93 ms** |
+
+`expert_ffn` -- exactly the part `moe_compute` would replace -- costs **30.8 ms**
+for all 48 layers. `moe_compute` measured **57.7 ms** for the same work. Adopting
+it would cost us 27 ms a token.
+
+So invariant 34's arithmetic was right about the floor but wrong about who was
+far from it: at 0.64 ms/layer our `sparse_matmul` path is already ~2x better
+than ttnn's fused op, which means it is *not* reading the whole expert axis.
+The 50x figure was measured against `moe_compute`, not against us.
+
+INVARIANT 35: do not port the MoE to `ttnn.experimental.moe_compute`. It is
+2x slower than the hand-rolled `sparse_matmul` path for batch-1 decode
+(57.7 ms vs 30.8 ms per token over 48 layers). Everything in section 4c is
+still true and was worth learning -- it is simply the wrong tool at batch 1,
+being dense over the expert axis where we are not. Revisit only for prefill,
+where many rows make the dense read pay for itself.
+
+### 4e.1 MoE is 29 % of the step; the other 103 ms is where the race is
+
+The same table says the thing that matters more. The whole MoE block is 42.9 ms
+of a 145.7 ms step, so **non-MoE work is 103 ms**. Driving the MoE to *zero*
+would still leave 103 ms, against the 32.6 ms an RTX 5090 spends on an entire
+token. No MoE change alone can close that.
+
+The custom kernel is still worth it -- 30.8 ms against a 1.6 ms floor is 19x on
+the table, and it is the single largest component. But it is not sufficient, and
+anything that claims a 3x from MoE alone is arithmetically wrong.
+
+CAVEAT, unresolved: this harness's baseline is 145.66 ms, while decode was
+measured at 109.2 ms earlier in the session (§5.7 work). The two setups differ
+somehow -- harness vs engine configuration -- and the numbers must not be mixed
+until that is explained. All deltas above are internally consistent, being from
+one harness in one session.
