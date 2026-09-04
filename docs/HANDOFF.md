@@ -321,7 +321,27 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     tiny tiles -- which is why the fix there was to restructure the consumer
     instead.
 
-23. **A device call on the eager prefill path is worth ~57 us, and its size does
+23. **DRAM-sharding the weights is real, correct, and worth almost nothing
+    here.** The standard advice for decode GEMV is to hold the activation in L1
+    and width-shard the weight across the DRAM banks with
+    `MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig`. It works: the answer
+    matches the interleaved one to 3.906e-03, one ulp from the different
+    accumulation order. On this model's projections with the shipped `bfloat4_b`
+    weights it measures **1.15x / 1.00x / 1.01x** -- a wash
+    (`dram_sharded_gemv_check.py`). At `bfloat16`, four times the bytes, it does
+    better (1.06 / 0.95 / 1.23), which is the tell: these projections are 1-4 MB
+    at 4 bits and are not DRAM-bandwidth-starved, so fetching those bytes better
+    has little to recover.
+
+    Two measurement notes that matter more than the result. Timing one call at a
+    time measures **dispatch**, not the op: the same GEMVs read 0.137 ms per call
+    and 0.035-0.060 ms when a run of them is enqueued and synchronised once, and
+    inside a trace it is the latter that applies. And the projections are not
+    where decode's time is -- QSA is 3.0 ms a layer of which its four projections
+    are ~0.13 ms and SDPA plus the cache update are ~0.10; the remaining ~2.8 ms
+    is the small ops around them. Matmul tuning cannot reach that.
+
+24. **A device call on the eager prefill path is worth ~57 us, and its size does
     not matter.** Injecting a known number of ops and reading the slope gives
     90 +/- 15 us for the marginal op, and the one clean removal on record
     (`moe_chunk` 32 -> 128, 1008 calls, 918.6 -> 861.7 ms) gives 57 us for a real
