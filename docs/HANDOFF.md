@@ -2562,3 +2562,54 @@ looked: the two kernels deployed so far replaced four ops and nine.
 
 Session: **146.18 -> 96.67 ms, 1.51x**, with no precision the quality harness
 can see.
+
+### 7.2 Deployed: `_l2norm` as an RMS norm identity, no kernel needed
+
+`l2norm(x) = x * rsqrt(sum(x^2) + eps)` was five ops. An RMS norm is the same
+reduction with a mean instead of a sum, and `ttnn.rms_norm` is a real fused op:
+
+    rms_norm(x, eps/D) = x * rsqrt(sum(x^2)/D + eps/D) = sqrt(D) * l2norm(x)
+
+so `l2norm(x) = rms_norm(x, eps/D) / sqrt(D)`, and any following scalar folds
+into that one multiply -- which is why `_l2norm` now takes `scale` rather than
+letting the caller do its own. Verified in float64 against the closed form: max
+difference **5.6e-17**, so this is an identity, not an approximation.
+
+Six ops become two at the q site and five become two at the k site, twice a
+layer over 36 DeltaNet layers. **96.67 -> 96.21 ms**, quality unchanged (top-1
+85.1 %, top-5 97.9 %, NLL 0.671 against 0.675).
+
+Predicted 1.39 ms and got 0.46, which is the useful part: `ttnn.rms_norm` is not
+a 5.5 us op -- it carries its own reduction -- so replacing five cheap ops with
+one expensive one plus a multiply recovers about a third of what the op count
+suggested. Invariant 42's 5.5 us floor is a floor for *elementwise* ops, not a
+constant for every op.
+
+### 7.3 Where this is going, arithmetically
+
+Six changes deployed: the QSA selection skip (35 ms), the hc_down reduction
+shard (7.3), the gate/up dtype (2.2), the fused SwiGLU (2.3), the fused
+gate-and-average (2.7), and this (0.5). **146.18 -> 96.21 ms, 1.52x.**
+
+The target is 32.6, so 64 ms still has to come out, and the individual fusions
+are worth 0.5-3 ms each. Twenty more of them would not do it. What the numbers
+say instead:
+
+- DeltaNet issues **61 ops a layer** and measures 16.35 ms against a 12.08 ms
+  per-op floor, so ~74 % of it is the floor rather than work.
+- The whole step is ~6500 ttnn calls now. At 5.5 us that is 36 ms of floor.
+- Actual weight reading is ~11 ms.
+
+So a decode path fused down to a handful of kernels a layer would sit somewhere
+near 16-20 ms -- comfortably past the target. Fusion *can* get there, but the
+unit of work has to be a whole layer, not a chain inside one. Fusing chains one
+at a time is a 0.5-3 ms-per-kernel grind and the arithmetic says it does not
+converge in reasonable time.
+
+The other route the audit found remains open and is much cheaper: the traced
+`step_n` curve fits **t ~= 162 + 12.8k**, so **k=8 accepted tokens a step is
+33.1 ms/token with no kernel work at all**, and every fusion above shrinks the
+162 ms fixed term further. It is blocked on the trace-alternation defect in
+`ttnn_bug_report/`, whose own conclusion is "B superset of A is safe; B and A
+disagreeing about a shape is not" -- which means the ladder of capture widths is
+what breaks it, not two traces as such.
