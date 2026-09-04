@@ -356,9 +356,19 @@ def expert_ffn(
         leading unit dimensions only, so it is metadata.
         """
         a = x if kw_in["is_input_a_sparse"] is False else ttnn.repeat(x, (1, num_experts, 1, 1))
+        # `dtype=bfloat8_b` on the gate/up output. It sets two costs at once:
+        # `sparse_matmul` zero-fills its whole [1, E, M, N] output on every call
+        # regardless of the mask (handoff 5.2, 1.51 GB a token), and the SwiGLU
+        # chain then reads that output over all E. Halving the element width
+        # halves both.
+        #
+        # The precision case: this tensor is the product of bfloat4_b weights,
+        # so its low bits are already noise, and it feeds silu and a multiply
+        # rather than an accumulation. Kept only because the quality harness
+        # held -- see the commit; if it had moved, this comes straight back out.
         out = ttnn.sparse_matmul(
             a, w, program_config=sparse_program_config(m, k_in, n_out),
-            compute_kernel_config=HIFI4, **kw_in,
+            compute_kernel_config=HIFI4, dtype=ttnn.bfloat8_b, **kw_in,
         )
         return ttnn.reshape(out, (1, num_experts, m, n_out))
 
