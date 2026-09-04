@@ -93,6 +93,13 @@ def test_sharding_covers_experts_and_the_deltanet() -> None:
         "blk.0.ffn_down_exps.weight",
         # LM head, sharded by vocabulary
         "output.weight",
+        # Hyper-connection down projection, sharded on its reduction axis.
+        # [10240, 320] replicated read 3.48 MB a call at 0.1209 ms and ran 96
+        # times a token; split four ways it is 0.0445 ms including the
+        # all_reduce of the 320-wide partial, which is latency-bound at 0.0397
+        # whatever its width. `up` is the transpose and its 10240-wide output
+        # already fills the grid at 0.0157 ms, so it stays replicated.
+        "output_hc_down.weight",
         # Gated DeltaNet, sharded by head
         "blk.0.attn_qkv.weight",
         "blk.0.attn_gate.weight",

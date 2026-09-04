@@ -122,7 +122,26 @@ def gated_residual_mix(
 
     # down_w and inject_w carry the 1/hc_count factor already (folded at
     # conversion; exact, since 1/4 only shifts the block-float exponent)
-    mix = ttnn.silu(linear_rows(normed, down_w, compute_kernel_config=HIFI4))
+    #
+    # `down_w` is Shard.ROW: its 10240 of reduction is split across the four
+    # devices, so this matmul returns a *partial* sum and has to be completed
+    # before anything nonlinear touches it. The all_reduce is therefore inside
+    # the silu, not outside -- sum-then-silu and silu-then-sum are not the same
+    # function, and getting that backwards would be silently wrong rather than
+    # loud. See plan.py for why `down` is split and `up` is not: replicated it
+    # reads 3.48 MB at 0.1209 ms against 0.0445 for the split plus the
+    # collective, 11.61 -> 4.27 ms a token over its 96 calls.
+    #
+    # No model state is needed for the collective -- `TTModel.all_reduce` is this
+    # one line -- so it lives here and the nine call sites stay as they were.
+    # A ROW shard splits the weight's reduction axis, so the activation has to be
+    # split the same way -- `normed` is replicated 10240 wide and this device's
+    # `down_w` is only [2560, 320]. `mesh_partition` is the inverse of
+    # all_gather: device d keeps columns [d*2560, (d+1)*2560).
+    part = linear_rows(
+        ttnn.mesh_partition(normed, dim=-1), down_w, compute_kernel_config=HIFI4
+    )
+    mix = ttnn.silu(ttnn.all_reduce(part, cluster_axis=1, topology=ttnn.Topology.Linear))
     mix = ttnn.sigmoid(linear_rows(mix, up_w, compute_kernel_config=HIFI4))
     gated = ttnn.multiply(mix, normed)
 

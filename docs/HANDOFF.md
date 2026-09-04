@@ -2230,3 +2230,60 @@ Other findings from the audit worth having, none of them measured by me yet:
   step would be 33.1 ms/token with no kernel work at all. That is the cheapest
   path to the target on paper, and it is blocked on the trace-alternation defect
   in `ttnn_bug_report/`. Worth more than any single op here if it can be unblocked.
+
+### 5.3 Deployed: the hyper-connection down projection is a reduction shard
+
+The first fix to actually ship from section 5's reframing. `hc_*_down` is
+`[10240, 320]` in device layout -- 10240 of reduction against **10 output
+tiles** -- and it was `Shard.REPLICATE`, so all four devices read the whole
+3.48 MB and ran it 96 times a token (twice a layer inside
+`gated_residual_mix`). Measured at 0.1209 ms a call, 11.61 ms a token.
+
+Splitting the reduction four ways is the one structural fix that needed no
+kernel. `hc_down_shard_check.py`, at the real shapes and dtypes read off the
+manifest rather than guessed:
+
+| | ms/call |
+|---|---------|
+| all_reduce 32x640 | 0.0397 |
+| all_reduce 32x2560 | 0.0398 |
+| all_reduce 32x10240 | 0.0446 |
+| hc_down replicated [10240, 320] bf8 | 0.1209 |
+| hc_down K-sharded [2560, 320] bf8 | 0.0324 |
+| **K-sharded + all_reduce** | **0.0445** |
+| hc_up [320, 10240] bf8 | 0.0157 |
+| router [2560, 512] fp32 / bf16 | 0.0369 / 0.0368 |
+
+`all_reduce` is **latency-bound, not bandwidth-bound** -- 640 and 2560 wide cost
+the same -- which is what makes this pay: a quarter of the read plus one
+collective is 2.72x better than the full read.
+
+**Measured, deployed: 111.41 -> 104.10 ms** on the shipping config, and
+146.18 -> 138.94 with the selection running. Predicted 7.33, got 7.31.
+
+Quality is unchanged: 87.2 % top-1 against 83.0 before (41/47 vs 39/47 -- two
+tokens on a small sample), top-5 97.9 % both, NLL 0.682 vs 0.675, against a
+float32 reference of 80.9 % / 0.703. Same products, summed in a different order.
+
+Three things this needed that are easy to get wrong:
+
+- **The all_reduce goes inside the silu.** The matmul returns a partial sum and
+  silu is nonlinear, so sum-then-silu and silu-then-sum are different functions.
+  Getting that backwards would be silently wrong.
+- **The activation has to be split on the same axis.** `normed` is replicated
+  10240 wide; `ttnn.mesh_partition(normed, dim=-1)` gives device d its columns.
+  Without it the op refuses outright ("width=10240 height=2560"), which is the
+  good case.
+- `up` stays replicated. Its 10240-wide output already fills the grid at
+  0.0157 ms, and splitting its 320 of reduction would starve it and buy a
+  collective that costs three times the matmul.
+
+Two things this ruled out at no cost: the router's dtype (fp32 and bf16 time
+identically, so it is not bandwidth-bound and there is no reason to spend
+accuracy on it), and the shared expert's N=1 sigmoid gate, which an audit
+modelled at 3.19 ms and **measured at 1.25** -- too small to restructure.
+
+INVARIANT 41: `ttnn.all_reduce` on this box costs ~0.040 ms whatever the width,
+up to 10240. It is latency-bound, so a reduction shard pays for any weight whose
+replicated read costs more than ~0.055 ms -- and does not pay for one that is
+already wide enough to fill the grid.

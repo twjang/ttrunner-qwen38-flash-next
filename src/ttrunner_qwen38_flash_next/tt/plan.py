@@ -115,7 +115,19 @@ PLAN: tuple[TensorPlan, ...] = (
     TensorPlan(r"^blk\.\d+\.attn_(q|k)_norm\.weight$", Residency.DEVICE, "float32", Shard.REPLICATE,
                "per-head-dim norms, 256 elements each"),
     # -- hyper-connections and norms -------------------------------------------
-    TensorPlan(r"^(blk\.\d+\.hc_\w+|output_hc)_(down|up)\.weight$", Residency.DEVICE, "bfloat8_b",
+    # `down` is [10240, 320] -- 10240 of reduction against 10 output tiles, which
+    # is far too narrow to fill the grid: replicated it reads 3.48 MB a call at
+    # 0.1209 ms, and it runs 96 times a token. Splitting the reduction four ways
+    # makes each device read 0.87 MB (0.0324 ms) and the 320-wide partial costs
+    # one all_reduce, which is latency-bound at 0.0397 ms whatever its width --
+    # 0.0445 against 0.1209, so 11.61 ms a token becomes 4.27
+    # (`hc_down_shard_check.py`). Same products, summed in a different order.
+    TensorPlan(r"^(blk\.\d+\.hc_\w+|output_hc)_down\.weight$", Residency.DEVICE, "bfloat8_b",
+               Shard.ROW, "reduction split 4 ways; consumer all-reduces"),
+    # `up` is the transpose, [320, 10240], and a 10240-wide output already fills
+    # the grid -- 0.0157 ms a call. Sharding its 320 of reduction would starve it
+    # and buy an all_reduce that costs more than the matmul. Left replicated.
+    TensorPlan(r"^(blk\.\d+\.hc_\w+|output_hc)_up\.weight$", Residency.DEVICE, "bfloat8_b",
                Shard.REPLICATE),
     TensorPlan(r"^(blk\.\d+\.hc_\w+|output_hc)_(norm|inject)\.weight$", Residency.DEVICE, "float32",
                Shard.REPLICATE),

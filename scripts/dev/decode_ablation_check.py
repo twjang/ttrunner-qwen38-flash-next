@@ -59,6 +59,22 @@ elif PART == "allreduce":
 elif PART == "attn":
     model_mod.TTModel._attention_step = lambda self, mixed, *a, **kw: mixed
     model_mod.TTModel._linear_attention_step = lambda self, mixed, *a, **kw: mixed
+elif PART == "shexpgate":
+    # Only the shared expert's sigmoid gate: one [hidden, 1] linear, so N=1,
+    # one output tile column, one core running the whole K loop. The audit
+    # models it at 3.19 of shared_expert's measured 5.47 ms; this measures it.
+    _se_real = moe.shared_expert
+
+    def _se_stub(x, gate_w, up_w, down_w, gate_vec):
+        hidden = ttnn.multiply(
+            ttnn.silu(ttnn.linear(x, gate_w, compute_kernel_config=ops_HIFI4)),
+            ttnn.linear(x, up_w, compute_kernel_config=ops_HIFI4),
+        )
+        # everything the real one does except the gate column and its multiply
+        return ttnn.linear(hidden, down_w, compute_kernel_config=ops_HIFI4)
+
+    from ttrunner_qwen38_flash_next.tt.ops import HIFI4 as ops_HIFI4
+    moe.shared_expert = _se_stub
 elif PART == "grmlinear":
     # Only the two linears inside the hyper-connection mixing, keeping the norm,
     # the silu/sigmoid and the mean. Standalone those two shapes (10240x640 and

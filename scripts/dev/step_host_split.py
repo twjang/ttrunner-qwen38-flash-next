@@ -67,16 +67,7 @@ emb = med(lambda: m.embed([1000]), sync=False)
 print(f"RESULT   model.embed             {emb:7.2f} ms   (host gather from token_embd)",
       flush=True)
 
-if "ngram" in (m.bound or {}):
-    print("RESULT   ngram buffer is bound -- the PLE lookup runs every step", flush=True)
-    try:
-        ng = med(lambda: m.ngram_rows(state) if hasattr(m, "ngram_rows") else None, sync=False)
-        print(f"RESULT   ngram rows            {ng:7.2f} ms", flush=True)
-    except Exception as exc:                                        # noqa: BLE001
-        print(f"RESULT   ngram rows: {type(exc).__name__} -- name it by hand: "
-              f"{[k for k in (m.bound or {})]}", flush=True)
-else:
-    print(f"RESULT   bound buffers: {sorted((m.bound or {}).keys())}", flush=True)
+print(f"RESULT   bound buffers: {sorted((m.bound or {}).keys())}", flush=True)
 
 rope = med(lambda: m.rope([44]), sync=False)
 print(f"RESULT   model.rope              {rope:7.2f} ms   (host cos/sin build)", flush=True)
