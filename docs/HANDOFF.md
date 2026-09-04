@@ -2613,3 +2613,58 @@ The other route the audit found remains open and is much cheaper: the traced
 `ttnn_bug_report/`, whose own conclusion is "B superset of A is safe; B and A
 disagreeing about a shape is not" -- which means the ladder of capture widths is
 what breaks it, not two traces as such.
+
+## 8. The measurement that reframes the target: traced `step_n(8)` is 22.71 ms/token
+
+`scripts/dev/step_n_traced_curve.py`, one trace per k so the alternation defect
+is never touched, below `indexer_budget` where the selection is off (and where
+`step_n` is willing to run at all):
+
+| k | ms a step | **ms a token** |
+|---|----------:|---------------:|
+| 1 | 95.09 | 95.09 |
+| 2 | 123.08 | 61.54 |
+| 4 | 142.71 | **35.68** |
+| 8 | 181.66 | **22.71** |
+
+Fit: **t ~= 82.7 + 12.37k**. The audit predicted `162 + 12.8k`; the slope was
+right and the fixed term is now half what it was, because the six deployed
+optimisations shrank exactly that part.
+
+**k=8 is 22.71 ms a token, 1.4x past the 32.6 ms target. k=4 is 35.68, already
+within 10 %.** No kernel work is involved -- the marginal cost of a token is
+12.37 ms and everything else is a per-step fixed cost that 32 empty tile rows
+are paying for.
+
+This says plainly what the fusion grind could not: the gap is not work, it is
+occupancy. Every fusion so far helps twice over, because it comes off the fixed
+term and is then amortised k ways.
+
+### 8.1 What stands between this and shipping it
+
+Speculation needs the state to advance by the number of tokens actually
+*accepted*, and one captured trace advances by exactly k. Two widths would be
+the obvious answer and are the one thing that provokes the hang -- the bug
+report's own conclusion is "B superset of A is safe; B and A disagreeing about a
+shape is not", and two widths differ in shape.
+
+So the width has to stay fixed and the *advance* has to become data. Sketch,
+to be measured rather than believed:
+
+- The DeltaNet recurrence is `state = state * g + k^T delta`. Setting `g = 1`
+  and `delta = 0` for a rejected position makes that step the identity, and both
+  come from tensors (`g_exp`, `beta`) that are already bound buffers refreshed
+  before each replay. An accept mask multiplied into them is **data, not shape**,
+  so one capture serves every acceptance count.
+- The QSA K/V cache is positional, so rejected writes land at indices the next
+  round overwrites. Nothing to undo.
+- The **conv ring is the open problem**: `_causal_conv_step` shifts a column in
+  per token, and a rejected token still pollutes the window. Either the shift
+  has to become maskable the same way, or the ring has to be restored -- and at
+  batch 1 the recurrent state plus rings is small enough (~112 MB) that a
+  snapshot/restore is ~0.3 ms, which is affordable against a 181 ms verify.
+
+INVARIANT 48: the decode step costs `82.7 + 12.37k` ms for k tokens, so at batch
+1 roughly 87 % of it is fixed cost paid for one token. Speculation is worth more
+than any fusion on this list, and the two compound: fusion shrinks the fixed
+term, speculation divides it.
