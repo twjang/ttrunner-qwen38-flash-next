@@ -6,14 +6,12 @@
 // 30.8 for the whole of expert_ffn today. This is the same reader with the
 // checksum replaced by a write, which is the part that makes it usable.
 //
-// What it buys, and why it beats writing a full fused MoE kernel: once the
-// weights of the K_SEL selected experts sit in a compact [1, K_SEL, K, N]
-// tensor, the arithmetic is an ordinary dense batched `ttnn.matmul` over an
-// expert axis of K_SEL instead of E. That removes three things at once --
-// `sparse_matmul`'s unconditional zero-fill of a [1, E, M, N] output
-// (1.51 GB/token, handoff 5.2), the SwiGLU chain running over tensors that are
-// 97 % zeros (6.83 ms, handoff 5.4), and the sparse op itself -- without anyone
-// having to write a matmul kernel.
+// What it buys: once the K_SEL selected experts sit side by side in one wide
+// [K, K_SEL*N] tensor, the arithmetic is a single ordinary `ttnn.linear`. That
+// removes four things at once -- `sparse_matmul`'s unconditional zero-fill of a
+// [1, E, M, N] output (1.51 GB/token, handoff 5.2), the SwiGLU chain running
+// over tensors that are 97 % zeros (handoff 5.4), the sparse op itself, and the
+// separate combine -- without anyone having to write a matmul kernel.
 //
 // Why the indices come from a tensor: a captured trace freezes the dispatch
 // commands and therefore the runtime args, but not tensor CONTENTS. Reading the
@@ -25,13 +23,24 @@
 //
 //   src(slot, t) = idx[slot] * TILES_PER_EXPERT + t
 //
-// Destination tile, in the compact [1, K_SEL, K, N] output: the work index
-// itself, because the output's expert axis is the slot axis --
+// Destination tile. The compact form would be [1, K_SEL, K, N] and `dst = w`,
+// but that is not the layout worth having: a batched matmul over K_SEL experts
+// at M=1 still cannot fill the core grid, and stage 2 measured it *slower* than
+// the sparse matmul it replaces (0.382 ms against 0.321).
 //
-//   dst(slot, t) = slot * TILES_PER_EXPERT + t = w
+// Concatenating the experts on the **output** axis instead gives one wide
+// [K, K_SEL*N] matmul -- the shape attn_qkv already runs at 128 GB/s -- and it
+// measures 0.0479 ms against 0.321. So with `t = kt * NT + nt`:
 //
-// so the gather is a permutation of whole expert slabs and needs no shuffling
-// within one.
+//   dst(slot, t) = kt * (K_SEL * NT) + slot * NT + nt
+//
+// The down projection wants the other concatenation, on its *input* axis:
+// [K_SEL*N, K], so that the matmul sums over the experts -- which is the
+// combine, for free. Stacking [N, K] slabs on rows is exactly `dst = w`, the
+// straightforward compact layout, so one flag covers both:
+//
+//   WIDE=1 (gate/up):  dst = kt * (K_SEL * NT) + slot * NT + nt
+//   WIDE=0 (down):     dst = w
 //
 // Positional compile-time args, in the order the host appends them:
 //   0: TILES_PER_EXPERT   (Kt*Nt)
@@ -39,10 +48,13 @@
 //   2: READ_BATCH         (tiles in flight between barriers)
 //   3: IDX_PAGE_BYTES     (aligned page size of the index tensor)
 //   4: NUM_EXPERTS        (experts_per_device -- bounds clamp only)
-//   5: K_SEL              (selection width; here only to separate program-cache
-//                          entries, since generic_op hashes compile-time args by
-//                          value but runtime args only by count -- handoff 4g)
-//   6..: TensorAccessorArgs for weights, then indices, then output
+//   5: K_SEL              (selection width; also separates program-cache entries,
+//                          since generic_op hashes compile-time args by value but
+//                          runtime args only by count -- handoff 4g)
+//   6: NT                 (tiles across one expert's output, N/32)
+//   7: WIDE               (1: concatenate on the output axis, for gate/up;
+//                          0: stack on rows, for the down projection)
+//   8..: TensorAccessorArgs for weights, then indices, then output
 //
 // Per-core runtime args:
 //   0: weights.buffer_address()
@@ -60,6 +72,10 @@ void kernel_main() {
     constexpr uint32_t READ_BATCH = get_compile_time_arg_val(2);
     constexpr uint32_t IDX_PAGE_BYTES = get_compile_time_arg_val(3);
     constexpr uint32_t NUM_EXPERTS = get_compile_time_arg_val(4);
+    constexpr uint32_t K_SEL = get_compile_time_arg_val(5);
+    constexpr uint32_t NT = get_compile_time_arg_val(6);
+    constexpr uint32_t WIDE = get_compile_time_arg_val(7);
+    constexpr uint32_t OUT_ROW_TILES = K_SEL * NT;
 
     static_assert(TILES_PER_EXPERT > 0, "TILES_PER_EXPERT must be non-zero");
     static_assert(TILE_BYTES % 64 == 0, "tile pages must be a multiple of DRAM_ALIGNMENT(64)");
@@ -74,7 +90,7 @@ void kernel_main() {
     const uint32_t work_lo = get_arg_val<uint32_t>(3);
     const uint32_t work_hi = get_arg_val<uint32_t>(4);
 
-    constexpr auto w_ta = TensorAccessorArgs<6>();
+    constexpr auto w_ta = TensorAccessorArgs<8>();
     const auto w_acc = TensorAccessor(w_ta, w_addr);
     constexpr auto i_ta = TensorAccessorArgs<w_ta.next_compile_time_args_offset()>();
     const auto i_acc = TensorAccessor(i_ta, idx_addr);
@@ -110,8 +126,8 @@ void kernel_main() {
         }
 
         uint32_t src = safe_id * TILES_PER_EXPERT + t;
-        uint32_t dst = w;
         const uint32_t end = src + run;
+        uint32_t tt = t;                   // tile index within this expert
         while (src < end) {
             uint32_t batch = end - src;
             if (batch > READ_BATCH) {
@@ -122,12 +138,23 @@ void kernel_main() {
             }
             noc_async_read_barrier();
             for (uint32_t i = 0; i < batch; ++i) {
-                noc_async_write_page(dst + i, o_acc, w_l1 + i * TILE_BYTES);
+                // t = kt * NT + nt, and the wide output puts expert `slot`'s
+                // columns at offset slot * NT within a row of OUT_ROW_TILES.
+                const uint32_t ti = tt + i;
+                uint32_t dst;
+                if (WIDE) {
+                    const uint32_t kt = ti / NT;
+                    const uint32_t nt = ti - kt * NT;
+                    dst = kt * OUT_ROW_TILES + slot * NT + nt;
+                } else {
+                    dst = slot * TILES_PER_EXPERT + ti;
+                }
+                noc_async_write_page(dst, o_acc, w_l1 + i * TILE_BYTES);
             }
             // The write must land before the next batch overwrites the same L1.
             noc_async_write_barrier();
             src += batch;
-            dst += batch;
+            tt += batch;
         }
         w += run;
     }

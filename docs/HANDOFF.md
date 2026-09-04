@@ -2878,3 +2878,43 @@ possible". At k=6 nine of seventeen rounds accept everything; at k=8 the same
 drafter earns the same 4.00 tokens a round while every rejection costs a wider
 verify. Sweep it against the actual drafter rather than assuming bigger is
 better.
+
+## 10. The MoE wall breaks: gather the experts side by side, one wide matmul
+
+Stage 2 concluded that gather-then-dense was a regression, and that was true of
+the layout it tried. Gathering into `[1, K_SEL, K, N]` gives a *batched* matmul
+over K_SEL, and at M=1 that still cannot fill the core grid: 0.382 ms against
+0.321 for the sparse matmul it would replace (invariant 44).
+
+Concatenating the selected experts on the **output axis** instead gives one wide
+`[K, K_SEL*N]` matmul -- the same shape as `attn_qkv`, which runs at 128 GB/s --
+and that changes the answer completely. Measured on the real layer-0
+`ffn_gateup_exps`, K_SEL=3 (the per-device budget, ceil(10/4)):
+
+| | ms a layer | over 48 layers |
+|---|----------:|---------------:|
+| gather (bit-exact against torch, **0.000e+00**) | 0.0465 | 2.23 |
+| one wide matmul `[2560, 3x1280]` | 0.0478 | 2.29 |
+| **gather + matmul** | **0.0933** | **4.48** |
+| `expert_ffn` today, both projections | -- | **30.83** |
+
+And the down projection wants the *other* concatenation, on its input axis:
+`[K_SEL*N, K]`, so that the matmul **sums over the experts** -- which is the
+combine, for free. Stacking `[N, K]` slabs on rows is exactly the straightforward
+`dst = w`, so one `WIDE` compile-time flag covers both layouts in the same
+kernel. Priced separately at 0.0411 ms a layer.
+
+So the whole MoE becomes: gather gate|up, one wide matmul, SwiGLU over a
+`[1, 1, 1, K_SEL*2N]` tensor instead of `[1, 128, 1, 1280]`, scale by the router
+weights, gather down, one wide matmul that also combines. Roughly **9 ms a token
+against the ~40 that `expert_ffn` plus its SwiGLU chain plus `_combine` cost
+now**, and it removes the 1.51 GB zero-fill (invariant 40) on the way.
+
+INVARIANT 52: at M=1 the layout of a gather decides whether it is worth doing.
+The same bytes, gathered into an expert *batch*, lose to `sparse_matmul`;
+gathered side by side into one wide matrix, they beat it by 7x. Width is what
+fills the grid, and an expert axis is not width.
+
+Not yet wired into `expert_ffn`: the down-projection gather, the router scaling
+between the two matmuls, and removing `_combine`. The kernel supports both
+layouts and is bit-exact; what remains is the plumbing.

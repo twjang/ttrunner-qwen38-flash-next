@@ -37,7 +37,7 @@ from ttrunner_qwen38_flash_next.tt.weights import TTWeights          # noqa: E40
 
 KERNEL = str(Path(__file__).resolve().parent / "kernels" / "expert_gather.cpp")
 IDX_LEN = 128          # index page width in uint32 -> 512 B
-K_SEL = 10             # worst case: all ten routed experts on one device
+K_SEL = 3              # the real per-device budget, ceil(10/4)
 READ_BATCH = 8
 
 
@@ -49,7 +49,7 @@ def split_work(total: int, n: int):
     return [((total * c) // n, (total * (c + 1)) // n) for c in range(n)]
 
 
-def build_gather(weights, indices, out, grid, k_sel: int):
+def build_gather(weights, indices, out, grid, k_sel: int, wide: bool = True):
     cores = core_list(grid)
     crs = ttnn.CoreRangeSet(
         [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
@@ -83,11 +83,11 @@ def build_gather(weights, indices, out, grid, k_sel: int):
             buffer_index=1, data_format=ttnn.uint32, page_size=64)],
     )
 
-    # 0..4 then K_SEL at 5, so the kernel's TensorAccessorArgs<6> lands right.
+    # 0..4, then K_SEL, NT and WIDE, so the kernel's TensorAccessorArgs<8> lands right.
     # K_SEL also separates program-cache entries: generic_op hashes compile-time
     # args by value but runtime args only by count (handoff 4g).
     ct_args = [tiles_per_expert, tile_bytes, READ_BATCH, idx_bytes,
-               weights.shape[1], k_sel]
+               weights.shape[1], k_sel, nt, 1 if wide else 0]
     ct_args += accessors["w"] + accessors["i"] + accessors["o"]
 
     addrs = (weights.buffer_address(), indices.buffer_address(), out.buffer_address())
@@ -128,7 +128,9 @@ def main() -> None:
         idx_dev = ttnn.from_torch(host_idx, dtype=ttnn.uint32,
                                   layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh,
                                   mesh_mapper=replicate)
-        gathered = ttnn.from_torch(torch.zeros(1, K_SEL, K, N), dtype=w.dtype,
+        # Wide, not compact: the experts sit side by side on the output axis so
+        # one `ttnn.linear` covers all of them (see the kernel header).
+        gathered = ttnn.from_torch(torch.zeros(1, 1, K, K_SEL * N), dtype=w.dtype,
                                    layout=ttnn.TILE_LAYOUT, device=mesh,
                                    mesh_mapper=replicate)
 
@@ -139,7 +141,7 @@ def main() -> None:
         ttnn.synchronize_device(mesh)
         got = ttnn.to_torch(gathered, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
         ref_full = ttnn.to_torch(w, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
-        want = ref_full[:, ids, :, :]
+        want = torch.cat([ref_full[:, e, :, :] for e in ids], dim=-1).unsqueeze(1)
         err = (got.to(torch.float64) - want.to(torch.float64)).abs().max().item()
         print(f"RESULT gather vs torch index: max abs err {err:.3e} "
               f"{'EXACT' if err == 0.0 else 'MISMATCH'}", flush=True)
@@ -149,7 +151,6 @@ def main() -> None:
         # --- the two paths ---------------------------------------------------
         x1 = ttnn.from_torch(torch.randn(1, 1, 1, K) * 0.05, dtype=ttnn.bfloat16,
                              layout=ttnn.TILE_LAYOUT, device=mesh, mesh_mapper=replicate)
-        xk = ttnn.repeat(x1, (1, K_SEL, 1, 1))
         xe = ttnn.repeat(x1, (1, E, 1, 1))
         spars = ttnn.from_torch(torch.zeros(1, 1, 1, E), dtype=ttnn.bfloat16,
                                 layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh,
@@ -176,11 +177,12 @@ def main() -> None:
             return ms
 
         g = timed(lambda: ttnn.generic_op([w, idx_dev, gathered], prog), "gather only")
-        mm = timed(lambda: ttnn.matmul(xk, gathered), f"dense matmul over K_SEL={K_SEL}")
+        mm = timed(lambda: ttnn.linear(x1, gathered),
+                   f"one wide matmul [{K}, {K_SEL}x{N}]")
 
         def both():
             ttnn.generic_op([w, idx_dev, gathered], prog)
-            return ttnn.matmul(xk, gathered)
+            return ttnn.linear(x1, gathered)
 
         tot = timed(both, "gather + dense matmul")
 
