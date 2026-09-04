@@ -2833,3 +2833,48 @@ to have advanced j+1, and j is only known after the step runs. So a partial
 acceptance costs either two verifies or per-step state saved in-graph. Do not
 "fix" it by drafting harder: a rejected draft is strictly worse than no draft,
 because no draft can use the single masked advance.
+
+### 9.2 k=6 is the optimum, and what the 54.79 ms actually means
+
+Swept on the same 64-token generation:
+
+| k | ms a token | tokens a round | acceptance |
+|---|-----------:|---------------:|------------|
+| 4 | 63.58 | 2.44 | `{0:14, 3:13}` |
+| 5 | 54.95 | 3.00 | `{0:11, 4:11}` |
+| **6** | **54.79** | **4.00** | `{0:5, 1:2, 4:1, 5:9}` |
+| 7 | 67.64 | 3.76 | `{0:7, 2:1, 3:2, 4:1, 5:1, 6:5}` |
+| 8 | 67.53 | 4.00 | `{0:7, 2:3, 4:1, 6:1, 7:5}` |
+
+k=6 wins because nine of seventeen rounds accept *everything* -- a full
+acceptance is one verify for six tokens, where a partial is two verifies for
+fewer. The optimum is where the drafter's reach and the verify width meet, and
+past it the extra width buys rejections rather than tokens.
+
+Making the drafter prefer the **longest** context match rather than the most
+recent 3-gram measured neutral here (54.79 against 54.94, identical histogram),
+because a prompt that quotes itself makes the 3-gram unambiguous. Kept anyway:
+it is the better bet in general and costs only host-side scanning against a
+~187 ms verify.
+
+**The honest caveat, and it matters more than the number.** This benchmark's
+prompt quotes itself, which is exactly the case `prompt_lookup_draft` is built
+for -- the drafter's own docstring says it "earns 1.7-2.1x on prompts that quote
+their context and nothing at all on open prose". So **54.79 ms a token is the
+favourable case, and the general-text number is the plain step's 96.21.**
+
+That splits the remaining work cleanly:
+
+- For text that repeats, the ceiling is the second verify on a partial
+  acceptance: one verify a round would be ~46.7 ms at k=6. The design is in 9.1
+  and is the last piece of machinery.
+- For text that does not, speculation contributes nothing and the only lever is
+  the plain step -- which is fusion, and the untouched chains are DeltaNet
+  (2196 calls a token, 61 a layer, ~74 % of its 16.35 ms is per-op floor) and
+  QSA (1260 calls).
+
+INVARIANT 51: the speculation width has an optimum and it is not "as large as
+possible". At k=6 nine of seventeen rounds accept everything; at k=8 the same
+drafter earns the same 4.00 tokens a round while every rejection costs a wider
+verify. Sweep it against the actual drafter rather than assuming bigger is
+better.

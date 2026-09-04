@@ -47,7 +47,24 @@ class _Sequence:
 
 
 def prompt_lookup_draft(
-    context: list[int], k: int, ngram: int = 3
+    context: list[int], k: int, ngram: int = 3, longest: int = 6
+) -> list[int] | None:
+    """Longest match first, falling back to shorter ones.
+
+    A longer context match is a better predictor, and trying `longest` down to
+    `ngram` costs only host-side scanning -- which is free next to a ~187 ms
+    verify. The single-length version took the most *recent* 3-gram match
+    instead, which is a different and weaker bet.
+    """
+    for n in range(longest, ngram - 1, -1):
+        got = _lookup_at(context, k, n)
+        if got is not None:
+            return got
+    return None
+
+
+def _lookup_at(
+    context: list[int], k: int, ngram: int
 ) -> list[int] | None:
     """The `k` tokens that followed the last earlier occurrence of the last
     `ngram` tokens, or None if there is no earlier occurrence with k to spare.
