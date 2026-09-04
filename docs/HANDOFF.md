@@ -415,7 +415,36 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
     7.4e-03 and HiFi3/HiFi4 4.0e-03. Blanket HiFi4 costs nothing and buys
     accuracy, which is the right default and now a measured one.
 
-27. **A device call on the eager prefill path is worth ~57 us, and its size does
+27. **The bandwidth is being used; it is being used on an output nobody wants.**
+    The arithmetic that exposes this: four p150a have aggregate DRAM bandwidth in
+    a top consumer GPU's class, and a decode step genuinely needs ~1 GB per
+    device -- the dense projections plus the ~11.5 experts of 512 that routing
+    selects. At the 273-393 GB/s these boards demonstrably stream that is a couple
+    of milliseconds. The step takes 173.
+
+    `sparse_matmul_reads_check.py` locates the gap. Holding the weight fixed and
+    varying only the mask's non-zero count on the down projection:
+
+        nnz      1      2      8     32    128    512
+        ms   1.052  1.052  1.060  1.092  1.222  1.743
+
+    The sparsity is doing something -- 512 non-zeros cost 1.66x what 1 does -- but
+    it sits on a **1.05 ms floor that does not depend on the mask at all**, where
+    a single expert needs 0.23 MB of the 118 MB present.
+
+    That floor is the *output*. The op's contract is `[1, E, M, K]`, so it writes
+    512 slots x 32 padded rows x 2560 = **84 MB a layer**, of which the ~11.5
+    selected experts at one real row are 59 KB -- a factor of ~1400. 84 MB /
+    1.05 ms is 80 GB/s, which is write bandwidth being spent in full, and 48
+    layers of it is the 51.7 ms the ablation attributes to the down projection.
+
+    So the machine is not slow and the bandwidth is not idle. Decode writes 4 GB
+    per token per device to carry 3 MB of answer. `_combine` (`022`) fixed the
+    *consumer* of that tensor; the producer still writes all of it, and the only
+    lever that shrinks it is fewer experts per device -- expert-axis sharding,
+    priced at 2.06x on the two matmuls in `022` and blocked on a cache rebuild.
+
+28. **A device call on the eager prefill path is worth ~57 us, and its size does
     not matter.** Injecting a known number of ops and reading the slope gives
     90 +/- 15 us for the marginal op, and the one clean removal on record
     (`moe_chunk` 32 -> 128, 1008 calls, 918.6 -> 861.7 ms) gives 57 us for a real
