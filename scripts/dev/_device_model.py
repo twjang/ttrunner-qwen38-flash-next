@@ -2,8 +2,8 @@
 
 Paths come from the environment so nothing about a machine is hard-coded:
 
-    TWTEST_GGUF_DIR   directory with the UD-IQ4_XS shards   (default ~/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS)
-    TWTEST_TT_CACHE   the converted device-weight cache      (default ~/models/qwen38-tt-cache)
+    TTRUNNER_GGUF_DIR   directory with the UD-IQ4_XS shards   (default ~/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS)
+    TTRUNNER_TT_CACHE   the converted device-weight cache      (default ~/models/qwen38-tt-cache)
 """
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ from ttrunner_qwen38_flash_next.tt.model import TTModel
 from ttrunner_qwen38_flash_next.tt.weights import TTWeights
 
 GGUF_DIR = os.environ.get(
-    "TWTEST_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS")
+    "TTRUNNER_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS")
 )
-TT_CACHE = os.environ.get("TWTEST_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
+TT_CACHE = os.environ.get("TTRUNNER_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
 
 
 def open_model(max_seq_len: int = 512, preload: bool = True, trace_region_bytes: int | None = None,
@@ -47,15 +47,15 @@ def open_model(max_seq_len: int = 512, preload: bool = True, trace_region_bytes:
     cfg = Qwen4ExpConfig.from_gguf(gguf.metadata)
     host = WeightStore(gguf, cache_bytes=2 << 30, row_cache_bytes=8 << 30)
     w = TTWeights(TT_CACHE, mesh)
-    # TWTEST_SDPA_K overrides the decode attention's k_chunk_size. It is the
+    # TTRUNNER_SDPA_K overrides the decode attention's k_chunk_size. It is the
     # accumulation width of the online softmax over the K/V cache, and the
     # handoff already records that it changes the answer.
     kchunk = sdpa_k_chunk if sdpa_k_chunk is not None else (
-        int(os.environ["TWTEST_SDPA_K"]) if "TWTEST_SDPA_K" in os.environ else None)
+        int(os.environ["TTRUNNER_SDPA_K"]) if "TTRUNNER_SDPA_K" in os.environ else None)
     extra = {} if kchunk is None else {"sdpa_k_chunk": kchunk}
-    # TWTEST_PIN_SDPA=1 restores the pinned decode program config that caused the
+    # TTRUNNER_PIN_SDPA=1 restores the pinned decode program config that caused the
     # context collapse, so the fix can be A/B'd.
-    if os.environ.get("TWTEST_PIN_SDPA"):
+    if os.environ.get("TTRUNNER_PIN_SDPA"):
         extra["pin_sdpa_config"] = True
     model = TTModel(cfg, w, host, mesh, max_seq_len=max_seq_len, traceable_kv=True, **extra)
     model.fuse_expert_gate_up = "blk.0.ffn_gateup_exps.weight" in w
@@ -81,11 +81,11 @@ def synthetic_prompt(n: int) -> list[int]:
 
 
 def tokenizer(cfg):
-    """The real tokenizer, from TWTEST_TOKENIZER (default ~/models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json)."""
+    """The real tokenizer, from TTRUNNER_TOKENIZER (default ~/models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json)."""
     from ttrunner_qwen38_flash_next.reference.tokenizer import Qwen4ExpTokenizer
 
     path = os.environ.get(
-        "TWTEST_TOKENIZER",
+        "TTRUNNER_TOKENIZER",
         str(Path.home() / "models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json"),
     )
     return Qwen4ExpTokenizer(

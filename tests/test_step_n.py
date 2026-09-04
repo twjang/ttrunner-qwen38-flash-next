@@ -137,4 +137,4 @@ def test_step_n_refuses_k_past_one_tile_of_rows() -> None:
 
     src = inspect.getsource(TTModel.step_n)
     assert "else 32" in src, "the guard must stop at one tile of rows by default"
-    assert "TWTEST_ALLOW_WIDE_STEP_N" in src, "with a documented escape for investigation"
+    assert "TTRUNNER_ALLOW_WIDE_STEP_N" in src, "with a documented escape for investigation"

@@ -43,7 +43,7 @@ Stages:
                  (differing count, differing binaries) hangs, so those two
                  cannot separate count from binary residency. This can: if it
                  hangs, program count is implicated; if it does not, the count
-                 is not the trigger on its own. TWTEST_NEW_KERNEL=1 makes the
+                 is not the trigger on its own. TTRUNNER_NEW_KERNEL=1 makes the
                  extra op one the model never uses, so the second trace carries a
                  kernel binary the first does not -- count moves by one either
                  way, and only the binary set differs between the two runs. That
@@ -97,17 +97,17 @@ if STAGE not in STAGES:
 # hung run's last line is an allocation warning, so headroom is a variable, not
 # a detail. 24.94 GB of weights leaves ~7 GB, and two trace regions plus a
 # 4x-larger K/V compete for it.
-SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "512"))
-# TWTEST_TRACE_REGION_MB mirrors what `TTEngine` passes and no harness ever has:
+SEQ = int(os.environ.get("TTRUNNER_MAX_SEQ", "512"))
+# TTRUNNER_TRACE_REGION_MB mirrors what `TTEngine` passes and no harness ever has:
 # the engine opens its mesh with `trace_region_size=(len(widths) + 1) * 128 MB`
 # -- 256 MB at speculate=2 -- while `open_model` passes nothing and takes ttnn's
 # default. Unset means the default, i.e. what the working harnesses do.
-REGION = os.environ.get("TWTEST_TRACE_REGION_MB")
+REGION = os.environ.get("TTRUNNER_TRACE_REGION_MB")
 region = int(REGION) * (1 << 20) if REGION else None
 print(f"RESULT stage {STAGE} k={K} max_seq_len {SEQ} "
       f"trace_region {REGION + ' MB' if REGION else 'default'}", flush=True)
-# TWTEST_STEPN_CQ=1 puts the step_n capture on its own command queue.
-STEPN_CQ = int(os.environ.get("TWTEST_STEPN_CQ", "0"))
+# TTRUNNER_STEPN_CQ=1 puts the step_n capture on its own command queue.
+STEPN_CQ = int(os.environ.get("TTRUNNER_STEPN_CQ", "0"))
 mesh, cfg, m = open_model(
     max_seq_len=SEQ, trace_region_bytes=region,
     num_command_queues=2 if STEPN_CQ else None,
@@ -169,11 +169,11 @@ def verify_cq():
     dec.reset()
     rewind(st)
     # warm through the *decoder's trace*, so both traces have run this round --
-    # the interleaving that hangs on one queue. TWTEST_NO_DEC_REPLAY=1 warms
+    # the interleaving that hangs on one queue. TTRUNNER_NO_DEC_REPLAY=1 warms
     # eagerly instead: the control that says whether this harness can produce a
     # MATCH at all, since the interleaved flow either hangs (cq 0) or comes back
     # wrong (cq 1) and neither proves the fixture is sound.
-    if os.environ.get("TWTEST_NO_DEC_REPLAY"):
+    if os.environ.get("TTRUNNER_NO_DEC_REPLAY"):
         print("RESULT warming eagerly (no decoder replay) -- control", flush=True)
         for t in prompt[:8]:
             m.step([t], st)
@@ -202,19 +202,19 @@ def two_stepn():
         m.step([t], st)
     print("RESULT capturing step_n k=2", flush=True)
     a = TracedStepN(m, st, 2)
-    k2 = int(os.environ.get("TWTEST_SECOND_K", "4"))
+    k2 = int(os.environ.get("TTRUNNER_SECOND_K", "4"))
     print(f"RESULT capturing step_n k={k2}", flush=True)
     b = TracedStepN(m, st, k2)
     print("RESULT both captured; replaying k=2", flush=True)
     a.step_n(toks[8:10])
-    if os.environ.get("TWTEST_RESET_STALL"):
+    if os.environ.get("TTRUNNER_RESET_STALL"):
         # `enqueue_trace` takes per-sub-device ownership and updates worker state
         # indexed by sub-device, so anything that resets that grouping between
         # replays is worth one try before concluding there is no host-side fix.
         print("RESULT reset_sub_device_stall_group between the replays", flush=True)
         mesh.reset_sub_device_stall_group()
         ttnn.synchronize_device(mesh)
-    if os.environ.get("TWTEST_EAGER_BETWEEN"):
+    if os.environ.get("TTRUNNER_EAGER_BETWEEN"):
         # The mechanism says the *host* launch-message pointer is left at the
         # executed trace's program count while the next trace was recorded
         # against zero. Ordinary (non-trace) dispatch maintains those pointers
@@ -266,7 +266,7 @@ def plus_one():
     for t in toks[:8]:
         m.step([t], st)
     warm = [1000] * K
-    extra = "atan (new kernel)" if os.environ.get("TWTEST_NEW_KERNEL") else "add (existing kernel)"
+    extra = "atan (new kernel)" if os.environ.get("TTRUNNER_NEW_KERNEL") else "add (existing kernel)"
     print(f"RESULT extra op in B: {extra}", flush=True)
     print(f"RESULT capturing A: step_n k={K}", flush=True)
     a = TracedStepN(m, st, K)
@@ -285,7 +285,7 @@ def plus_one():
     # binary that is not already in the program cache ("Cannot load new binaries
     # during trace capture"). So the binary is resident for both traces; only
     # trace B *references* it, which is the difference under test.
-    if os.environ.get("TWTEST_NEW_KERNEL"):
+    if os.environ.get("TTRUNNER_NEW_KERNEL"):
         ttnn.atan(pad)
     else:
         ttnn.add(pad, pad)
@@ -294,13 +294,13 @@ def plus_one():
     try:
         tid = ttnn.begin_trace_capture(mesh, cq_id=0)
         m.step_n(warm, st)
-        # TWTEST_EXTRA_OPS=N appends N ops instead of one, so the two traces'
+        # TTRUNNER_EXTRA_OPS=N appends N ops instead of one, so the two traces'
         # program counts differ by a lot while B still contains A's programs
         # unchanged. If that alternates cleanly, appending is safe at any size
         # and the trigger really is *re-shaping* an operation, not the delta.
-        for _ in range(int(os.environ.get("TWTEST_EXTRA_OPS", "0"))):
+        for _ in range(int(os.environ.get("TTRUNNER_EXTRA_OPS", "0"))):
             ttnn.add(pad, pad)
-        if os.environ.get("TWTEST_NEW_KERNEL"):
+        if os.environ.get("TTRUNNER_NEW_KERNEL"):
             ttnn.atan(pad)                       # +1 program, and a *new* binary
         else:
             ttnn.add(pad, pad)                   # +1 program, kernel already present
@@ -381,11 +381,11 @@ def work():
             print("RESULT replaying the decoder (both traces live)", flush=True)
             dec.step([1000])
             print("RESULT decoder replayed", flush=True)
-            # TWTEST_SYNC_BETWEEN=1: does a device sync between the two replays
+            # TTRUNNER_SYNC_BETWEEN=1: does a device sync between the two replays
             # clear it? Both `execute_trace` calls are already blocking=True on
             # cq 0, so if this helps, "blocking" is not settling what the next
             # trace needs settled.
-            if os.environ.get("TWTEST_SYNC_BETWEEN"):
+            if os.environ.get("TTRUNNER_SYNC_BETWEEN"):
                 print("RESULT synchronizing between the replays", flush=True)
                 ttnn.synchronize_device(mesh)
             print("RESULT replaying step_n (both traces live)  <-- the stack dump's line",

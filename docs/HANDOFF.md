@@ -122,7 +122,7 @@ uv run python scripts/dev/prefill_bisect.py 4    # ~3 min
   cache in `~/models/qwen38-tt-cache` (130 GB, per-device `.tensorbin` files,
   includes the prebuilt fused `blk.N.ffn_gateup_exps.weight`). MTP head:
   `~/models/Qwen3.8-Flash-Next-GGUF/MTP/*.gguf`. Override with
-  `TWTEST_GGUF_DIR` / `TWTEST_TT_CACHE`.
+  `TTRUNNER_GGUF_DIR` / `TTRUNNER_TT_CACHE`.
 * Opening the mesh + loading all weights ≈ 90 s. One eager step ≈ 0.5 s. A
   traced step ≈ 0.23 s after ~40 s of warmup/compile. The CPU reference is
   minutes per token — use it for a handful of tokens only.
@@ -449,7 +449,7 @@ here runs at `max_seq_len=512`, where the selection is **off**, so the branch
 that hands `paged_scaled_dot_product_attention_decode` an `attn_mask` was
 untested until it was run deliberately at 8192.
 
-The engine row is `speculation_check.py` with `TWTEST_SPEC_ONLY=0`, and it
+The engine row is `speculation_check.py` with `TTRUNNER_SPEC_ONLY=0`, and it
 covers the paged *decode* path end to end. Chunked prefill is off in that
 configuration, so the MoE routing/compute split (5.7) is covered by
 `device_quality --prefill`, not by this.
@@ -634,7 +634,7 @@ the experts are reached. Splitting `expert_ffn` into 32-row groups to keep
 
 `step_n` exists to reproduce k sequential steps *exactly*, so a path that cannot
 is no use to it whatever the cause. Nothing needs k > 32 -- speculation caps its
-widths at 17 -- so it refuses, with `TWTEST_ALLOW_WIDE_STEP_N=1` to lift the cap
+widths at 17 -- so it refuses, with `TTRUNNER_ALLOW_WIDE_STEP_N=1` to lift the cap
 for investigation.
 
 One row tile turns out to be the reproducibility boundary throughout: it caps
@@ -680,7 +680,7 @@ above make affordable.
 
 Built end to end and opt-in via `TTEngine(speculate=k)`, where k is the tokens a
 verify *feeds* and it drafts `k - 1`. `docs/iterations/016` has the iteration and
-`018` the diagnosis. Set `TWTEST_ALLOW_SPECULATION=1` to lift the refusal.
+`018` the diagnosis. Set `TTRUNNER_ALLOW_SPECULATION=1` to lift the refusal.
 
 **The capture was never the problem.** For four board resets the record said
 capturing `step_n` inside the engine hangs the device. It does not: the setup
@@ -737,12 +737,12 @@ alternates tiny traces of 2 and 5 programs with no trouble at all.
 Both candidates are retired by controls that separate them. `plus_one` captures
 the same graph twice with the second one `ttnn.add` longer -- counts differ by
 one, binaries identical -- and alternates cleanly; the same with
-`TWTEST_NEW_KERNEL=1`, where the extra op is `ttnn.atan` so trace B references a
+`TTRUNNER_NEW_KERNEL=1`, where the extra op is `ttnn.atan` so trace B references a
 kernel trace A does not, also alternates cleanly. And magnitude is not it either:
 k=2 against **k=3** hangs.
 
 The line the controls actually draw: trace B may be trace A *plus appended
-operations* -- one or fifty of them (`TWTEST_EXTRA_OPS=50`), new kernels
+operations* -- one or fifty of them (`TTRUNNER_EXTRA_OPS=50`), new kernels
 included -- and the pair alternates fine; if the two traces hold
 differently-shaped versions of the same operations, they hang. **B superset of A
 is safe; B and A disagreeing about a shape is not.** Changing k re-shapes every
@@ -767,9 +767,9 @@ layer rather than adding anything.
    `step_n` returns `[75, 220]`, in 12 ms against 265.
 3. An ordinary (non-trace) program between the replays, on the theory that
    normal dispatch maintains what the trace path leaves stale
-   (`TWTEST_EAGER_BETWEEN=1`) — still hangs.
+   (`TTRUNNER_EAGER_BETWEEN=1`) — still hangs.
 4. `MeshDevice.reset_sub_device_stall_group()` between the replays, since
-   `enqueue_trace` updates worker state per sub-device (`TWTEST_RESET_STALL=1`)
+   `enqueue_trace` updates worker state per sub-device (`TTRUNNER_RESET_STALL=1`)
    — still hangs.
 5. A 1 GB `trace_region_size`, against the 256–384 MB the two traces need, in
    case they were colliding in an undersized region — still hangs, so it is not
@@ -828,7 +828,7 @@ cannot be tested while the engine hangs.
 
 **Instrumentation to start from.** `TTEngine.speculation_report()` breaks a round
 into snapshot / verify / restore / replay and reports the drafter's own cost; the
-`mark()` lines print each setup step while speculating; `TWTEST_STACK_DUMP=<s>`
+`mark()` lines print each setup step while speculating; `TTRUNNER_STACK_DUMP=<s>`
 in `speculation_check.py` dumps every thread's stack on a timer. The first of
 those once showed a *plain* round costing 487.5 ms against a traced 236 because a
 harness was disabling the trace, and the third ended this hunt in one run.
@@ -845,7 +845,7 @@ hangs on its own capture -- an engine-lifecycle bug, not a speculation one, and
 it blocks anything that opens a mesh twice. `close` now releases its captured
 traces, which was part of it but not all. Note this is *not* the speculation
 hang: that reproduces with the speculative engine as the only one in the process
-(`TWTEST_SPEC_ONLY=2`).
+(`TTRUNNER_SPEC_ONLY=2`).
 
 Done when: the interleaved replay works -- upstream fix or a formulation that
 avoids two traces -- and `speculation_check.py` shows a round cheaper than
@@ -1098,7 +1098,7 @@ the answer changes past 32, which is one tile:
 
 The wall-clock column is one unwarmed draw per row, taken before
 `moe_chunk_sweep.py` was fixed to warm twice and take a median of nine. **Ignore
-it.** Re-measured properly (`TWTEST_LIFT_MOE_CAP=1` to reach past the cap):
+it.** Re-measured properly (`TTRUNNER_LIFT_MOE_CAP=1` to reach past the cap):
 
 | moe_chunk | median | min | max | tok/s |
 |---|---|---|---|---|
@@ -1275,15 +1275,15 @@ file and several are undiscoverable:
 
 | variable | what it does |
 |---|---|
-| `TWTEST_GGUF_DIR`, `TWTEST_TT_CACHE`, `TWTEST_TOKENIZER` | where the weights, the converted cache and the tokenizer live |
-| `TWTEST_MAX_SEQ` | `max_seq_len` for the dev harnesses (default 512). **Above 2048 turns the QSA selection on**, which no other check here does |
-| `TWTEST_TRACE_REGION_MB` | `trace_region_size` for `spec_capture_ladder.py`; unset takes ttnn's default, which is what the working harnesses use |
-| `TWTEST_ALLOW_WIDE_STEP_N=1` | lifts `step_n`'s k≤32 guard for investigation. Does not make it correct (5.5) |
-| `TWTEST_ALLOW_SPECULATION=1` | lifts `TTEngine`'s speculation refusal. **Hangs the boards**; expect `tt-smi -r all` (5.6) |
-| `TWTEST_SPEC_ONLY=<k>` | `speculation_check.py` builds only that one engine, so a process holds one |
-| `TWTEST_STACK_DUMP=<s>` | dumps every thread's stack on a timer — what located the trace hang |
-| `TWTEST_SECOND_K`, `TWTEST_NEW_KERNEL`, `TWTEST_NO_DEC_REPLAY`, `TWTEST_SYNC_BETWEEN`, `TWTEST_EAGER_BETWEEN`, `TWTEST_RESET_STALL`, `TWTEST_STEPN_CQ` | `spec_capture_ladder.py` knobs, one per hypothesis it tests or excludes — see 5.6's exclusion list |
-| `TWTEST_MOE_CHUNK` *(none — use `--moe-chunk`)* | `device_quality.py --moe-chunk N` lifts `_MAX_MOE_CHUNK` for the measurement that decides whether the cap should move |
+| `TTRUNNER_GGUF_DIR`, `TTRUNNER_TT_CACHE`, `TTRUNNER_TOKENIZER` | where the weights, the converted cache and the tokenizer live |
+| `TTRUNNER_MAX_SEQ` | `max_seq_len` for the dev harnesses (default 512). **Above 2048 turns the QSA selection on**, which no other check here does |
+| `TTRUNNER_TRACE_REGION_MB` | `trace_region_size` for `spec_capture_ladder.py`; unset takes ttnn's default, which is what the working harnesses use |
+| `TTRUNNER_ALLOW_WIDE_STEP_N=1` | lifts `step_n`'s k≤32 guard for investigation. Does not make it correct (5.5) |
+| `TTRUNNER_ALLOW_SPECULATION=1` | lifts `TTEngine`'s speculation refusal. **Hangs the boards**; expect `tt-smi -r all` (5.6) |
+| `TTRUNNER_SPEC_ONLY=<k>` | `speculation_check.py` builds only that one engine, so a process holds one |
+| `TTRUNNER_STACK_DUMP=<s>` | dumps every thread's stack on a timer — what located the trace hang |
+| `TTRUNNER_SECOND_K`, `TTRUNNER_NEW_KERNEL`, `TTRUNNER_NO_DEC_REPLAY`, `TTRUNNER_SYNC_BETWEEN`, `TTRUNNER_EAGER_BETWEEN`, `TTRUNNER_RESET_STALL`, `TTRUNNER_STEPN_CQ` | `spec_capture_ladder.py` knobs, one per hypothesis it tests or excludes — see 5.6's exclusion list |
+| `TTRUNNER_MOE_CHUNK` *(none — use `--moe-chunk`)* | `device_quality.py --moe-chunk N` lifts `_MAX_MOE_CHUNK` for the measurement that decides whether the cap should move |
 
 **Judge a change to the model** — `scripts/dev/device_quality.py 48`
 (add `--prefill 32` for the chunked path, `--score-from N` for a matched

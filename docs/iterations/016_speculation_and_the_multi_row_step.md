@@ -160,7 +160,7 @@ separate processes, because two engines in one still hang (Observation 7).
 > **Corrected in `018`.** The title is wrong, and the body below already
 > contradicts it ("a single engine hangs too"). It is not two engines: the hang
 > reproduces with the speculative engine as the *only* one in the process
-> (`TWTEST_SPEC_ONLY=2`). Nor is it the capture, which this observation assumes
+> (`TTRUNNER_SPEC_ONLY=2`). Nor is it the capture, which this observation assumes
 > throughout -- instrumenting `_device_loop` shows setup completing and a stack
 > dump lands in `ttnn.execute_trace` on the **first replay** of the verifier.
 > The cause is alternating replays of two traces whose operations differ in

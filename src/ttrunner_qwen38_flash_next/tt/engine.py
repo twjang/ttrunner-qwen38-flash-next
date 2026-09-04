@@ -356,7 +356,7 @@ class TTEngine(Engine):
             # only one and is never alternated against anything
             # (`ttnn_bug_report/`, handoff 5.6).
             #
-            # `TWTEST_ALLOW_SPECULATION` is no longer required. It is kept as a
+            # `TTRUNNER_ALLOW_SPECULATION` is no longer required. It is kept as a
             # no-op switch name in the ladder harnesses, which still capture two
             # traces deliberately to reproduce the defect.
             if self.model.use_indexer:

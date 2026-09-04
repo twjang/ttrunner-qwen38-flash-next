@@ -22,7 +22,7 @@ Each of these passed, i.e. captured both traces without hanging:
 | `no_replay` | capturing #2 without ever replaying #1, as the engine does |
 
 Also excluded: two engines in one process — the hang reproduces with the
-speculative engine as the only one, via `TWTEST_SPEC_ONLY=2`.
+speculative engine as the only one, via `TTRUNNER_SPEC_ONLY=2`.
 
 Sixteen exclusions and no cause is a sign the question is wrong, not that the
 list is incomplete.
@@ -128,7 +128,7 @@ programs without trouble.
 So program count alone is not the trigger. Binary residency was the obvious
 alternative and it does not survive either: `plus_one` makes the second capture
 one `ttnn.add` longer (counts differ, binaries identical) and, with
-`TWTEST_NEW_KERNEL=1`, one `ttnn.atan` longer (trace B references a kernel trace
+`TTRUNNER_NEW_KERNEL=1`, one `ttnn.atan` longer (trace B references a kernel trace
 A does not). Both alternate cleanly. Nor is it the *size* of the difference,
 which was the next thing written down and also wrong: k=2 against k=3 hangs.
 
@@ -169,8 +169,8 @@ accept rule are unit-tested, and offline pricing says 1.70–2.14x on prompts th
 quote their context.
 
 Kept from the investigation: the `mark()` progress lines (on only while
-speculating), `TWTEST_ALLOW_SPECULATION=1` so the real engine can be driven
-rather than reconstructed, `TWTEST_STACK_DUMP` in `speculation_check.py`, and
+speculating), `TTRUNNER_ALLOW_SPECULATION=1` so the real engine can be driven
+rather than reconstructed, `TTRUNNER_STACK_DUMP` in `speculation_check.py`, and
 `spec_capture_ladder.py` itself.
 
 ## The lesson, which is not "bisect"

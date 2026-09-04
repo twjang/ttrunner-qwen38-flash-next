@@ -1,7 +1,7 @@
 """Does a captured trace reproduce the eager step, token for token?
 
     uv run python scripts/dev/traced_vs_eager.py [n_tokens]      (default 12)
-    TWTEST_MAX_SEQ=8192 ... to exercise the QSA selection as well
+    TTRUNNER_MAX_SEQ=8192 ... to exercise the QSA selection as well
 
 The project's standing gate for anything that touches the step. A trace replays
 a recorded graph against the addresses it captured, so a step that reads
@@ -18,7 +18,7 @@ from _device_model import open_model, tokenizer
 from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 12
-SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "8192"))
+SEQ = int(os.environ.get("TTRUNNER_MAX_SEQ", "8192"))
 
 mesh, cfg, m = open_model(max_seq_len=SEQ)
 tok = tokenizer(cfg)

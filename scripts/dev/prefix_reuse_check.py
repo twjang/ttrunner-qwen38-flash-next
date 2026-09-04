@@ -23,10 +23,10 @@ from pathlib import Path
 from ttrunner_qwen38_flash_next.engine import GenerationRequest
 from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
-GGUF = os.environ.get("TWTEST_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS"))
-CACHE = os.environ.get("TWTEST_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
+GGUF = os.environ.get("TTRUNNER_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS"))
+CACHE = os.environ.get("TTRUNNER_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
 TOKENIZER = os.environ.get(
-    "TWTEST_TOKENIZER", str(Path.home() / "models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json")
+    "TTRUNNER_TOKENIZER", str(Path.home() / "models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json")
 )
 import sys
 

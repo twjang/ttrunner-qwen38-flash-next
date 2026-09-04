@@ -99,10 +99,10 @@ def test_speculation_refuses_rather_than_wedging_the_device() -> None:
         "the refusal must name what actually hangs -- the *replay* of the "
         "verifier, not its capture; see docs/iterations/018"
     )
-    assert "TWTEST_ALLOW_SPECULATION" in src, "there must be a way to work on it"
+    assert "TTRUNNER_ALLOW_SPECULATION" in src, "there must be a way to work on it"
     # and the escape must be opt-in, not merely present
-    assert not os.environ.get("TWTEST_ALLOW_SPECULATION"), (
-        "this test asserts the default; unset TWTEST_ALLOW_SPECULATION to run it"
+    assert not os.environ.get("TTRUNNER_ALLOW_SPECULATION"), (
+        "this test asserts the default; unset TTRUNNER_ALLOW_SPECULATION to run it"
     )
 
 

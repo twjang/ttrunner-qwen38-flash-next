@@ -21,7 +21,7 @@ import ttnn
 from _device_model import open_model, synthetic_prompt
 
 BATCHES = [int(x) for x in sys.argv[1:]] or [1, 8, 32, 64]
-SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "512"))
+SEQ = int(os.environ.get("TTRUNNER_MAX_SEQ", "512"))
 WARM, ITERS = 5, 25
 
 mesh, cfg, m = open_model(max_seq_len=SEQ)

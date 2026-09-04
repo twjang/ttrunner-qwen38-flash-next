@@ -39,7 +39,7 @@ WARM, ITERS = 2, 9
 # Lifting the cap is the point of asking: whether it costs anything is exactly
 # what this measures, and the answer decides whether 5.8's "remaining prize" is
 # real.
-if os.environ.get("TWTEST_LIFT_MOE_CAP"):
+if os.environ.get("TTRUNNER_LIFT_MOE_CAP"):
     import ttrunner_qwen38_flash_next.tt.model as model_mod
     model_mod._MAX_MOE_CHUNK = max(MOE)
     print(f"RESULT lifted _MAX_MOE_CHUNK to {max(MOE)} for this measurement", flush=True)

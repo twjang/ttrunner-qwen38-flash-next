@@ -5,7 +5,7 @@ by phase, which is the only reliable way to read this: inferring from end-to-end
 rates hid a parameter mix-up for one cycle and an eager decoder for another.
 
 Exactness needs two *processes*, not two engines -- a second engine in one
-process still hangs -- so `TWTEST_SPEC_ONLY` runs one configuration and prints
+process still hangs -- so `TTRUNNER_SPEC_ONLY` runs one configuration and prints
 its tokens for comparison across runs.
 
     uv run python scripts/dev/speculation_check.py [k]            (default 8)
@@ -30,21 +30,21 @@ from pathlib import Path
 from ttrunner_qwen38_flash_next.engine import GenerationRequest
 from ttrunner_qwen38_flash_next.tt.engine import TTEngine
 
-# TWTEST_STACK_DUMP=<seconds> dumps every thread's stack on a timer. The
+# TTRUNNER_STACK_DUMP=<seconds> dumps every thread's stack on a timer. The
 # speculative engine spins somewhere in the serve loop -- setup completes and no
 # token is ever emitted -- and six candidate causes were excluded by rebuilding
 # the setup elsewhere before anyone simply asked the process where it was.
-if os.environ.get("TWTEST_STACK_DUMP"):
+if os.environ.get("TTRUNNER_STACK_DUMP"):
     faulthandler.dump_traceback_later(
-        float(os.environ["TWTEST_STACK_DUMP"]), repeat=True, exit=False
+        float(os.environ["TTRUNNER_STACK_DUMP"]), repeat=True, exit=False
     )
 
 K = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 N = 48
-GGUF = os.environ.get("TWTEST_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS"))
-CACHE = os.environ.get("TWTEST_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
+GGUF = os.environ.get("TTRUNNER_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS"))
+CACHE = os.environ.get("TTRUNNER_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
 TOKENIZER = os.environ.get(
-    "TWTEST_TOKENIZER", str(Path.home() / "models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json")
+    "TTRUNNER_TOKENIZER", str(Path.home() / "models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json")
 )
 
 PROMPTS = {
@@ -86,7 +86,7 @@ async def main():
     # ONLY=2 runs just the speculating engine, so a single engine exists in the
     # process. Two engines in one process was a confound worth removing: the
     # first one's captures used to leak (TTEngine.close now releases them).
-    only = os.environ.get("TWTEST_SPEC_ONLY")
+    only = os.environ.get("TTRUNNER_SPEC_ONLY")
     specs = (int(only),) if only else (0, K)
     for spec in specs:
         engine = TTEngine(

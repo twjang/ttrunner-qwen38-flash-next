@@ -34,7 +34,7 @@ PREFILL = 0
 SCORE_FROM = 0
 MOE_CHUNK = None
 # `--chunk N` sets the prefill chunk width. Above 128 it needs
-# TWTEST_WIDE_PREFILL_CHUNK=1, and it is not a free choice: a wider chunk changes
+# TTRUNNER_WIDE_PREFILL_CHUNK=1, and it is not a free choice: a wider chunk changes
 # the row count every dense linear sees, which changes their blocking and so
 # their rounding (`row_count_stability_check.py`). This is how that gets priced
 # in next-token accuracy rather than argued about.
@@ -75,7 +75,7 @@ TEXT = (
     "damaged passages of the Greek text were eventually restored."
 )  # long enough for a full unpadded 128-token chunk
 
-SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "512"))
+SEQ = int(os.environ.get("TTRUNNER_MAX_SEQ", "512"))
 mesh, cfg, m = open_model(max_seq_len=SEQ)
 print(f"RESULT max_seq_len {SEQ}  indexer {'on' if m.use_indexer else 'off'}", flush=True)
 tok = tokenizer(cfg)

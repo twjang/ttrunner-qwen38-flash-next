@@ -1419,9 +1419,9 @@ class TTModel:
         # `step_n` exists to reproduce k sequential steps exactly, so a path
         # that cannot is no use to it whatever the cause. Nothing needs k > 32
         # today (speculation caps its widths at 17), so it refuses.
-        # `TWTEST_ALLOW_WIDE_STEP_N=1` lifts the cap so the break can be
+        # `TTRUNNER_ALLOW_WIDE_STEP_N=1` lifts the cap so the break can be
         # investigated (`step_n_layer_bisect.py`); it does not make it correct.
-        if not 0 < k <= (64 if os.environ.get("TWTEST_ALLOW_WIDE_STEP_N") else 32):
+        if not 0 < k <= (64 if os.environ.get("TTRUNNER_ALLOW_WIDE_STEP_N") else 32):
             raise ValueError(
                 f"k must be in 1..32, got {k}. step_n is wrong past one tile of "
                 "rows (35.68 % on the hidden at k=33); see the comment above."

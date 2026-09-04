@@ -71,7 +71,7 @@ EXTRA = (
 )
 TEXT = PARA + EXTRA + PARA + EXTRA
 
-SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "512"))
+SEQ = int(os.environ.get("TTRUNNER_MAX_SEQ", "512"))
 mesh, cfg, m = open_model(max_seq_len=SEQ)
 tok = tokenizer(cfg)
 ids = tok.encode(TEXT)

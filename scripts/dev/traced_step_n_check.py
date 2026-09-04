@@ -22,7 +22,7 @@ from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder, TracedStepN
 
 KS = [int(x) for x in sys.argv[1:]] or [2, 4, 8]
 PRE = 8
-SEQ = int(os.environ.get("TWTEST_MAX_SEQ", "512"))
+SEQ = int(os.environ.get("TTRUNNER_MAX_SEQ", "512"))
 mesh, cfg, m = open_model(max_seq_len=SEQ)
 print(f"RESULT max_seq_len {SEQ}", flush=True)
 prompt = synthetic_prompt(PRE + max(KS) + 4)

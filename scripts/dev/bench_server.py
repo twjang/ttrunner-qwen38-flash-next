@@ -29,10 +29,10 @@ ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 3
 # 1.32x because it timed a single unwarmed pass; the first round here pays for
 # kernel compilation and trace capture, so it is discarded and the rest reported
 # as a median (invariant 7).
-GGUF = os.environ.get("TWTEST_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS"))
-CACHE = os.environ.get("TWTEST_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
+GGUF = os.environ.get("TTRUNNER_GGUF_DIR", str(Path.home() / "models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS"))
+CACHE = os.environ.get("TTRUNNER_TT_CACHE", str(Path.home() / "models/qwen38-tt-cache"))
 TOKENIZER = os.environ.get(
-    "TWTEST_TOKENIZER", str(Path.home() / "models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json")
+    "TTRUNNER_TOKENIZER", str(Path.home() / "models/Qwen3.8-Flash-Next-tokenizer/tokenizer.json")
 )
 
 

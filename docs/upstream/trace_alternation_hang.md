@@ -55,32 +55,32 @@ Model-scale, which is the only scale that reproduces it. From this repository:
 
 ```
 # hangs, ~7 min to reach the hang, then the watchdog reports
-PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
+PYTHONPATH=src:scripts/dev TTRUNNER_MAX_SEQ=2048 TTRUNNER_TRACE_REGION_MB=384 \
   uv run python scripts/dev/spec_capture_ladder.py two_stepn 2
 
 # the same two captures, replaying only the second: clean
-PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
+PYTHONPATH=src:scripts/dev TTRUNNER_MAX_SEQ=2048 TTRUNNER_TRACE_REGION_MB=384 \
   uv run python scripts/dev/spec_capture_ladder.py stepn_only 2
 
 # two captures of one graph, alternated A/B/A: clean
-PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
+PYTHONPATH=src:scripts/dev TTRUNNER_MAX_SEQ=2048 TTRUNNER_TRACE_REGION_MB=384 \
   uv run python scripts/dev/spec_capture_ladder.py two_same 2
 
 # same graph, second capture one op longer: clean (rules out program count)
-PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
+PYTHONPATH=src:scripts/dev TTRUNNER_MAX_SEQ=2048 TTRUNNER_TRACE_REGION_MB=384 \
   uv run python scripts/dev/spec_capture_ladder.py plus_one 2
 
 # ... and with that op introducing a new kernel binary: also clean
-PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
-  TWTEST_NEW_KERNEL=1 uv run python scripts/dev/spec_capture_ladder.py plus_one 2
+PYTHONPATH=src:scripts/dev TTRUNNER_MAX_SEQ=2048 TTRUNNER_TRACE_REGION_MB=384 \
+  TTRUNNER_NEW_KERNEL=1 uv run python scripts/dev/spec_capture_ladder.py plus_one 2
 
 # ... and with fifty appended ops, so the counts differ a lot: also clean
-PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
-  TWTEST_EXTRA_OPS=50 uv run python scripts/dev/spec_capture_ladder.py plus_one 2
+PYTHONPATH=src:scripts/dev TTRUNNER_MAX_SEQ=2048 TTRUNNER_TRACE_REGION_MB=384 \
+  TTRUNNER_EXTRA_OPS=50 uv run python scripts/dev/spec_capture_ladder.py plus_one 2
 
 # adjacent widths, k=2 against k=3: hangs, so magnitude is not the variable
-PYTHONPATH=src:scripts/dev TWTEST_MAX_SEQ=2048 TWTEST_TRACE_REGION_MB=384 \
-  TWTEST_SECOND_K=3 uv run python scripts/dev/spec_capture_ladder.py two_stepn 2
+PYTHONPATH=src:scripts/dev TTRUNNER_MAX_SEQ=2048 TTRUNNER_TRACE_REGION_MB=384 \
+  TTRUNNER_SECOND_K=3 uv run python scripts/dev/spec_capture_ladder.py two_stepn 2
 ```
 
 `two_stepn` captures two `step_n` graphs (k=2 and k=4) over the same model state,
@@ -155,11 +155,11 @@ further controls separate them, and both pass:
 * `plus_one`: A and B are the same graph, B with one extra `ttnn.add` recorded
   inside the capture. Program counts differ by one, binaries identical.
   Alternates cleanly.
-* `plus_one` with `TWTEST_EXTRA_OPS=50`: fifty appended ops rather than one, so
+* `plus_one` with `TTRUNNER_EXTRA_OPS=50`: fifty appended ops rather than one, so
   the program counts differ substantially while B still contains A's programs
   unchanged. Alternates cleanly, ruling out the *size* of the difference as well
   as its existence.
-* `plus_one` with `TWTEST_NEW_KERNEL=1`: the extra op is `ttnn.atan`, which the
+* `plus_one` with `TTRUNNER_NEW_KERNEL=1`: the extra op is `ttnn.atan`, which the
   model never uses, so trace B references a kernel binary trace A does not.
   (It is warmed before capture, since a capture cannot load a new binary.)
   Alternates cleanly.
