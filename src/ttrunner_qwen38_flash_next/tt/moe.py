@@ -212,7 +212,7 @@ def moe_block(
     # tuning knob, so the guard is on M rather than on `_MAX_MOE_CHUNK`.
     # `step_n` (the speculative verifier) runs M = k, so it takes the
     # `sparse_matmul` path, which is per-row exact.
-    if WIDE_EXPERTS and up_w is None and x.shape[-2] == 1:
+    if WIDE_EXPERTS and up_w is None:
         # Two gathers and two wide matmuls, the second of which also combines.
         # Falls back below if anything about the shapes is unexpected.
         # Not a silent fallback: swallowing the exception here would leave the
@@ -231,8 +231,32 @@ def moe_block(
                            else ttnn.mesh_partition(sel_weights, dim=-1))
             else:
                 w_local = None
-            return wide_expert_ffn(x, gate_w, down_w, w_local, WIDE_EXPERTS,
-                                   hidden_size, sel=sel)
+            rows = x.shape[-2]
+            if rows == 1:
+                return wide_expert_ffn(x, gate_w, down_w, w_local, WIDE_EXPERTS,
+                                       hidden_size, sel=sel)
+            # More than one row: the gather serves **one** selection, because
+            # `expert_gather.cpp` reads it from the index tile's first face, so
+            # each row has to have its own pass. That is `rows` times the M=1
+            # cost -- and the alternative is `sparse_matmul` over all 512
+            # experts, whose [1, E, M, K] zero-fill is a flat **145 ms** a step
+            # whatever k is (`step_n_one.py --moe-stub`). Four rows of the wide
+            # path is about 37.
+            outs = []
+            for i in range(rows):
+                xi = ttnn.slice(x, (0, 0, i, 0), (1, 1, i + 1, x.shape[-1]))
+                seli = None
+                wi = w_local
+                if sel is not None:
+                    vals, idx = sel
+                    seli = (ttnn.slice(vals, (0, 0, i, 0), (1, 1, i + 1, vals.shape[-1])),
+                            ttnn.slice(idx, (0, 0, i, 0), (1, 1, i + 1, idx.shape[-1])))
+                elif w_local is not None:
+                    wi = ttnn.slice(w_local, (0, 0, i, 0),
+                                    (1, 1, i + 1, w_local.shape[-1]))
+                outs.append(wide_expert_ffn(xi, gate_w, down_w, wi, WIDE_EXPERTS,
+                                            hidden_size, sel=seli))
+            return ttnn.concat(outs, dim=-2)
         except Exception as exc:                            # noqa: BLE001
             global _WIDE_FELL_BACK
             if not _WIDE_FELL_BACK:

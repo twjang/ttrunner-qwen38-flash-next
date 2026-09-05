@@ -5,7 +5,11 @@
 // tile before anything is packed.
 //
 // Runtime arg 0 is the tile count, not a compile-time arg: the K split is
-// balanced but not equal, so cores differ by one.
+// balanced but not equal, so cores differ by one -- and it is **zero** for a
+// core the plan has nothing for. Such a core must pack nothing: it accumulated
+// nothing, so its destination register holds whatever was there, and packing it
+// hands the writer garbage to put in tile (0, 0). Thirty idle cores doing that
+// at once is a race, and it was the model's entire run-to-run nondeterminism.
 
 #include <cstdint>
 #include "api/compute/tile_move_copy.h"
@@ -20,6 +24,9 @@ void kernel_main() {
     constexpr tt::CBIndex cb_out = tt::CBIndex::c_16;
 
     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_a, cb_b, cb_out);
+    if (n_k == 0) {
+        return;                       // nothing to accumulate, nothing to pack
+    }
     matmul_init(cb_a, cb_b);
 
     tile_regs_acquire();

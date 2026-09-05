@@ -4021,3 +4021,100 @@ That also explains the two earlier misfires in this session. The op-count model
 kernel's own cost is the term nobody estimates. On this evidence the remaining
 "~10 ms of fusion" in 17.1 should be read as an upper bound with no lower bound
 attached.
+
+## 21. The model was not reproducible, and the cause was idle cores
+
+`batch_equivalence_check.py` reported that batched decode diverged from batch 1,
+which the handoff had recorded as exact up to 32 slots. Bisecting it turned up
+something larger: **two runs of batch-1 greedy generation on identical code
+produced completely different text after the first token.**
+
+`scripts/dev/determinism_check.py` localises it in three levels:
+
+    one matmul, twice                     0.000e+00
+    all_reduce, eight times               0.000e+00
+    three identical 3-token runs          2.688e+00   (rel 9.95e-02)
+
+So not the collective -- the hypothesis this document had been carrying since
+19.1 -- and not a plain op. Stubbing components: with `shared_expert` removed the
+step is bit-reproducible; with `moe_block` removed it is not. The one thing
+`shared_expert` had that nothing else did was the k-split on its `[2560, 1]`
+sigmoid gate.
+
+### The bug
+
+`_ksplit_build` pads its work plan out to the core count with an idle entry:
+
+    while len(plan) < len(cores):
+        plan.append((0, 0, 0, 0))                     # idle core
+
+The reader honours that -- `kt_lo == kt_hi`, so it reads nothing. The **compute
+kernel did not**: it packed and pushed unconditionally, so an idle core packed
+whatever its destination register happened to hold. And the writer put that
+where its runtime args said, which for the idle entry is `g * NT + nt` = **tile
+(0, 0)**.
+
+Thirty idle cores, all writing garbage into the same tile, racing. `ttnn.sum`
+then folded it into the answer.
+
+    [2560, 1]   80 work items, 110 cores -> 30 idle
+    [2560, 512]  96 work items           -> 14 idle
+    [2560, 352] 110 work items           ->  0 idle    (the one that was safe)
+
+Fixed by having the compute kernel return before packing when its tile count is
+zero, and giving the writer an `active` runtime arg so it returns before waiting
+on a circular buffer nobody will fill.
+
+### What it had been costing
+
+    three identical 3-token runs      2.688e+00  ->  0.000e+00
+    device_quality.py 192, twice      137/140/140/143 top-1  ->  identical
+    batch_equivalence_check           DIVERGES at 8 and 32   ->  8/8 and 32/32
+
+So the model is bit-reproducible again and batched decode is exactly equivalent
+to single-stream up to 32 slots, which is what invariant 13 always claimed.
+
+INVARIANT 73: a padded work plan is not a harmless one. Every kernel in the
+triple has to agree about what "no work" means -- the reader read nothing, the
+compute packed anyway, and the writer wrote it somewhere real. The failure was
+silent, data-dependent and racing, which is the worst combination to find by
+looking at output.
+
+INVARIANT 74 (**replaces invariant 70**): the quality harness *is* deterministic.
+Two runs of `device_quality.py 192` now give byte-identical numbers. Every
+comparison in sections 15 through 19 that was dismissed as "inside the noise" was
+measured against this bug and can be re-run to a decision.
+
+## 22. Throughput: the goal, measured
+
+The target is a 5090's throughput on this model, 32.6 ms a token or 30.7 tokens
+a second. Single-stream decode is 49.15 ms, and section 17.1 says why that floor
+is where it is: 5764 ttnn ops at 5.8 us apiece is 33 ms before any arithmetic.
+
+But an op costs the same at one row as at thirty-two (invariant 66), so a step
+serving B sequences costs barely more than a step serving one.
+`scripts/dev/batch_throughput.py`, on the traced path the engine runs:
+
+| batch | ms a step | ms a token | tokens/s | vs target |
+|---:|---:|---:|---:|---:|
+| 1 | 49.15 | 49.15 | 20.3 | 0.66x |
+| 2 | 70.95 | 35.48 | 28.2 | 0.92x |
+| 4 | 94.32 | **23.58** | **42.4** | **1.38x** |
+| 8 | 148.47 | 18.56 | 53.9 | 1.76x |
+| 16 | 253.40 | **15.84** | **63.1** | **2.06x** |
+
+**The target is met at three concurrent sequences and doubled at sixteen**, with
+each sequence's own latency unchanged from what it would be alone -- and, since
+section 21, with each sequence's output bit-identical to what it would be
+decoded alone (`batch_equivalence_check.py`, 32/32).
+
+This was not available before this session's last change. The wide gather path
+is exact at one row only, so `moe_block` at M > 1 fell back to `sparse_matmul`
+over all 512 experts, whose `[1, E, M, K]` zero-fill is a flat **145 ms** a step
+whatever the batch (`step_n_one.py --moe-stub`). Running the wide path once per
+row instead costs `rows` times the M=1 MoE -- about 9 ms a row -- and makes the
+whole thing scale. It also makes the MoE *exactly* per-row at every group size up
+to 32, which `moe_rows_check.py` now reports as 0.000 % where it had been 1.562.
+
+Single-stream remains 49 ms and 32.6 needs the op count roughly halved; the two
+halves of that are in 17.1, and 20.2 bounds what fusion can return.

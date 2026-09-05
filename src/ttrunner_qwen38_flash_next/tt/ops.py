@@ -396,8 +396,9 @@ def _ksplit_build(a, w, out, groups: int, kt: int, nt: int):
             plan.append((lo, hi, n, g))
     if len(plan) > len(cores):
         raise RuntimeError(f"{len(plan)} work items over {len(cores)} cores")
+    n_active = len(plan)
     while len(plan) < len(cores):
-        plan.append((0, 0, 0, 0))                     # idle core
+        plan.append((0, 0, 0, 0))                     # idle core: writes nothing
 
     cbs = [
         ttnn.CBDescriptor(total_size=4 * acc["a"][1], core_ranges=crs,
@@ -427,7 +428,9 @@ def _ksplit_build(a, w, out, groups: int, kt: int, nt: int):
             kern("ksplit_compute.cpp", [], [[hi - lo] for lo, hi, _, _ in plan],
                  ttnn.ComputeConfigDescriptor(math_fidelity=ttnn.MathFidelity.HiFi4)),
             kern("ksplit_writer.cpp", [nt] + acc["o"],
-                 [[oa, g, n] for _, _, n, g in plan], ttnn.WriterConfigDescriptor()),
+                 [[oa, g, n, int(i < n_active)]
+                  for i, (_, _, n, g) in enumerate(plan)],
+                 ttnn.WriterConfigDescriptor()),
         ],
         semaphores=[], cbs=cbs)
 

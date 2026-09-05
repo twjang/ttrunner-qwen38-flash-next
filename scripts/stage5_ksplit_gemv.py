@@ -58,6 +58,7 @@ def build(a, w, out, grid, kt: int, nt: int, groups: int, fp32: bool = True):
             plan.append((lo, hi, n, g))
     if len(plan) > len(cores):
         raise RuntimeError(f"{len(plan)} work items over {len(cores)} cores")
+    n_active = len(plan)
     while len(plan) < len(cores):
         plan.append((0, 0, 0, 0))          # idle: reads nothing, writes nothing
 
@@ -93,7 +94,8 @@ def build(a, w, out, grid, kt: int, nt: int, groups: int, fp32: bool = True):
                  ttnn.ComputeConfigDescriptor(
                      math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=False)),
             kern("ksplit_writer.cpp", [nt] + acc["o"],
-                 [[o_addr, g, n] for _, _, n, g in plan],
+                 [[o_addr, g, n, int(i < n_active)]
+                  for i, (_, _, n, g) in enumerate(plan)],
                  ttnn.WriterConfigDescriptor()),
         ],
         semaphores=[], cbs=cbs)
