@@ -637,14 +637,24 @@ def _gather_gemv_program(x, weights, idx, out, k_sel, mode, idx16, cols_per_core
             core_ranges=crs, compile_time_args=ct,
             runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
 
+    # The activation is multicast from one core, so the rectangle's *physical*
+    # corners and the sender's are runtime args. All devices share a layout, so
+    # device 0's mapping serves the mesh.
+    d0 = dev.get_devices()[0] if hasattr(dev, "get_devices") else dev
+    p_lo = d0.worker_core_from_logical_core(ttnn.CoreCoord(0, 0))
+    p_hi = d0.worker_core_from_logical_core(ttnn.CoreCoord(cols_ - 1, rows_ - 1))
+    n_dest = len(cores)
+    mc = [p_lo.x, p_lo.y, p_hi.x, p_hi.y, p_lo.x, p_lo.y]
+
     ct = [kt, kt_e, ne, tpe, half, k_sel, mode, weights.shape[1], idx16,
-          a_page, w_page, h0] + acc["a"] + acc["w"] + acc["i"]
+          a_page, w_page, h0, n_dest] + acc["a"] + acc["w"] + acc["i"]
     wct = [kt, h0, kt_e, ne, tpe, half, k_sel, mode, weights.shape[1], idx16,
            w_page] + acc["o"] + acc["w"] + acc["i"]
     return ttnn.ProgramDescriptor(kernels=[
         kern("gather_gemv_reader.cpp", ct,
              [[x.buffer_address(), weights.buffer_address(), idx.buffer_address(),
-               lo, hi] for lo, hi in work], ttnn.ReaderConfigDescriptor()),
+               lo, hi, 1 if i == 0 else 0] + mc
+              for i, (lo, hi) in enumerate(work)], ttnn.ReaderConfigDescriptor()),
         kern("gather_gemv_compute.cpp", [kt, h0], [[lo, hi] for lo, hi in work],
              # fp32 in the destination register: the reduction is 80 tile
              # products deep and bfloat16 accumulation over that is visible --
@@ -655,7 +665,8 @@ def _gather_gemv_program(x, weights, idx, out, k_sel, mode, idx16, cols_per_core
              [[out.buffer_address(), weights.buffer_address(), idx.buffer_address(),
                lo, hi] for lo, hi in work],
              ttnn.WriterConfigDescriptor()),
-    ], semaphores=[], cbs=cbs)
+    ], semaphores=[ttnn.SemaphoreDescriptor(id=i, core_ranges=crs, initial_value=0)
+                   for i in (0, 1)], cbs=cbs)
 
 
 def gather_gemv(x, weights, idx, k_sel: int, mode: int, out_shape, idx16: int = 0,
@@ -918,11 +929,13 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
 
     # The gather is the expensive half: 59.73 us to copy gate|up and multiply it
     # against 35.01 to multiply it *through the index*, because a copied weight
-    # crosses DRAM three times and an indexed one crosses it once. Four output
-    # columns a core is the measured optimum for both projections once the
-    # reader and the writer split the weight fetch between their two NOCs.
+    # crosses DRAM three times and an indexed one crosses it once. **Two** output
+    # columns a core since the activation became a multicast: the duplication
+    # that used to cap the core count is gone, so more cores is now better.
+    #
+    #   gate|up  35.01 us -> 27.99      down  25.74 -> 20.47
     both = (gather_gemv(x, gate_w, idx_pad, k_sel, 2,
-                        (1, 1, x.shape[-2], k_sel * 2 * n), 1, 4)
+                        (1, 1, x.shape[-2], k_sel * 2 * n), 1, 2)
             if x.shape[-2] <= TILE else None)
     if both is None:
         gu = _gather(gate_w, idx_pad, k_sel, 2,
@@ -945,7 +958,7 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
     scaled = ttnn.multiply(hidden, ttnn.matmul(vals, spread, compute_kernel_config=HIFI4))
 
     out = (gather_gemv(scaled, down_w, idx_pad, k_sel, 0,
-                       (1, 1, scaled.shape[-2], hidden_size), 1, 4)
+                       (1, 1, scaled.shape[-2], hidden_size), 1, 2)
            if scaled.shape[-2] <= TILE else None)
     if out is not None:
         return out

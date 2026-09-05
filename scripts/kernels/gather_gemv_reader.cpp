@@ -11,10 +11,14 @@
 // selected expert's weights cross DRAM three times instead of once. Reading them
 // through the index in the matmul itself is the whole saving.
 //
-// Each core owns a range of output tile columns and reads the activation row
-// **once** into L1, keeping all KT of its tiles resident; the weights then
-// stream past it column by column. That is what makes few cores the right
-// choice: the activation is re-read per core, not per column.
+// Each core owns a range of output tile columns and keeps the whole activation
+// row resident in L1; the weights then stream past it column by column.
+//
+// The activation is **multicast**: one core reads it from DRAM and broadcasts it
+// to every participating core's landing buffer. Read per core instead, it was
+// 2.1 MB of the 6.9 MB the gate|up projection moves, and it is what capped the
+// core count -- more cores meant more duplicate reads. `ttnn`'s own matmul does
+// this (`mcast_in0=True`); a `generic_op` has to do it itself.
 //
 // The weight reads are **split with the writer kernel**. A core pulls about
 // 15 GB/s over one NOC, and thirteen of them saturate at ~190 GB/s -- half the
@@ -45,9 +49,11 @@
 //   9 A_PAGE    activation page bytes
 //   10 W_PAGE    weight page bytes
 //   11 H0        k-tiles this kernel fetches (the writer takes the rest)
-//   12.. TensorAccessorArgs for a, w, idx
+//   12 N_DEST    cores in the multicast rectangle (the sender included)
+//   13.. TensorAccessorArgs for a, w, idx
 //
-// Runtime args: 0 a_addr, 1 w_addr, 2 idx_addr, 3 col_lo, 4 col_hi
+// Runtime args: 0 a_addr, 1 w_addr, 2 idx_addr, 3 col_lo, 4 col_hi,
+//               5 is_sender, 6 mx0, 7 my0, 8 mx1, 9 my1, 10 sx, 11 sy
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -65,6 +71,7 @@ void kernel_main() {
     constexpr uint32_t A_PAGE = get_compile_time_arg_val(9);
     constexpr uint32_t W_PAGE = get_compile_time_arg_val(10);
     constexpr uint32_t H0 = get_compile_time_arg_val(11);
+    constexpr uint32_t N_DEST = get_compile_time_arg_val(12);
 
     constexpr uint32_t cb_a = 0, cb_b = 1, cb_idx = 2;
 
@@ -74,16 +81,23 @@ void kernel_main() {
     const uint32_t col_lo = get_arg_val<uint32_t>(3);
     const uint32_t col_hi = get_arg_val<uint32_t>(4);
 
-    constexpr auto a_ta = TensorAccessorArgs<12>();
+    constexpr auto a_ta = TensorAccessorArgs<13>();
     const auto a_acc = TensorAccessor(a_ta, a_addr);
     constexpr auto w_ta = TensorAccessorArgs<a_ta.next_compile_time_args_offset()>();
     const auto w_acc = TensorAccessor(w_ta, w_addr);
     constexpr auto i_ta = TensorAccessorArgs<w_ta.next_compile_time_args_offset()>();
     const auto i_acc = TensorAccessor(i_ta, idx_addr);
 
-    if (col_lo >= col_hi) {
-        return;                      // an idle core reads nothing and pushes nothing
-    }
+    const uint32_t is_sender = get_arg_val<uint32_t>(5);
+    const uint32_t mx0 = get_arg_val<uint32_t>(6);
+    const uint32_t my0 = get_arg_val<uint32_t>(7);
+    const uint32_t mx1 = get_arg_val<uint32_t>(8);
+    const uint32_t my1 = get_arg_val<uint32_t>(9);
+    const uint32_t sx = get_arg_val<uint32_t>(10);
+    const uint32_t sy = get_arg_val<uint32_t>(11);
+
+    // An idle core still takes part in the handshake -- the sender counts every
+    // core in the rectangle, and one that returned early would hang it.
 
     // The selection, once. 64-byte aligned: a Blackhole DRAM transfer needs
     // (local & 63) == (noc & 63) and a CB base is only L1-aligned.
@@ -95,15 +109,39 @@ void kernel_main() {
     volatile tt_l1_ptr uint16_t* idx16 =
         reinterpret_cast<volatile tt_l1_ptr uint16_t*>(idx_l1);
 
-    // The activation row, once, and resident: the compute kernel indexes it by
-    // tile rather than popping it.
+    // The activation row, once for the whole rectangle, and resident: the
+    // compute kernel indexes it by tile rather than popping it.
     cb_reserve_back(cb_a, KT);
     const uint32_t ab = get_write_ptr(cb_a);
-    for (uint32_t kt = 0; kt < KT; ++kt) {
-        noc_async_read_page(kt, a_acc, ab + kt * A_PAGE);
+    volatile tt_l1_ptr uint32_t* ready =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0));
+    volatile tt_l1_ptr uint32_t* valid =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1));
+    if (is_sender) {
+        for (uint32_t kt = 0; kt < KT; ++kt) {
+            noc_async_read_page(kt, a_acc, ab + kt * A_PAGE);
+        }
+        noc_async_read_barrier();
+        noc_semaphore_wait(ready, N_DEST - 1);
+        noc_semaphore_set(ready, 0);
+        const uint64_t dst = get_noc_multicast_addr(mx0, my0, mx1, my1, ab);
+        noc_async_write_multicast_loopback_src(ab, dst, KT * A_PAGE, N_DEST);
+        noc_async_write_barrier();
+        noc_semaphore_set(valid, 1);
+        const uint64_t sdst =
+            get_noc_multicast_addr(mx0, my0, mx1, my1, (uint32_t)get_semaphore(1));
+        noc_semaphore_set_multicast_loopback_src(
+            (uint32_t)get_semaphore(1), sdst, N_DEST);
+    } else {
+        noc_semaphore_set(valid, 0);
+        noc_semaphore_inc(get_noc_addr(sx, sy, (uint32_t)get_semaphore(0)), 1);
+        noc_semaphore_wait(valid, 1);
     }
-    noc_async_read_barrier();
     cb_push_back(cb_a, KT);
+
+    if (col_lo >= col_hi) {
+        return;                      // nothing else for an idle core to do
+    }
 
     for (uint32_t c = col_lo; c < col_hi; ++c) {
         cb_reserve_back(cb_b, H0);
