@@ -6182,6 +6182,25 @@ then no device program event after the first inside the 48-layer step.
 A boolean cannot find that. `TT_KSG_WIDE` is now a comma list -- `router`,
 `shexp`, `ab`, `qkv`, `indexer`, or `1` for all -- so each call site runs alone.
 
+Bisected, one site per process, retried four times each:
+
+| site | shape | plan | traced replay |
+|---|---|---|---|
+| `router` | [2560, 512] | 5 groups x 22 cores (2 rows) | **OK**, 32.94 ms |
+| `shexp` | [2560, 1312] | 2 groups x 44 cores (4 rows) | **HUNG 4/4** |
+
+Four of four against the router's clean run settles it: the shared expert's
+gate\|up is the site that hangs, not the k-split in general. And its plan is the
+only one in the model that gives a group **four grid rows** -- `rows_pg =
+ceil(41/11) = 4`, so the activation multicast addresses a 4 x 11 rectangle where
+`hc_down` uses 1 x 11, the router 2 x 11 and the indexer four cores of one row.
+`ksgemv_check.py` runs that exact 2 x 44 configuration clean outside a trace, so
+whatever this is, it needs the traced step to show up.
+
+Not yet chased further, and the honest reason is that it does not have to be:
+the site is worth 0.74 ms isolated of the 2.39, and the other four are worth
+1.65 between them. Leave `shexp` off and take the rest.
+
 INVARIANT 121: a flag that turns on several call sites at once cannot be
 bisected, and a kernel that only fails inside the full traced step is the only
 kind this project has left. Wire each site behind its own name from the start.
