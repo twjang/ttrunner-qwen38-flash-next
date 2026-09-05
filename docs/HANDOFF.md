@@ -3748,3 +3748,73 @@ Five ops instead of nineteen, 168 fewer a token, and one read of a cache that is
 16.8 MB a layer at the model's maximum instead of four.
 `scripts/dev/indexer_select_check.py` puts it against the reference mask at
 position 2599: **2048 of 2048 tokens, 100 % overlap, no block missing or extra.**
+
+## 17. What a fused kernel is actually worth, and the two halves of the 58 ms
+
+The fused `reinject` (four ops a call, 96 calls a token) removed 288 ttnn calls
+and bought **0.40 ms**, where the op floor said 288 x 5.5 us = 1.6 ms. That gap
+is the useful result, and chasing it produced the first measurement in this
+project that prices an op by its *shape*.
+
+`scripts/dev/elementwise_shape_cost.py`, same element count at different padding,
+inside a trace:
+
+| shape | tiles | physical | multiply | sigmoid | GB/s |
+|---|---:|---:|---:|---:|---:|
+| [1,1,1,10240] | 320 | 640 KB | 6.75 us | 5.78 us | 291 |
+| [1,1,32,10240] | 320 | 640 KB | 6.68 us | 5.80 us | 295 |
+| [1,1,1,2560] | 80 | 160 KB | 5.82 us | 5.71 us | 85 |
+| [1,1,32,320] | 10 | 20 KB | 5.80 us | 5.74 us | 11 |
+| [1,1,1,32] | 1 | 2 KB | 5.83 us | 5.75 us | 1 |
+
+**Invariant 42 is exactly right, and now it is explained.** A 320-tile multiply
+costs 16 % more than a one-tile multiply while moving 320 times the data -- so it
+runs at 291 GB/s, three quarters of peak, and its bytes are very nearly free. The
+5.8 us is dispatch. The M=1 row padding that looked like a 32x tax on every
+elementwise op costs almost nothing, because the op was never bandwidth-bound.
+
+INVARIANT 66: at these shapes an elementwise op's bytes are free and its launch
+is not. Do not fuse to save bytes; fuse to save launches. And a `generic_op` is
+itself worth about two of those launches once its own work is counted, so
+**fusing N ops saves roughly (N - 2) x 5.8 us a call**. A four-op chain saves
+two ops' worth; a thirteen-op chain saves eleven.
+
+That is why `reinject` returned 0.4 ms rather than 1.6: it replaced four ops with
+a kernel that reads three tiles per output tile and synthesises a broadcast, and
+that kernel costs about what two of the ops did.
+
+### 17.1 The two halves, and what each needs
+
+    5897 calls, of which 484 are linear
+    5413 small ops x 5.8 us                    31.4 ms
+    484 linears, 2.745 GB, 14.6 us each at peak, measured ~56    27.0 ms
+                                               -------
+                                                58.4 ms   against 58.4 measured
+
+So the step is two roughly equal halves and they need opposite things.
+
+**The small-op half is op count, and only long chains pay.** Ranked by what
+`(N - 2) x 5.8 us x calls` would return:
+
+| chain | ops | calls | worth |
+|---|---:|---:|---:|
+| `linear_attn.decode_step` | 13 | 36 | 2.3 ms |
+| the `gated_residual_mix` tail (silu, sigmoid, slices, multiply, permute, mean) | ~7 | 96 | 2.8 ms |
+| DeltaNet q/k/v prepare (slices, reshapes, two l2norms) | ~10 | 36 | 1.7 ms |
+| DeltaNet gate chain (add, softplus, multiply, exp, sigmoid, reshapes) | 9 | 36 | 1.5 ms |
+| `grouped_rms_norm` | 4 | 96 | 1.1 ms |
+| DeltaNet output chain | 6 | 36 | 0.8 ms |
+
+About 10 ms in six kernels, none of them large. The short chains are not worth
+touching: a three-op fusion returns 5.8 us a call and costs a day.
+
+**The linear half is bandwidth, and it is at 26 %.** 484 calls whose roofline is
+14.6 us each measure about 56. Invariant 38 says why -- output width decides how
+many cores get work -- and the k-split kernel (section 14) is the tool, but it
+declines every shape whose output already fills the grid, which is most of them
+now. Getting these to 50 % is worth ~13 ms and is the single largest item left in
+the model.
+
+For the 32.6 ms target: ~10 ms of fusion and ~13 ms of matmul efficiency lands at
+about 35. Neither half is speculative -- both have a measured mechanism and a
+worked example -- but neither is one insight either.
