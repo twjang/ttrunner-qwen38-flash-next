@@ -5004,3 +5004,59 @@ The three items still on the table, with their measured sizes:
    `matmul_init` already takes the transpose flag.
 3. **The 2560-wide all-reduce**, 3.15 ms at three links, if a pair of them can
    ever be made simultaneous.
+
+## 32. The 7.9 ms roofline was wrong, and the right number changes the plan
+
+Section 25 set the target from bytes alone: 3.05 GB a device a token at 388 GB/s
+is 7.9 ms, 127 tokens a second. That has been quoted all session. It is not
+reachable **and not because of anything a fusion could fix** -- it leaves out two
+costs that are as real as bandwidth and that this decomposition cannot avoid.
+
+**The collectives.** 181 of them a token, and their cost is fixed, not
+proportional: 12.79 us to reduce 0.7 KB across four chips, 32.77 to reduce 5 KB.
+
+    96 wide   x 32.77 us  =  3.15 ms
+    97 narrow x 12.79     =  1.24
+                             ----
+                             4.39 ms
+
+They exist because `ssm_out`, the MoE `down` and the hyper-connection `down` are
+all row-sharded, which is the right choice -- section 31.2 re-measured the
+alternative and it is worse. So 4.4 ms is a floor for *this* parallelisation.
+
+**The launch floor.** 604 `ttnn.linear` calls alone, at the traced marginal cost
+of a wide op, are ~1.8 ms before a byte moves.
+
+So the honest floor for the model as it is decomposed today:
+
+    matmul weights            6.11 ms   (linear_shape_census roofline)
+    expert weights            1.11      (430 MB through gather_gemv)
+    collectives               4.39      (fixed cost, not bytes)
+    KV cache + DeltaNet state 0.48
+                             ------
+                             12.1 ms  ~= 83 tokens a second
+
+and with the ~2200 non-matmul launches at even 2 us of marginal cost, ~16.5 ms,
+**about 60 tokens a second**. Not 127.
+
+At 35.9 ms the model is at 45 % of that, so there is still roughly a factor of two
+inside this decomposition -- and it is in the 2200 non-matmul launches and the op
+chains around them, which is where this session's eleven changes came from and
+where the next ones are.
+
+**127 tok/s needs the decomposition to change**, and the three things that would
+do it are all outside "make the current graph cheaper":
+
+* a batch, which the goal excludes;
+* fewer collectives, i.e. a different sharding of `ssm_out`, the MoE `down` and
+  the hyper-connection `down` -- each is row-sharded because replicating it costs
+  more *given a free collective*, and that trade should be re-run now that the
+  collective is priced at 4.4 ms a token;
+* M = 1 itself: a tile matmul computes a 32x32 output whatever M is, so 31 rows
+  of every one are discarded, and the narrow shapes are compute-bound on the
+  eleven to sixteen cores their output width affords.
+
+INVARIANT 94: a roofline built from bytes alone is not a target. Collectives cost
+what they cost regardless of size, and every launch has a floor. Price those two
+into the number before quoting it, or the gap will keep looking like a fusion
+backlog when it is a decomposition.
