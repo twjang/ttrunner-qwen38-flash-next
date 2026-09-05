@@ -2104,17 +2104,30 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
             raise RuntimeError(f"k-split gemv: {tag} must be interleaved")
         acc[tag] = ct
 
-    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
-        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
-    all_cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
+    # **Only the cores in a group.** This used to launch on the whole grid and
+    # give the leftovers all-zero runtime args -- and an idle core's `is_head` is
+    # then 0, so it took the reader's *non-head* path and ran
+    # `noc_semaphore_inc(get_noc_addr(hx, hy, ...))` with hx = hy = 0: every idle
+    # core incremented the `ready` semaphore of whichever core sits at (0, 0),
+    # which is group 0's head. That head then saw its count satisfied before its
+    # real members had armed, multicast early, and a member that had not yet
+    # zeroed `valid` waited for ever.
+    #
+    # Invisible whenever the plan covers all 110 cores, which is why `hc_down`
+    # (10 x 11) and the router (5 x 22) have always been fine and the shared
+    # expert (2 x 44 = 88), ssm_alpha|beta (80 x 1 = 80) and the indexer
+    # (20 x 4 = 80) hung four times out of four. Handoff 45.10.
+    #
+    # Each group is exactly one rectangle by construction, so the set is one
+    # range a group.
+    crs = ttnn.CoreRangeSet([
+        ttnn.CoreRange(where(g, 0), where(g, cores_pg - 1)) for g in range(groups)])
     d0 = dev.get_devices()[0] if hasattr(dev, "get_devices") else dev
 
-    idle_r = [0] * 13
-    idle_c = [0, 0, 0, groups]
-    idle_w = [0] * 8
-    r_args = {c: idle_r for c in all_cores}
-    c_args = {c: idle_c for c in all_cores}
-    w_args = {c: idle_w for c in all_cores}
+    used = [where(g, j) for g in range(groups) for j in range(cores_pg)]
+    r_args: dict = {}
+    c_args: dict = {}
+    w_args: dict = {}
     cap = 0
     for g in range(groups):
         lo, hi = (kt * g) // groups, (kt * (g + 1)) // groups
@@ -2138,7 +2151,7 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
             kernel_source=str(_KDIR / name),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=crs, compile_time_args=ct,
-            runtime_args=[(c, args[c]) for c in all_cores], config=cfgd)
+            runtime_args=[(c, args[c]) for c in used], config=cfgd)
 
     # Not float32: packing into a Float32 circular buffer hangs the card here,
     # and the launch this replaces wrote bfloat16 partials to DRAM anyway.

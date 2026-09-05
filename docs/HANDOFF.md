@@ -6218,6 +6218,53 @@ INVARIANT 117: a paired, alternating A/B is the only reading this rig supports.
 Its absolute number drifted 1 ms over one sweep -- more than any change measured
 this session -- so an unpaired before/after is noise with a sign.
 
+### 45.10 The k-split's trace hang, found: idle cores signalling group 0's head
+
+The bisection, one site per process, with the prediction written down before the
+last two ran:
+
+| site | plan | cores of 110 | traced replay |
+|---|---|--:|---|
+| `hc_down` (shipped) | 10 x 11 | **110** | fine, always has been |
+| `router` | 5 x 22 | **110** | OK, 32.94 ms |
+| `qkv` | 5 x 22 | **110** | OK, 32.47 ms |
+| `shexp` | 2 x 44 | 88 | HUNG 4/4 |
+| `ab` | 80 x 1 | 80 | HUNG 4/4 |
+| `indexer` | 20 x 4 | 80 | HUNG |
+
+**A plan that covers all 110 cores runs; a plan that leaves cores idle hangs.**
+
+The mechanism, in `_ksgemv_program`: it launched on the whole grid and gave the
+cores outside every group all-zero runtime args. An idle core's `is_head` is
+then 0, so the reader takes its **non-head** path, which does
+
+    noc_semaphore_inc(get_noc_addr(hx, hy, get_semaphore(0)), 1)
+
+with `hx = hy = 0` -- so every idle core increments the `ready` semaphore of
+whichever core sits at (0, 0), which is group 0's head. That head reaches
+`N_DEST - 1` before its real members have armed, multicasts early, and a member
+that has not yet zeroed its `valid` waits for ever. It is invisible whenever the
+plan covers the grid, which is exactly why the two shipped shapes never showed
+it.
+
+The fix is not a workaround: **launch the kernel only on cores that have work.**
+Each group is one rectangle by construction, so the core-range set is one range a
+group and the runtime args are keyed on those cores alone.
+
+Two things this retires. `_KSG_FOLD`'s hang (42.1) is very likely the same bug --
+it is the same kernel, the same semaphore, and its A/Bs all ran on shapes where
+the geometry happened to differ. And it was **my** widened `_ksgemv_plan` guard
+that turned the indexer from 10 x 11 = 110 into 20 x 4 = 80, so the indexer's
+hang is one I introduced this session and then measured.
+
+INVARIANT 122: a `generic_op` must not be launched on cores it has no work for.
+Giving them zeroed runtime args is not neutral -- zero is a valid core
+coordinate, and a kernel that signals a neighbour will signal (0, 0).
+
+INVARIANT 123: write the prediction down before the run that tests it. "Full
+coverage runs, partial coverage hangs" was recorded with `qkv` and `indexer`
+still pending, which is the only reason their results mean anything.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
