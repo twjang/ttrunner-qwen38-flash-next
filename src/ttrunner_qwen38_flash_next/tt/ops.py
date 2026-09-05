@@ -998,16 +998,21 @@ def fused_gated_mean(mix, normed, hc_count: int, hidden_size: int,
 # a token against 50.79/50.79 for the eight ttnn ops it replaces, both pairs
 # agreeing.
 #
-# Why, so nobody rebuilds it: the SFPU multiplies whole tiles, so the per-row
-# injection scalar has to be spread across a tile first, and that spread is 1024
-# scalar writes which the reader redoes for every one of the 320 output tiles a
-# call. Caching it does not help because the circular buffer's slots alternate.
-# The ops it replaces are launch-bound rather than bandwidth-bound -- 5.8 us each
-# whatever they move (invariant 66) -- so eight of them on 655 KB tiles is a low
-# bar that a kernel doing real per-tile work does not clear.
+# That was true, and the cause was one word of it: "caching it does not help
+# because the circular buffer's slots alternate". The SFPU multiplies whole
+# tiles, so the per-row injection scalar has to be spread across one first, and
+# that spread is 1024 scalar writes. The reader caches it and keys the cache on
+# the slot address -- which a *double-buffered* CB alternates on every push, so
+# the cache never hit and the spread ran on all 320 output tiles instead of on
+# four. Giving the broadcast buffer one page instead of two makes the address
+# constant and the cache work.
 #
-# `TT_FUSED_REINJECT=1` turns it back on.
-_NO_FUSED_REINJECT = os.environ.get("TT_FUSED_REINJECT", "0") != "1"
+# The same A/B, before and after that one line: **-0.50 ms -> +0.58 ms**. The
+# kernel is also nearer float64 than the ops at every M it was checked at
+# (`reinject_kernel_check.py`).
+#
+# `TT_NO_FUSED_REINJECT=1` turns it off.
+_NO_FUSED_REINJECT = bool(os.environ.get("TT_NO_FUSED_REINJECT"))
 _KSPLIT: dict = {}
 _KS_KDIR = Path(__file__).resolve().parents[3] / "scripts" / "kernels"
 
@@ -1292,7 +1297,14 @@ def _reinject_program(hyper, branch, inject, out, hc_count: int, inj_base=None):
 
     cbs = [
         ttnn.CBDescriptor(
-            total_size=2 * tile_bytes, core_ranges=crs,
+            # **One** page for the broadcast tile (index 1), two for the rest.
+            # The reader caches the spread scalar across work items, and its
+            # cache key includes the slot address -- so a double-buffered CB,
+            # whose write pointer alternates, invalidated the cache on every
+            # single item and ran 1024 scalar writes a tile instead of one in
+            # eighty. That is the whole of why this kernel measured slower than
+            # the ops it replaces.
+            total_size=(1 if i == 1 else 2) * tile_bytes, core_ranges=crs,
             format_descriptors=[ttnn.CBFormatDescriptor(
                 buffer_index=i, data_format=hyper.dtype, page_size=tile_bytes)])
         for i in (0, 1, 2, 4)
