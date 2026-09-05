@@ -5173,3 +5173,65 @@ had been overtaken (the k-split, +1.82; the collective's default link count,
 Held throughout: 235 tests, determinism 0.0e+00 in every configuration, and the
 traced decoder emitting the same tokens as the eager one, which it did not do at
 the start of the session.
+
+## 35. Inside `gated_residual_mix`, and the last measurements
+
+`scripts/dev/grm_cumulative.py`, stripping cumulatively from a 35.46 ms baseline
+(two of the stubs are model-wide, marked):
+
+    - fused_group_norm      2.56 ms   97 calls, three launches each
+    - fused_gated_mean      0.73
+    - all_reduce  (model)   3.42
+    - linear_rows (model)   2.66
+
+So the norm is the largest piece of the largest remaining component, and the
+collective is still the largest single named cost in the model.
+
+### 35.1 `topology=Ring`, measured but not taken
+
+`num_links` was worth +0.75 ms (invariant 93) and bit-identical. Ring is a
+further 2 us on the wide reduce and is **not** identical -- the reduction order
+differs, and it shows as 1.6e-02 against Linear at 2560 wide:
+
+    W=2560   Linear/3 links 32.89 us      Ring/3 links 30.84   Ring/2 31.22
+    W=352    Linear default 12.87         Ring default 12.75   (all identical)
+
+0.2 ms for a numerics change whose effect on quality this rig cannot resolve --
+the day's top-1 readings move +-1 % between runs of identical code. Left on
+Linear. If someone wants it, the gate is `device_quality.py` against the Linear
+control, not a speed measurement.
+
+### 35.2 Two more fusions priced and left
+
+* **The group norm's first pass folded into `reinject`.** `reinject` already
+  touches every tile of the hyper stream and writes it; the norm's first pass
+  reads the same tiles back and squares them. Folding the square-and-accumulate
+  into `reinject` would delete pass 1 (7.44 us, ~0.6 ms a token) and is *exact*,
+  the same arithmetic moved earlier. What stops it being safe is staleness:
+  `grm` runs twice a layer and only the second of the pair always follows a
+  `reinject` -- the first may have a PLE add between it and the previous layer's,
+  which invalidates the partials. A wrong norm from a stale partial would be
+  silent.
+* **Not materialising `normed`.** Pass 3 writes it (320 tiles) only for
+  `fused_gated_mean` to read it back. Teaching `gated_mean` to take `x`, the
+  scale and the weight instead would drop 800 tiles of traffic and add 320, worth
+  about 0.28 ms, at the cost of putting the norm inside a second kernel.
+
+### 35.3 The state of it
+
+    47.87 -> 35.6 ms a token; 34.34 best      20.9 -> 28.1 tokens a second
+    5640  -> 2825 launches                    3.06 -> 2.95 GB
+
+Fourteen changes, eight new kernels, every one nearer float64 than what it
+replaced. The remaining items, all measured, none larger than 1.1 ms:
+
+    gather_gemv activation multicast   ~1.1   needs semaphores
+    the group norm's pass 1            ~0.6   needs a staleness guard
+    the expert weights transposed      ~0.8   conversion-time
+    normed not materialised            ~0.28
+    Ring topology                      ~0.2   changes the numerics
+
+Against the ~16.5 ms floor this decomposition allows (section 32), the model is
+at 46 %. Against the 7.9 ms that bytes alone suggest, 22 % -- and that number
+does not include the 4.4 ms of collectives or the launch floor, so it was never
+reachable by making the current graph cheaper.
