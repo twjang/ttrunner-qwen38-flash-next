@@ -5297,3 +5297,32 @@ is the point.
 
 Fifteen changes this session, nine new kernels. Against the ~16.5 ms floor this
 decomposition allows, the model is at **47 %**.
+
+### 36.4 Rejected a second time, and this time for a reason worth keeping
+
+`ew_slice_silu` -- the gate's slice and silu as one right-sized launch -- was
+rejected in 29.3 at +0.02 ms. Re-measured against the now-34 ms step, where a
+fixed launch cost is a larger fraction, it reads **+0.28 ms** best-of-five
+(+0.48, -0.07, -0.07, +0.19, +0.52), and the kernel is nearer float64 than the
+pair it replaces.
+
+It also makes the traced decoder **diverge from the eager one**:
+
+    slice+silu on   traced ' Paris.\n\nThe capital of France is Paris.\n\nThis'
+    slice+silu off  traced ' Paris. The capital of Germany is Berlin. The capital of'
+                    eager  ' Paris. The capital of Germany is Berlin. The capital of'
+
+Everything else holds -- 235 tests, determinism 0.0e+00 in every configuration,
+quality 73.3 / 90.1 / 1.206, which is *better* -- and the two paths still agree
+with the flag off. So it is the fusion, and it is the only op in the model that
+goes through `_small_ew`'s per-call-site output buffer.
+
+INVARIANT 97: `ops._small_ew`'s per-site buffer is not trace-safe. It has been
+correct in isolation every time it has been checked (`small_ew_check.py`) and has
+now failed twice in the model -- once by aliasing two live results through one
+wrapper line (24.3, top-1 73 % -> 0.5 %) and once by making a captured replay
+disagree with the eager path. Traced/eager agreement was recovered this session
+and is not worth 0.28 ms.
+
+The whole `ew_*` family stays where handoff 24.2 left it: correct, unused, and
+raw material for kernels that own their buffers.
