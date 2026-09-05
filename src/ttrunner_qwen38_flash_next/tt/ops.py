@@ -44,14 +44,64 @@ HIFI4 = ttnn.WormholeComputeKernelConfig(
 #
 # Below the grid it is already at its floor -- a 352-wide reduce is 12.8 us of
 # fixed cost for 0.7 KB -- so the extra links only add setup.
+# Every fused kernel below falls back to the plain ops when its guard declines,
+# and warns **once per process** -- so a second decline elsewhere is silent. A
+# guard that declines by accident is expensive and invisible: a `shape[:3]` that
+# ttnn's Shape does not support made `fused_delta_scalars` throw and take the
+# nine-op path on all 36 layers, which measured +2.25 ms and looked like noise
+# until the log was read. TT_STRICT_KERNELS turns every decline into a raise, so
+# a check run says which kernel and why.
+_STRICT_KERNELS = bool(os.environ.get("TT_STRICT_KERNELS"))
+if _STRICT_KERNELS:
+    # Not every decline in this file routes through `_declined` -- some warn
+    # inline -- so promote the warning itself. That covers the ones this helper
+    # does not, and any added later.
+    import warnings as _warnings
+    _warnings.simplefilter("error", RuntimeWarning)
+
+
+def _declined(what: str, why: str) -> None:
+    """Warn, or raise under TT_STRICT_KERNELS. Callers still return None."""
+    if _STRICT_KERNELS:
+        raise RuntimeError(f"{what} declined and TT_STRICT_KERNELS is set: {why}")
+    import warnings
+    warnings.warn(f"{what}, using the ops: {why}", RuntimeWarning, stacklevel=3)
+
+
 _AR_LINKS = int(os.environ.get("TT_AR_LINKS", "3"))
 _NO_AR_LINKS = bool(os.environ.get("TT_NO_AR_LINKS"))
 _AR_MIN_TILES = 16
 
 
+# The 12.8 -> 32.8 us step above is an **algorithm switch, not hops and not
+# bytes.** `ttnn.all_reduce` is a dispatcher: `all_reduce_async` looks for a
+# scatter dim, and at 352 wide (11 tiles) nothing divides by four, so it takes
+# the *composite* path -- one line all_gather and a local sum. At 2560 (80
+# tiles) 80 % 4 == 0, so it takes the *native* path, which is
+# `reduce_scatter_minimal_async` **then** `all_gather_async`: two fabric
+# collectives where the composite runs one. That is the whole width step.
+#
+# So the 84 wide reduces a token can be put back on the one-collective path
+# without a kernel: gather the four partials onto the batch axis and add them
+# here. It moves the sum out of `reduce_scatter` and into a local reduction, so
+# the reduction *order* changes -- which is the gate handoff 35.1 set for
+# `Topology.Ring` and it applies unchanged: `device_quality.py` against the
+# Linear control, not a speed measurement.
+_AR_COMPOSITE = os.environ.get("TT_AR_COMPOSITE", "0") == "1"
+
+
 def all_reduce(t):
     """`ttnn.all_reduce` over the mesh's one axis, with the link count that wins."""
-    if _NO_AR_LINKS or _tile_count(t) < _AR_MIN_TILES:
+    wide = _tile_count(t) >= _AR_MIN_TILES
+    if _AR_COMPOSITE and wide and len(t.shape) == 4 and int(t.shape[1]) == 1:
+        # dim=1 so the four partials arrive as four *rows of tiles*, which is
+        # the [1, G, 32, N] shape `fused_group_sum` already folds for the
+        # k-split -- no reshape, and the fold is on the cores the output needs.
+        g = ttnn.all_gather(t, dim=1, cluster_axis=1,
+                            topology=ttnn.Topology.Linear, num_links=_AR_LINKS)
+        folded = fused_group_sum(g, key=("arcomp", int(t.shape[-1]), str(t.dtype)))
+        return folded if folded is not None else ttnn.sum(g, dim=1, keepdim=True)
+    if _NO_AR_LINKS or not wide:
         return ttnn.all_reduce(t, cluster_axis=1, topology=ttnn.Topology.Linear)
     return ttnn.all_reduce(t, cluster_axis=1, topology=ttnn.Topology.Linear,
                            num_links=_AR_LINKS)
@@ -448,9 +498,7 @@ def fused_delta_out(v, predicted, beta, q, k, q_decayed, heads, head_dim, key=No
         if why is not None:
             if not _DOUT_FELL_BACK:
                 _DOUT_FELL_BACK = True
-                import warnings
-                warnings.warn(f"fused delta out declined, using the ops: {why}",
-                              RuntimeWarning, stacklevel=2)
+                _declined("fused delta out", f"{why}")
             return None
 
         okey = (key, id(v.device()), heads, head_dim, str(v.dtype))
@@ -555,9 +603,7 @@ def fused_delta_tail(o, z, w, heads: int, head_dim: int, eps: float, key=None):
         if why is not None:
             if not _DTAIL_FELL_BACK:
                 _DTAIL_FELL_BACK = True
-                import warnings
-                warnings.warn(f"fused delta tail declined, using the ops: {why}",
-                              RuntimeWarning, stacklevel=2)
+                _declined("fused delta tail", f"{why}")
             return None
 
         okey = (key, id(o.device()), heads, head_dim, str(o.dtype))
@@ -897,9 +943,7 @@ def fused_group_norm(x, weight, eps: float, group_size: int, groups: int, key=No
         if why is not None:
             if not _GNORM_FELL_BACK:
                 _GNORM_FELL_BACK = True
-                import warnings
-                warnings.warn(f"fused group norm declined, using the ops: {why}",
-                              RuntimeWarning, stacklevel=2)
+                _declined("fused group norm", f"{why}")
             return None
 
         dev = x.device()
@@ -1021,9 +1065,7 @@ def fused_qkv_heads(qkv, key_dim: int, value_dim: int, heads: int, head_dim: int
         if why is not None:
             if not _QKVH_FELL_BACK:
                 _QKVH_FELL_BACK = True
-                import warnings
-                warnings.warn(f"fused qkv heads declined, using the ops: {why}",
-                              RuntimeWarning, stacklevel=2)
+                _declined("fused qkv heads", f"{why}")
             return None
 
         okey = (key, id(qkv.device()), tuple(shape), str(qkv.dtype))
@@ -1131,8 +1173,14 @@ def fused_delta_scalars(both_ab, dt, a_decay, heads: int, key=None):
         return None
     try:
         why = None
-        if list(both_ab.shape) != [1, 1, 1, 2 * heads]:
-            why = f"both_ab is {list(both_ab.shape)}, expected [1, 1, 1, {2 * heads}]"
+        # `>=` rather than `==`: TILE layout pads a 24-wide row out to 32
+        # columns anyway, so a caller that declares the padding (to get the
+        # weight past `ksgemv`'s whole-tile guard) hands this the *same physical
+        # tile*. The kernel reads columns 0..heads and heads..2*heads by index,
+        # so anything past 2*heads is untouched either way.
+        sh = list(both_ab.shape)
+        if len(sh) != 4 or sh[:3] != [1, 1, 1] or int(sh[-1]) < 2 * heads:
+            why = f"both_ab is {list(both_ab.shape)}, expected [1, 1, 1, >= {2 * heads}]"
         elif 2 * heads > _TILE:
             why = f"{2 * heads} columns do not fit one tile"
         elif list(dt.shape) != [1, 1, 1, heads] or list(a_decay.shape) != [1, 1, 1, heads]:
@@ -1143,9 +1191,7 @@ def fused_delta_scalars(both_ab, dt, a_decay, heads: int, key=None):
         if why is not None:
             if not _DSCAL_FELL_BACK:
                 _DSCAL_FELL_BACK = True
-                import warnings
-                warnings.warn(f"fused delta scalars declined, using the ops: {why}",
-                              RuntimeWarning, stacklevel=2)
+                _declined("fused delta scalars", f"{why}")
             return None
 
         okey = (key, id(both_ab.device()), str(both_ab.dtype), heads)
@@ -1261,9 +1307,7 @@ def fused_conv_step(x, state, taps, key=None):
         if why is not None:
             if not _CONV_FELL_BACK:
                 _CONV_FELL_BACK = True
-                import warnings
-                warnings.warn(f"fused conv declined, using the ops: {why}",
-                              RuntimeWarning, stacklevel=2)
+                _declined("fused conv", f"{why}")
             return None
         okey = (key, id(x.device()), tuple(shape), str(x.dtype))
         out = _CONV_OUT.get(okey)
@@ -1998,12 +2042,18 @@ def _ksgemv_plan(grid, kt, nt):
     """Cores as (k-group, output tile), each group a rectangle. Or None.
 
     A group has to be a rectangle because the head multicasts the activation to
-    it. Two shapes of rectangle cover everything the model runs: when `nt`
-    divides the grid width, `nt` consecutive cores of one row -- so a 1-tile
+    it. Two shapes of rectangle cover everything the model runs: when `nt` fits
+    inside the grid width, `nt` consecutive cores of one row -- so a 1-tile
     output gets one group a core and eleven groups a row -- and otherwise whole
     rows, with the cores past `nt` in the rectangle for the handshake only.
     """
-    if _KSG_ROWS == 0 and nt <= grid.x and grid.x % nt == 0:
+    if _KSG_ROWS == 0 and nt <= grid.x:
+        # `grid.x % nt == 0` used to be required here, and the grid is **eleven**
+        # wide -- a prime -- so every nt from 2 to 10 fell through to whole-row
+        # groups, where only nt of each row's eleven cores do anything. Packing
+        # `per_row = grid.x // nt` groups into a row instead leaves the remainder
+        # columns idle rather than a whole row's worth: at nt = 5 that is 20
+        # groups of 5 (100 cores working) against 10 groups of 11 (50 working).
         per_row = grid.x // nt
         cores_pg = nt
         groups = min(kt, per_row * grid.y)
@@ -2136,9 +2186,7 @@ def ksgemv(x, w, key=None):
         if why is not None:
             if not _KSG_FELL_BACK:
                 _KSG_FELL_BACK = True
-                import warnings
-                warnings.warn(f"k-split gemv declined, using ttnn.linear: {why}",
-                              RuntimeWarning, stacklevel=2)
+                _declined("k-split gemv", f"{why}")
             return None
 
         dev = x.device()
@@ -2323,9 +2371,7 @@ def fused_outer_add(decayed, kt, delta, state, key=None):
         if why is not None:
             if not _OUTER_FELL_BACK:
                 _OUTER_FELL_BACK = True
-                import warnings
-                warnings.warn(f"fused outer add declined, using the ops: {why}",
-                              RuntimeWarning, stacklevel=2)
+                _declined("fused outer add", f"{why}")
             return False
         dev = decayed.device()
         ttnn.generic_op(

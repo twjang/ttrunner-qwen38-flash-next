@@ -24,7 +24,8 @@ from pathlib import Path
 import torch
 import ttnn
 
-from .ops import (HIFI4, _KSG_WIDE, fast_linear, ksgemv, ksplit_linear,
+from . import ops as _ops
+from .ops import (HIFI4, fast_linear, ksgemv, ksplit_linear,
                    output_tiles as ops_output_tiles)
 
 TILE = 32
@@ -195,7 +196,7 @@ def moe_block(
     # reduction groups -- measured 1.49x and more accurate than `ttnn.linear`
     # (invariant 57). Six is about where the split starts paying; the guard in
     # `ksplit_linear` declines anything narrower in groups than that pays for.
-    logits = ksgemv(x, router_w, key=("router", id(router_w))) if _KSG_WIDE else None
+    logits = ksgemv(x, router_w, key=("router", id(router_w))) if _ops._KSG_WIDE else None
     if logits is None:
         logits = ksplit_linear(x, router_w)
     if logits is None:
@@ -937,8 +938,13 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
     # that used to cap the core count is gone, so more cores is now better.
     #
     #   gate|up  35.01 us -> 27.99      down  25.74 -> 20.47
+    #
+    # ...and one column a core was never swept, only two against the pre-multicast
+    # cap. `n = min(nt_out, ceil(nt_out / cols), 110)` above, so cols = 1 doubles
+    # the cores: gate|up goes from 50 to 100 of 110, down from 44 to 80.
+    # `TT_GG_COLS` sweeps it.
     both = (gather_gemv(x, gate_w, idx_pad, k_sel, 2,
-                        (1, 1, x.shape[-2], k_sel * 2 * n), 1, 2)
+                        (1, 1, x.shape[-2], k_sel * 2 * n), 1, _GG_COLS)
             if x.shape[-2] <= TILE else None)
     if both is None:
         gu = _gather(gate_w, idx_pad, k_sel, 2,
@@ -961,13 +967,15 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
     scaled = ttnn.multiply(hidden, ttnn.matmul(vals, spread, compute_kernel_config=HIFI4))
 
     out = (gather_gemv(scaled, down_w, idx_pad, k_sel, 0,
-                       (1, 1, scaled.shape[-2], hidden_size), 1, 2)
+                       (1, 1, scaled.shape[-2], hidden_size), 1, _GG_COLS)
            if scaled.shape[-2] <= TILE else None)
     if out is not None:
         return out
     dw = _gather(down_w, idx_pad, k_sel, 0, (1, 1, k_sel * n, hidden_size), 1)
     return fast_linear(scaled, dw, compute_kernel_config=HIFI4)
 
+
+_GG_COLS = int(os.environ.get("TT_GG_COLS", "2"))
 
 _SHEXP_GU: dict = {}
 
@@ -1003,7 +1011,7 @@ def shared_expert(
     # [2560, 1312] is forty-one output tiles, so `fast_linear` runs it on
     # forty-one of a hundred and ten cores. The k-split affords two reduction
     # groups of forty-four, which is the whole grid.
-    both = ksgemv(x, fused, key=("shexp_gu", id(fused))) if _KSG_WIDE else None
+    both = ksgemv(x, fused, key=("shexp_gu", id(fused))) if _ops._KSG_WIDE else None
     if both is None:
         both = fast_linear(x, fused, compute_kernel_config=HIFI4)
     n = gate_w.shape[-1]

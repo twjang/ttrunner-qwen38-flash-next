@@ -807,18 +807,30 @@ class TTModel:
 
     _FUSED_PAIRS: dict = {}
 
-    def _fused_pair(self, layer: int, left: str, right: str) -> ttnn.Tensor:
+    def _fused_pair(self, layer: int, left: str, right: str,
+                    pad_to_tile: bool = False) -> ttnn.Tensor:
         """Two same-input projections concatenated on their output axis.
 
         Built once per layer at first use. Cost here follows output *width* and
         only once the grid is full, so two narrow matmuls against one input are
         strictly worse than one wider one -- see invariant 55, and
         `scripts/dev/narrow_linear_cost.py` for the measurements.
+
+        `pad_to_tile` zero-fills the result out to a whole tile. It is free --
+        TILE layout already pads the row to 32 columns, so the padded tensor is
+        the same tile count and the same physical bytes -- and it is what gets a
+        sub-tile output past `ksgemv`'s whole-tile guard. The caller must then
+        take the halves' width from the *left* weight rather than from half the
+        concatenated width, which is why this is opt-in.
         """
-        key = (layer, left, right)
+        key = (layer, left, right, pad_to_tile)
         got = self._FUSED_PAIRS.get(key)
         if got is None:
             got = ttnn.concat([self.w.blk(layer, left), self.w.blk(layer, right)], dim=-1)
+            if pad_to_tile:
+                pad = (-int(got.shape[-1])) % 32
+                if pad:
+                    got = ttnn.pad(got, [(0, 0), (0, 0), (0, 0), (0, pad)], 0.0)
             self._FUSED_PAIRS[key] = got
         return got
 
@@ -891,7 +903,13 @@ class TTModel:
         # so they are one matmul with a wider output. Width costs nothing until
         # it fills the grid -- [2560, 48] and [2560, 96] both measure 31.6 us --
         # so this halves 2.28 ms a token to 1.14 (invariant 55).
-        ab = self._fused_pair(layer, "ssm_alpha.weight", "ssm_beta.weight")
+        # Padded to a whole tile: [2560, 24] float32 is one output tile, which
+        # `ttnn.linear` gives to **one** core of a hundred and ten while it walks
+        # all eighty k-tiles, and `ksgemv` refuses outright because 24 is not a
+        # whole tile. The pad costs nothing (the tile was already 32 wide) and
+        # lets the k-split have it: nt = 1 affords eighty reduction groups.
+        ab = self._fused_pair(layer, "ssm_alpha.weight", "ssm_beta.weight",
+                              pad_to_tile=True)
         # Three output tiles, the narrowest in the model after the fusion above,
         # so the grid affords more reduction groups here than anywhere else.
         both_ab = None
@@ -901,7 +919,9 @@ class TTModel:
             both_ab = ksplit_linear(mixed, ab)
         if both_ab is None:
             both_ab = linear_rows(mixed, ab, compute_kernel_config=HIFI4)
-        half = both_ab.shape[-1] // 2
+        # From the left weight, not from half the output: `ab` is padded out to
+        # a whole tile above, so half the width is not the number of heads.
+        half = int(self.w.blk(layer, "ssm_alpha.weight").shape[-1])
         dt = self.w.blk(layer, "ssm_dt.bias")
         a_decay = self.w.blk(layer, "ssm_a")
         # Nine launches -- two slices, an add, a softplus, a multiply, an exp, a
