@@ -4418,3 +4418,108 @@ is 8/8; batch 32 agrees row-to-row and no longer matches a single-sequence run.
 That is a deliberate trade of a serving property for 1.28 ms of the thing the
 goal asks for, and `TT_NO_SHARDED_RMSNORM=1` reverses it. Anyone who needs
 32-slot exactness more than 2.7 % of the step should set it.
+
+## 27. Batch 1, second pass: four changes, 3.5 ms, and two traps worth more
+
+The step went **47.87 -> 44.37 ms** on `decode_ablation_check.py none`, all of it
+from removing launches. Nothing here made an op faster; every millisecond came
+from there being fewer of them.
+
+| change | `ab_step.py` | how |
+|---|---:|---|
+| decode conv on rows | +0.69 | the permute/transpose round trip stops existing |
+| fused causal conv | +1.58 | 11 wide ops a layer -> 1 launch, ring shift included |
+| fused DeltaNet decay/beta | +1.16 | 9 one-tile ops a layer -> 1 core |
+| reinject broadcast CB | +0.58 | a one-page buffer instead of two (see 27.2) |
+
+And the component breakdown moved where it should:
+
+    deltanet  14.56 -> 11.18 ms      moe  7.81 -> 8.76
+    qsa        3.54 ->  4.27         reinject  2.95 -> 2.84
+
+### 27.1 Both traps were silence
+
+The fused conv measured **+0.12 ms** on its first A/B and was nearly abandoned.
+The conv weight is float32 and the stream is bfloat16, so the kernel's dtype
+guard returned `None` -- without a word -- and the A/B compared the op path with
+itself. With the taps typecast once and cached it is +1.58.
+
+INVARIANT 83: a guard that returns `None` for an unsupported shape or dtype must
+say so, once, as a `RuntimeWarning`. Invariant 71 said this about *exceptions*;
+the quiet `return None` is the same failure with better manners, and it has now
+cost two measurement rounds in two sessions.
+
+`model.TTModel._as_dtype` caches the one typecast a fused kernel needs when a
+float32 weight meets a bfloat16 stream. Every kernel that mixes the two wants it
+(invariant 76).
+
+### 27.2 The reinject kernel was right; its circular buffer was not
+
+Section 22 recorded the fused reinject at -0.50 ms and shelved it, with the
+reason written down and not followed up: *"caching it does not help because the
+circular buffer's slots alternate."*
+
+The reader spreads the per-row injection scalar across a tile -- 1024 scalar
+writes -- and caches the result, keyed on the slot address. A double-buffered CB
+alternates its write pointer on every push, so the key changed every time and the
+spread ran on all **320** output tiles a call instead of on four. Giving that one
+buffer a single page makes the address constant.
+
+    -0.50 ms  ->  +0.58 ms, from `total_size=2 * tile_bytes` to `1 *`
+
+INVARIANT 84: a cache key that includes a circular buffer's write pointer never
+hits. If a kernel caches work across items, the buffer holding that work needs
+one page, not two.
+
+### 27.3 Rejected: packing the activation, and reading only the live row
+
+Section 25 proposed carrying activations as `[1, 1, 32, X/32]` and priced it at
+~6 ms. It is worth nothing, and so is the cheaper version of the same idea (a
+kernel that reads only row 0 of each tile, 64 bytes instead of 2048).
+
+A 320-tile `ttnn.multiply` costs 5.33 us marginal. `dispatch_floor.py` prices a
+110-core launch at 5.81 and a one-core launch at 2.06. The op is **at its launch
+floor already** -- the 640 KB it moves is not what it is waiting for. Cutting the
+bytes 32-fold leaves the launch, and cutting the cores means each remaining core
+moves more, or issues six 32-byte NOC transactions a tile instead of three
+2 KB ones, which is worse.
+
+INVARIANT 85: at M = 1 a wide elementwise op is launch-bound, not bandwidth-bound.
+The only thing that makes it cheaper is not issuing it. Fusion, not layout.
+
+The channel-major hyper stream (`[1, hc, M, H]` instead of `[1, 1, M, hc*H]`) is
+the same mistake in a different shape and was tried and reverted: both forms are
+320 tiles at batch 1, so the reshapes it removes are paid straight back by a
+`grouped_rms_norm` that now normalises 320 tiles where it used to fold to 80.
+The *folded* form is the one with fewer tiles, and it cannot be carried, because
+`gated_residual_mix` needs `mesh_partition(dim=-1)` to hand device d group d and
+a folded stream has the groups on rows, which will not slice tile-aligned.
+
+### 27.4 Two things the record had wrong
+
+**Batch equivalence is already gone at HEAD.** Section 25.2 says the rig is
+"batch-exact to 32 slots". It is not, and was not before this session's changes:
+`batch_equivalence_check.py` gives 8/8 at batch 8 and 0/32 at batch 32 on the
+committed tree with every new flag turned off. Batch 1 is the goal, so this was
+not chased -- but nobody should plan against that sentence.
+
+**Traced and eager now agree.** They had differed for as long as
+`traced_vs_eager.py` has existed. Fusing the DeltaNet decay/beta chain closed it:
+the two paths now emit the same twelve tokens.
+
+### 27.5 Where the remaining time is
+
+`step_op_census.py` with the site dump, ranked by calls x their marginal price:
+
+    reinject group   ops.py:1159-1163      ~3.2 ms   (now partly fused)
+    ksplit's sum     ops.py:889            ~1.0 ms   cross-core, needs semaphores
+    grouped_rms_norm ops.py:55,59,60 +
+                     _sharded_rms_norm     ~3.2 ms   6 wide ops x 100 calls
+    q/k l2norm       model.py:519          ~0.4 ms   2 ops x 72
+    DeltaNet tail    model.py:869-880      ~0.7 ms   6 ops x 36
+    decode_step      linear_attn.py        ~0.7 ms   9 small ops x 36
+
+The matmuls are 9.45 ms and the memory roofline is 7.9. Everything above is the
+gap, and every entry in it is a chain of ops that exists to move between the ops
+around it.
+
