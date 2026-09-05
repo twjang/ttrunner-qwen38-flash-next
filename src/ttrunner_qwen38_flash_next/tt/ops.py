@@ -438,6 +438,232 @@ def fused_delta_tail(o, z, w, heads: int, head_dim: int, eps: float, key=None):
         return None
 
 
+_GNORM_OUT: dict = {}
+_GNORM_FELL_BACK = False
+_NO_FUSED_GROUP_NORM = bool(os.environ.get("TT_NO_FUSED_GROUP_NORM"))
+
+
+_CAST_ONCE: dict = {}
+
+
+def as_dtype(t, dtype):
+    """`t` in `dtype`, converted once and kept.
+
+    A compute kernel configures its unpacker from one circular buffer, so a
+    float32 weight read through a bfloat16 one is garbage (invariant 76) -- and
+    a guard that only declines makes the A/B compare a path with itself, which
+    has now happened four times in this project.
+    """
+    if t.dtype == dtype:
+        return t
+    key = (id(t), str(dtype))
+    hit = _CAST_ONCE.get(key)
+    if hit is None:
+        hit = ttnn.typecast(t, dtype)
+        _CAST_ONCE[key] = hit
+    return hit
+
+
+def _gnorm_devid(device):
+    """Which mesh device is running, as a tensor.
+
+    `generic_op` broadcasts one program to the whole mesh, so runtime args are
+    identical everywhere. A tensor sharded on dim 0 is not -- the same trick
+    `moe._router_devid` uses. Sixteen uint32 so the page clears DRAM's 64 B
+    alignment.
+    """
+    key = ("gnorm_devid", id(device))
+    got = _GNORM_OUT.get(key)
+    if got is None:
+        n = device.get_num_devices()
+        got = ttnn.from_torch(
+            torch.arange(n, dtype=torch.int32).reshape(n, 1, 1, 1)
+            .expand(n, 1, 1, 16).contiguous(),
+            dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=0))
+        _GNORM_OUT[key] = got
+    return got
+
+
+# Partials a group in the RMS reduction. The reduction is SFPU-bound, not
+# bandwidth-bound: one core over a whole 80-tile group is 240 tile operations and
+# measured 31 us on four cores. Ten partials a group is 24 each.
+# Swept against the ops it replaces (27.85 us): 4 -> 23.09, 5 -> 25.61,
+# 8 -> 21.66, 10 -> 22.56, 16 -> 21.45, 20 -> 22.03.
+_GNORM_PARTS = int(os.environ.get("TT_GNORM_PARTS", "16"))
+
+
+def _gnorm_programs(x, w, part, scale, out, local, devid, nt_g, groups, recip, eps,
+                    parts):
+    dev = x.device()
+    grid = dev.compute_with_storage_grid_size()
+    acc = {}
+    for tag, t in (("x", x), ("w", w), ("p", part), ("s", scale), ("o", out),
+                   ("l", local), ("d", devid)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"fused group norm: {tag} must be interleaved")
+        acc[tag] = ct
+    page = acc["x"][1]
+    for tag in ("w", "p", "s", "o", "l"):
+        if acc[tag][1] != page:
+            raise RuntimeError("fused group norm: every tile operand shares a page size")
+
+    def kern(name, ct, args, cfgd, crs, cores):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    def core_set(n):
+        n = max(1, min(n, grid.x * grid.y))
+        cols = min(n, grid.x)
+        rows = (n + grid.x - 1) // grid.x
+        crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+            ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+        return crs, [ttnn.CoreCoord(cx, cy) for cy in range(rows) for cx in range(cols)]
+
+    SN, SD = 1, 2                      # the reader takes half of every run
+
+    def reduction(runs, src, src_acc, dst, dst_acc, square, cap):
+        """One reduction pass: `runs` is [(out_page, tile_lo, tile_len), ...]."""
+        crs, cores = core_set(len(runs))
+        args = []
+        for i, c in enumerate(cores):
+            if i < len(runs):
+                o, lo, ln = runs[i]
+                args.append((o, o + 1, lo, ln))
+            else:
+                args.append((0, 0, 0, 0))
+        half = max(1, (cap * SN + SD - 1) // SD)
+        cbs = [ttnn.CBDescriptor(
+            total_size=n * page, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=i, data_format=x.dtype, page_size=page)])
+            for i, n in ((0, half), (1, max(1, cap - half + 1)), (2, 2))]
+        return ttnn.ProgramDescriptor(kernels=[
+            kern("group_rms_reader.cpp", [page, SN, SD] + src_acc,
+                 [[src.buffer_address(), a[0], a[1], a[2], a[3]] for a in args],
+                 ttnn.ReaderConfigDescriptor(), crs, cores),
+            kern("group_rms_compute.cpp", [square, recip, eps, SN, SD],
+                 [[a[0], a[1], a[3]] for a in args],
+                 ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True), crs, cores),
+            kern("group_rms_writer.cpp", [page, SN, SD] + dst_acc + src_acc,
+                 [[dst.buffer_address(), src.buffer_address(), a[0], a[1], a[2], a[3]]
+                  for a in args],
+                 ttnn.WriterConfigDescriptor(), crs, cores),
+        ], semaphores=[], cbs=cbs)
+
+    # --- pass 1: partial sums of squares -------------------------------------
+    runs_a, cap_a = [], 0
+    for g in range(groups):
+        for j in range(parts):
+            lo = g * nt_g + (nt_g * j) // parts
+            hi = g * nt_g + (nt_g * (j + 1)) // parts
+            runs_a.append((g * parts + j, lo, hi - lo))
+            cap_a = max(cap_a, hi - lo)
+    prog_a = reduction(runs_a, x, acc["x"], part, acc["p"], 1, cap_a)
+
+    # --- pass 2: fold each group's partials into its scale --------------------
+    runs_b = [(g, g * parts, parts) for g in range(groups)]
+    prog_a2 = reduction(runs_b, part, acc["p"], scale, acc["s"], 0, parts)
+
+    # --- pass 3: scale, weight, and this device's own group -------------------
+    total = groups * nt_g
+    crs_b, cores_b = core_set(total)
+    work_b = [((total * i) // len(cores_b), (total * (i + 1)) // len(cores_b))
+              for i in range(len(cores_b))]
+    cbs_b = [ttnn.CBDescriptor(
+        total_size=n * page, core_ranges=crs_b,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=x.dtype, page_size=page)])
+        # index 2 is the scale: **one** page, so the reader's cache key is stable
+        for i, n in ((0, 2), (1, 2), (2, 1), (3, 2), (4, 2))]
+    cbs_b.append(ttnn.CBDescriptor(
+        total_size=64 * ((acc["d"][1] + 64 + 63) // 64), core_ranges=crs_b,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=5, data_format=ttnn.uint32, page_size=64)]))
+    prog_b = ttnn.ProgramDescriptor(kernels=[
+        kern("group_scale_reader.cpp", [nt_g, page] + acc["x"] + acc["w"] + acc["s"],
+             [[x.buffer_address(), w.buffer_address(), scale.buffer_address(), lo, hi]
+              for lo, hi in work_b], ttnn.ReaderConfigDescriptor(), crs_b, cores_b),
+        kern("group_scale_compute.cpp", [], [[lo, hi] for lo, hi in work_b],
+             ttnn.ComputeConfigDescriptor(), crs_b, cores_b),
+        kern("group_scale_writer.cpp", [nt_g, 1] + acc["o"] + acc["l"] + acc["d"],
+             [[out.buffer_address(), local.buffer_address(), devid.buffer_address(),
+               lo, hi] for lo, hi in work_b],
+             ttnn.WriterConfigDescriptor(), crs_b, cores_b),
+    ], semaphores=[], cbs=cbs_b)
+    return prog_a, prog_a2, prog_b
+
+
+def fused_group_norm(x, weight, eps: float, group_size: int, groups: int, key=None):
+    """`grouped_rms_norm` and `mesh_partition` in two launches. Or None.
+
+    Returns `(normed, local)` where `local` is this device's own group -- the
+    same tensor `mesh_partition(normed, dim=-1)` produces, written by the same
+    kernel that is already producing those tiles.
+
+    Six launches become two: the reshapes only existed because `ttnn.rms_norm`
+    reduces over the last axis, and a kernel doing its own reduction leaves the
+    groups where they are.
+    """
+    global _GNORM_FELL_BACK
+    if _NO_FUSED_GROUP_NORM:
+        return None
+    try:
+        why = None
+        shape = list(x.shape)
+        if shape[:3] != [1, 1, 1]:
+            why = f"x is {shape}; this path is M = 1 only"
+        elif shape[3] != groups * group_size:
+            why = f"x is {shape[3]} wide, expected {groups} x {group_size}"
+        elif group_size % _TILE:
+            why = f"group_size {group_size} is not a whole number of tiles"
+        elif list(weight.shape) != shape or weight.dtype != x.dtype:
+            why = (f"weight is {list(weight.shape)} {weight.dtype}, expected "
+                   f"{shape} {x.dtype}")
+        if why is not None:
+            if not _GNORM_FELL_BACK:
+                _GNORM_FELL_BACK = True
+                import warnings
+                warnings.warn(f"fused group norm declined, using the ops: {why}",
+                              RuntimeWarning, stacklevel=2)
+            return None
+
+        dev = x.device()
+        okey = (key, id(dev), tuple(shape), str(x.dtype), groups)
+        bufs = _GNORM_OUT.get(okey)
+        if bufs is None:
+            def mk(sh):
+                return ttnn.from_torch(
+                    torch.zeros(*sh), dtype=x.dtype, layout=ttnn.TILE_LAYOUT,
+                    device=dev, mesh_mapper=ttnn.ReplicateTensorToMesh(dev))
+            bufs = (mk((groups * _GNORM_PARTS, 1, _TILE, _TILE)),
+                    mk((groups, 1, _TILE, _TILE)), mk(shape),
+                    mk((1, 1, 1, group_size)))
+            _GNORM_OUT[okey] = bufs
+        part, scale, out, local = bufs
+        devid = _gnorm_devid(dev)
+        bits = lambda f: struct.unpack("<I", struct.pack("<f", float(f)))[0]  # noqa: E731
+        pa, pa2, pb = _gnorm_programs(x, weight, part, scale, out, local, devid,
+                                      group_size // _TILE, groups,
+                                      bits(1.0 / group_size), bits(eps),
+                                      _GNORM_PARTS)
+        ttnn.generic_op([x, part], pa)
+        ttnn.generic_op([part, scale], pa2)
+        ttnn.generic_op([x, weight, scale, out, local, devid], pb)
+        return out, local
+    except Exception as exc:                                        # noqa: BLE001
+        if not _GNORM_FELL_BACK:
+            _GNORM_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused group norm unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 _QKVH_OUT: dict = {}
 _QKVH_FELL_BACK = False
 _NO_FUSED_QKV_HEADS = bool(os.environ.get("TT_NO_FUSED_QKV_HEADS"))
@@ -1494,7 +1720,15 @@ def gated_residual_mix(
     Returns (mixed [.., hidden_size], normed [.., hc*hidden], inject or None).
     Mirrors Qwen4ExpModel._gated_residual.
     """
-    normed = grouped_rms_norm(hyper, norm_w, eps, hidden_size, hc_count)
+    # Seven launches -- the norm's six and the partition behind it -- become
+    # three. The reshapes existed only because `ttnn.rms_norm` reduces over the
+    # last axis, and the partition hands device d exactly the group this kernel
+    # is already writing. 27.85 us to 21.45 (`group_norm_check.py`).
+    fused = fused_group_norm(hyper, as_dtype(norm_w, hyper.dtype), eps,
+                             hidden_size, hc_count, key=("grm", id(norm_w)))
+    normed, local_pre = fused if fused is not None else (None, None)
+    if normed is None:
+        normed = grouped_rms_norm(hyper, norm_w, eps, hidden_size, hc_count)
 
     # down_w and inject_w carry the 1/hc_count factor already (folded at
     # conversion; exact, since 1/4 only shifts the block-float exponent)
@@ -1515,7 +1749,7 @@ def gated_residual_mix(
     # `down_w` is only [2560, 320]. `mesh_partition` is the inverse of
     # all_gather: device d keeps columns [d*2560, (d+1)*2560).
     span = down_w.shape[-1]
-    local = ttnn.mesh_partition(normed, dim=-1)
+    local = local_pre if local_pre is not None else ttnn.mesh_partition(normed, dim=-1)
     if inject_w is None:
         part = linear_rows(local, down_w, compute_kernel_config=HIFI4)
     else:
