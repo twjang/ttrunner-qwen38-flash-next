@@ -150,7 +150,7 @@ def _gated_mean_output(src, hidden_size: int):
     return out
 
 
-def _gated_mean_program(a, b, out, hc_count: int):
+def _gated_mean_program(a, b, out, hc_count: int, sigmoid_a: bool = False):
     """Descriptors for this call's buffer addresses.
 
     Rebuilt per call because `a` and `b` are fresh allocations and their
@@ -201,7 +201,7 @@ def _gated_mean_program(a, b, out, hc_count: int):
                  [nt_out, hc_count, tile_bytes] + acc["a"] + acc["b"],
                  [[a.buffer_address(), b.buffer_address(), lo, hi] for lo, hi in work],
                  ttnn.ReaderConfigDescriptor()),
-            kern("gated_mean_compute.cpp", [hc_count, inv_bits],
+            kern("gated_mean_compute.cpp", [hc_count, inv_bits, int(sigmoid_a)],
                  [[hi - lo] for lo, hi in work], ttnn.ComputeConfigDescriptor()),
             kern("gated_mean_writer.cpp", [tile_bytes] + acc["o"],
                  [[out.buffer_address(), lo, hi] for lo, hi in work],
@@ -210,13 +210,23 @@ def _gated_mean_program(a, b, out, hc_count: int):
         semaphores=[], cbs=cbs)
 
 
-def fused_gated_mean(mix, normed, hc_count: int, hidden_size: int):
-    """(1/hc) * sum_h mix_h * normed_h, in one pass. Falls back to the ops."""
+def fused_gated_mean(mix, normed, hc_count: int, hidden_size: int,
+                     apply_sigmoid: bool = False):
+    """(1/hc) * sum_h sigmoid?(mix_h) * normed_h, in one pass.
+
+    `apply_sigmoid` folds the caller's read gate in. The kernel already holds the
+    tile in a register to multiply it, so the sigmoid is free there where outside
+    it was an op on a 10240-wide stream, 96 times a token.
+    """
     try:
         out = _gated_mean_output(mix, hidden_size)
-        ttnn.generic_op([mix, normed, out], _gated_mean_program(mix, normed, out, hc_count))
+        ttnn.generic_op(
+            [mix, normed, out],
+            _gated_mean_program(mix, normed, out, hc_count, apply_sigmoid))
         return out
     except Exception:                                               # noqa: BLE001
+        if apply_sigmoid:
+            mix = ttnn.sigmoid(mix)
         gated = ttnn.multiply(mix, normed)
         parts = [
             ttnn.slice(gated, (0, 0, 0, h * hidden_size),
@@ -420,7 +430,8 @@ def gated_residual_mix(
         else ttnn.slice(whole, (0, 0, 0, 0),
                         (whole.shape[0], whole.shape[1], whole.shape[2], span))
     )
-    mix = ttnn.sigmoid(linear_rows(mix, up_w, compute_kernel_config=HIFI4))
+    # No sigmoid here: fused_gated_mean is its only reader and folds it in.
+    mix = linear_rows(mix, up_w, compute_kernel_config=HIFI4)
     # Nine ttnn ops -- the multiply, four slices, three adds and the scale --
     # collapse into one kernel pass. See `fused_gated_mean` for why, and for the
     # fallback if `generic_op` is unavailable.
@@ -428,7 +439,7 @@ def gated_residual_mix(
     # (A `gated = ttnn.multiply(mix, normed)` used to sit here, left behind when
     # the fused kernel took over the work: a 10240-wide multiply on a tile padded
     # from one row to thirty-two, 96 times a token, whose result nothing read.)
-    mixed = fused_gated_mean(mix, normed, hc_count, hidden_size)
+    mixed = fused_gated_mean(mix, normed, hc_count, hidden_size, apply_sigmoid=True)
 
     inject = None
     if inject_w is not None:

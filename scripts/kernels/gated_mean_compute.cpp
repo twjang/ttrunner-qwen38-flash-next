@@ -5,7 +5,12 @@
 // and only the final tile is packed out.
 //
 // Runtime args: 0 = output tiles this core owns.
-// Compile-time args: 0 = HC, 1 = 1/hc as float bits (for mul_unary_tile).
+// Compile-time args: 0 = HC, 1 = 1/hc as float bits (for mul_unary_tile),
+//                    2 = SIGMOID_A: apply sigmoid to the `mix` operand.
+//
+// SIGMOID_A exists because the caller's sigmoid had exactly one reader --
+// this kernel -- and the tile is already in a register by the time it
+// would run.
 
 #include <cstdint>
 #include "api/compute/compute_kernel_api.h"
@@ -18,6 +23,7 @@
 void kernel_main() {
     constexpr uint32_t HC = get_compile_time_arg_val(0);
     constexpr uint32_t INV_HC_BITS = get_compile_time_arg_val(1);
+    constexpr uint32_t SIGMOID_A = get_compile_time_arg_val(2);
     const uint32_t n_tiles = get_arg_val<uint32_t>(0);
 
     constexpr uint32_t cb_a = 0;
@@ -34,6 +40,10 @@ void kernel_main() {
         for (uint32_t h = 0; h < HC; ++h) {
             copy_tile(cb_a, h, 0);
             copy_tile(cb_b, h, 1);
+            if (SIGMOID_A) {
+                sigmoid_tile_init();
+                sigmoid_tile(0);
+            }
             mul_binary_tile_init();
             if (h == 0) {
                 mul_binary_tile(0, 1, 4);            // accumulator starts here

@@ -475,14 +475,21 @@ _READ_BATCH = 8
 # slots the expert-axis layout needed, and unlike those ten it wastes nothing:
 # every slot but the tie tail carries a real expert.
 #
-# Unless the tie tail is not wanted. The reference takes the `top_k` largest;
-# this project's threshold form (`probs >= the top_k-th value`) admits ties as an
-# artifact of comparing in bfloat16, and the expert-axis shard absorbed that for
-# free because an extra landed on whichever device already owned it. With every
-# device holding every expert it has to be paid for in slots -- 16 rather than
-# 10, which is 1.6x the gather and both matmuls. `router_select.cpp` can do
-# either; this switch says which, and it changes `k_sel` with it.
-ROUTER_EXACT_TOPK = os.environ.get("TT_ROUTER_EXACT_TOPK", "0") == "1"
+# Except that the tie tail is not wanted. `reference/model.py` selects with
+# `torch.topk(probs, num_experts_per_tok)` and normalises over exactly those --
+# **no tie admission**. This project's threshold form (`probs >= the top_k-th
+# value`) is the approximation, and it admits ~1.5 extra experts a row as an
+# artifact of comparing in bfloat16. The expert-axis shard absorbed that for
+# free, because an extra landed on whichever device already owned it; with every
+# device holding every expert it has to be paid for in slots, 16 rather than 10,
+# which is 1.6x the gather and both matmuls.
+#
+# Measured on 234 tokens, the two rules are indistinguishable -- **top-5
+# identical at 200/234 and NLL 1.514 against 1.515** -- while top-1 differs by 3
+# tokens, which is 0.4 sigma. So the exact rule is the reference's own, the same
+# quality, and 62.31 -> 58.42 ms a token. `TT_ROUTER_EXACT_TOPK=0` restores the
+# threshold.
+ROUTER_EXACT_TOPK = os.environ.get("TT_ROUTER_EXACT_TOPK", "1") == "1"
 WIDE_EXPERTS = 10 if ROUTER_EXACT_TOPK else 16
 _WIDE_FELL_BACK = False
 
