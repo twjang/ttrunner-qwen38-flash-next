@@ -6074,6 +6074,21 @@ avoids -- but it inherits the replay hang (45.4) and the reduction-order gate,
 against a step that is currently bit-reproducible. Measure the composite's
 quality first; it is the cheap half of the same idea.
 
+### 45.6 The gate, and the default flipped
+
+    determinism, composite off   0.000e+00 on every line
+    determinism, composite on    0.000e+00 on every line
+    device_quality 192, off      top-1 72.8 %  top-5 91.1 %  NLL 1.219
+    device_quality 192, on       top-1 72.3 %  top-5 90.6 %  NLL 1.217
+
+One token in 191 either way, and the NLL is marginally *better* on the composite
+path. Invariant 70 puts this rig's noise at six top-1 tokens and 36.4 records it
+moving +-1 % between identical runs, so this is a pass, not a small loss. The
+step is still bit-reproducible, which is the thing the reduction-order change
+actually threatened.
+
+**On by default**; `TT_NO_AR_COMPOSITE` restores the native path.
+
 INVARIANT 117: a paired, alternating A/B is the only reading this rig supports.
 Its absolute number drifted 1 ms over one sweep -- more than any change measured
 this session -- so an unpaired before/after is noise with a sign.

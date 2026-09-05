@@ -87,7 +87,11 @@ _AR_MIN_TILES = 16
 # the reduction *order* changes -- which is the gate handoff 35.1 set for
 # `Topology.Ring` and it applies unchanged: `device_quality.py` against the
 # Linear control, not a speed measurement.
-_AR_COMPOSITE = os.environ.get("TT_AR_COMPOSITE", "0") == "1"
+# On. Five paired runs at -0.45 ms (handoff 45.5), determinism 0.000e+00 with it,
+# and `device_quality.py 192` moves one token in 191 either way -- 72.8 -> 72.3
+# top-1, 91.1 -> 90.6 top-5, NLL 1.219 -> 1.217 -- against invariant 70's noise
+# floor of six tokens. `TT_NO_AR_COMPOSITE` restores the native path.
+_AR_COMPOSITE = not os.environ.get("TT_NO_AR_COMPOSITE")
 
 
 def all_reduce(t):
