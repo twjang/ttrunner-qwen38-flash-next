@@ -5071,3 +5071,49 @@ INVARIANT 94: a roofline built from bytes alone is not a target. Collectives cos
 what they cost regardless of size, and every launch has a floor. Price those two
 into the number before quoting it, or the gap will keep looking like a fusion
 backlog when it is a decomposition.
+
+## 33. Cumulative ablation, and the first exact decomposition of the step
+
+Single-part ablation measures a component *in the presence of everything else*,
+and those overlap: this session's single-part numbers summed to 26 of 36 ms with
+no way to attribute the rest, and two whole families of them (`g:` and `w:`) went
+negative because their stub was more expensive than the code it replaced.
+
+`scripts/dev/cumulative_ablation.py` strips components and never puts them back.
+Each step's delta is that component's marginal cost *given what is already gone*,
+the last reading is the floor, and the column sums to the step exactly.
+
+    baseline                                   35.90 ms
+      - moe                       5.97         29.93
+      - shared                    1.86         28.07
+      - gated_residual_mix        7.80         20.27
+      - deltanet                 10.45          9.82
+      - qsa                       3.94          5.88
+      - reinject                  0.06          5.82
+      - ple                      -0.11          5.93
+                                 -----
+                                 29.97  + 5.93 floor = 35.90
+
+The floor is not glue: with every named component stubbed the step still runs 48
+un-stubbed `all_reduce` calls (1.57 ms), 48 adds, the 97 stub slices and the
+embedding. Read it as "what the stubs left behind", not as an opportunity.
+
+`scripts/dev/deltanet_cumulative.py` does the same inside the DeltaNet step. Note
+that two of its stubs are model-wide, not DeltaNet-only:
+
+    - all_reduce (all 181 calls)  3.14 ms
+    - decode_step                 1.99
+    - fused_qkv_heads             1.11
+    - fused_delta_tail            0.57
+    - causal conv                 0.46
+    - delta scalars               0.42
+    - linear_rows (model-wide)    5.63
+
+INVARIANT 95: ablate cumulatively. One part at a time answers "what would I save
+by deleting this", which is not the same question as "where does the time go",
+and only the cumulative form sums to the total.
+
+That measurement is what found the delta rule's tail: 1.99 ms in `decode_step`,
+most of it in six small ops after the matmuls, which is the shape invariant 91
+says is worth cutting. Fusing them is +0.62 ms and moved the model's quality up
+(top-5 88.5 -> 90.6 %).
