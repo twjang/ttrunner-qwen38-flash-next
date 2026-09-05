@@ -324,10 +324,15 @@ def ksplit_linear(x, w):
     than falling back itself, so the caller keeps its own kwargs.
     """
     dev = x.device()
-    kt, nt = w.shape[-2] // 32, w.shape[-1] // 32
+    # Round the output tiles up: an N of 1 -- the shared expert's sigmoid gate,
+    # the narrowest matmul in the model -- floored to zero tiles and produced a
+    # plan with no work items at all, so the split silently declined exactly the
+    # shape it exists for.
+    kt = w.shape[-2] // 32
+    nt = max(1, (w.shape[-1] + 31) // 32)
     grid = dev.compute_with_storage_grid_size()
     n_cores = grid.x * grid.y
-    groups = max(1, min(kt, n_cores // max(nt, 1)))
+    groups = max(1, min(kt, n_cores // nt))
     if groups < 2 or x.shape[-2] > 32:
         return None
 

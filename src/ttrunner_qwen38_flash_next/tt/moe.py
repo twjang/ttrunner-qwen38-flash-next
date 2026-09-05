@@ -489,6 +489,7 @@ _READ_BATCH = 8
 # tokens, which is 0.4 sigma. So the exact rule is the reference's own, the same
 # quality, and 62.31 -> 58.42 ms a token. `TT_ROUTER_EXACT_TOPK=0` restores the
 # threshold.
+_NO_SHEXP_KSPLIT = bool(os.environ.get("TT_NO_SHEXP_KSPLIT"))
 ROUTER_EXACT_TOPK = os.environ.get("TT_ROUTER_EXACT_TOPK", "1") == "1"
 WIDE_EXPERTS = 10 if ROUTER_EXACT_TOPK else 16
 _WIDE_FELL_BACK = False
@@ -782,7 +783,15 @@ def shared_expert(
         ttnn.slice(both, (0, 0, 0, n), (1, e, mrows, 2 * n)),
     )
     out = ttnn.linear(hidden, down_w, compute_kernel_config=HIFI4)
-    return ttnn.multiply(out, ttnn.sigmoid(ttnn.linear(x, gate_vec, compute_kernel_config=HIFI4)))
+    # The sigmoid gate is a single output column, and a single column is one
+    # output tile on one core of a hundred and ten: measured 22.13 us a call for
+    # a 10 KB weight, **0.1 % of bandwidth**, 48 calls a token. It is the exact
+    # shape the k-split exists for -- give the other 79 cores a slice of the
+    # 2560-long reduction instead.
+    gate = None if _NO_SHEXP_KSPLIT else ksplit_linear(x, gate_vec)
+    if gate is None:
+        gate = ttnn.linear(x, gate_vec, compute_kernel_config=HIFI4)
+    return ttnn.multiply(out, ttnn.sigmoid(gate))
 
 
 # Above this many rows the per-expert input copy is cheaper than making the op
