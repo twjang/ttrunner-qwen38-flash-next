@@ -5048,10 +5048,21 @@ where the next ones are.
 do it are all outside "make the current graph cheaper":
 
 * a batch, which the goal excludes;
-* fewer collectives, i.e. a different sharding of `ssm_out`, the MoE `down` and
-  the hyper-connection `down` -- each is row-sharded because replicating it costs
-  more *given a free collective*, and that trade should be re-run now that the
-  collective is priced at 4.4 ms a token;
+* fewer collectives -- **and that trade has now been re-run at the collective's
+  real price, and all three sharding choices survive it**:
+
+      hyper `down`   split 12.21 + reduce 12.79 = 25.0 us   replicated 39.97
+      `ssm_out`      split 15.18 + reduce 32.77 = 47.95     replicated 47.64,
+                     but un-head-sharding DeltaNet also quadruples the recurrent
+                     state's 28 MB and its traffic -- a 0.01 ms matmul saving
+                     against 0.66 ms of state
+      MoE `down`     replicating puts all 640 intermediate columns on every
+                     device: 4x the expert weights, 4.4 ms against the 1.57 the
+                     collective costs
+
+  QSA already does it the other way and it is a wash: its heads are not sharded,
+  so it runs a replicated [6144, 2560] output projection at 47.64 us and needs no
+  collective at all, against DeltaNet's 47.95 for the split plus the reduce;
 * M = 1 itself: a tile matmul computes a 32x32 output whatever M is, so 31 rows
   of every one are discarded, and the narrow shapes are compute-bound on the
   eleven to sixteen cores their output width affords.
