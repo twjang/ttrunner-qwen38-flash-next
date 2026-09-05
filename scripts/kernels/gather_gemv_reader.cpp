@@ -16,6 +16,13 @@
 // stream past it column by column. That is what makes few cores the right
 // choice: the activation is re-read per core, not per column.
 //
+// The weight reads are **split with the writer kernel**. A core pulls about
+// 15 GB/s over one NOC, and thirteen of them saturate at ~190 GB/s -- half the
+// card. The writer is a second dataflow core with its own NOC and almost nothing
+// to do (one tile a column), so it fetches the second half of every column into
+// its own circular buffer. Same bytes, twice the ports. This reader takes
+// k-tiles [0, H0).
+//
 // MODE 0 (the down projection, experts stacked on rows):
 //     slot = kt / KT_E,  kt_e = kt % KT_E
 //     w page = e*TPE + kt_e*NT_E + nt
@@ -37,7 +44,8 @@
 //   8 IDX16     1: uint16 straight out of ttnn.topk's tile face
 //   9 A_PAGE    activation page bytes
 //   10 W_PAGE    weight page bytes
-//   11.. TensorAccessorArgs for a, w, idx
+//   11 H0        k-tiles this kernel fetches (the writer takes the rest)
+//   12.. TensorAccessorArgs for a, w, idx
 //
 // Runtime args: 0 a_addr, 1 w_addr, 2 idx_addr, 3 col_lo, 4 col_hi
 
@@ -56,6 +64,7 @@ void kernel_main() {
     constexpr uint32_t IDX16 = get_compile_time_arg_val(8);
     constexpr uint32_t A_PAGE = get_compile_time_arg_val(9);
     constexpr uint32_t W_PAGE = get_compile_time_arg_val(10);
+    constexpr uint32_t H0 = get_compile_time_arg_val(11);
 
     constexpr uint32_t cb_a = 0, cb_b = 1, cb_idx = 2;
 
@@ -65,7 +74,7 @@ void kernel_main() {
     const uint32_t col_lo = get_arg_val<uint32_t>(3);
     const uint32_t col_hi = get_arg_val<uint32_t>(4);
 
-    constexpr auto a_ta = TensorAccessorArgs<11>();
+    constexpr auto a_ta = TensorAccessorArgs<12>();
     const auto a_acc = TensorAccessor(a_ta, a_addr);
     constexpr auto w_ta = TensorAccessorArgs<a_ta.next_compile_time_args_offset()>();
     const auto w_acc = TensorAccessor(w_ta, w_addr);
@@ -97,7 +106,7 @@ void kernel_main() {
     cb_push_back(cb_a, KT);
 
     for (uint32_t c = col_lo; c < col_hi; ++c) {
-        cb_reserve_back(cb_b, KT);
+        cb_reserve_back(cb_b, H0);
         const uint32_t bb = get_write_ptr(cb_b);
 
         uint32_t nt_e = 0, slot_c = 0;
@@ -115,7 +124,7 @@ void kernel_main() {
             nt_e = c;
         }
 
-        for (uint32_t kt = 0; kt < KT; ++kt) {
+        for (uint32_t kt = 0; kt < H0; ++kt) {
             uint32_t slot = slot_c;
             uint32_t kt_e = kt;
             if constexpr (MODE == 0) {
@@ -130,6 +139,6 @@ void kernel_main() {
             noc_async_read_page(e * TPE + kt_e * NT_E + nt_e, w_acc, bb + kt * W_PAGE);
         }
         noc_async_read_barrier();
-        cb_push_back(cb_b, KT);
+        cb_push_back(cb_b, H0);
     }
 }

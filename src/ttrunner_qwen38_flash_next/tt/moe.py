@@ -551,6 +551,13 @@ _NO_GATHER_GEMV = bool(os.environ.get("TT_NO_GATHER_GEMV"))
 _GEMV_COLS = int(os.environ.get("TT_GEMV_COLS", "4"))
 
 
+# How much of each column's reduction the reader fetches; the writer, on the
+# other NOC, fetches the rest. A half each is the obvious split and measured
+# best; the reader also carries the activation row, so it is not exactly
+# symmetric.
+_GEMV_SPLIT = float(os.environ.get("TT_GEMV_SPLIT", "0.5"))
+
+
 def _gather_gemv_program(x, weights, idx, out, k_sel, mode, idx16, cols_per_core):
     dev = weights.device()
     grid = dev.compute_with_storage_grid_size()
@@ -584,6 +591,9 @@ def _gather_gemv_program(x, weights, idx, out, k_sel, mode, idx16, cols_per_core
     work = [((nt_out * i) // len(cores), (nt_out * (i + 1)) // len(cores))
             for i in range(len(cores))]
 
+    h0 = max(1, min(kt - 1, int(round(kt * _GEMV_SPLIT)))) if kt > 1 else kt
+    h1 = kt - h0
+    idx_cb = 64 * ((acc["i"][1] + 64 + 63) // 64)
     cbs = [
         # The activation row stays resident: KT tiles, indexed rather than popped.
         ttnn.CBDescriptor(
@@ -591,13 +601,21 @@ def _gather_gemv_program(x, weights, idx, out, k_sel, mode, idx16, cols_per_core
             format_descriptors=[ttnn.CBFormatDescriptor(
                 buffer_index=0, data_format=x.dtype, page_size=a_page)]),
         ttnn.CBDescriptor(
-            total_size=2 * kt * w_page, core_ranges=crs,
+            total_size=2 * h0 * w_page, core_ranges=crs,
             format_descriptors=[ttnn.CBFormatDescriptor(
                 buffer_index=1, data_format=weights.dtype, page_size=w_page)]),
         ttnn.CBDescriptor(
-            total_size=64 * ((acc["i"][1] + 64 + 63) // 64), core_ranges=crs,
+            total_size=idx_cb, core_ranges=crs,
             format_descriptors=[ttnn.CBFormatDescriptor(
                 buffer_index=2, data_format=ttnn.uint32, page_size=64)]),
+        ttnn.CBDescriptor(
+            total_size=2 * max(1, h1) * w_page, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=3, data_format=weights.dtype, page_size=w_page)]),
+        ttnn.CBDescriptor(
+            total_size=idx_cb, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=4, data_format=ttnn.uint32, page_size=64)]),
         ttnn.CBDescriptor(
             total_size=2 * acc["o"][1], core_ranges=crs,
             format_descriptors=[ttnn.CBFormatDescriptor(
@@ -612,19 +630,22 @@ def _gather_gemv_program(x, weights, idx, out, k_sel, mode, idx16, cols_per_core
             runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
 
     ct = [kt, kt_e, ne, tpe, half, k_sel, mode, weights.shape[1], idx16,
-          a_page, w_page] + acc["a"] + acc["w"] + acc["i"]
+          a_page, w_page, h0] + acc["a"] + acc["w"] + acc["i"]
+    wct = [kt, h0, kt_e, ne, tpe, half, k_sel, mode, weights.shape[1], idx16,
+           w_page] + acc["o"] + acc["w"] + acc["i"]
     return ttnn.ProgramDescriptor(kernels=[
         kern("gather_gemv_reader.cpp", ct,
              [[x.buffer_address(), weights.buffer_address(), idx.buffer_address(),
                lo, hi] for lo, hi in work], ttnn.ReaderConfigDescriptor()),
-        kern("gather_gemv_compute.cpp", [kt], [[lo, hi] for lo, hi in work],
+        kern("gather_gemv_compute.cpp", [kt, h0], [[lo, hi] for lo, hi in work],
              # fp32 in the destination register: the reduction is 80 tile
              # products deep and bfloat16 accumulation over that is visible --
              # 6.4e-02 against the gather-and-multiply path before this line.
              ttnn.ComputeConfigDescriptor(math_fidelity=ttnn.MathFidelity.HiFi4,
                                           fp32_dest_acc_en=True)),
-        kern("gather_gemv_writer.cpp", acc["o"],
-             [[out.buffer_address(), lo, hi] for lo, hi in work],
+        kern("gather_gemv_writer.cpp", wct,
+             [[out.buffer_address(), weights.buffer_address(), idx.buffer_address(),
+               lo, hi] for lo, hi in work],
              ttnn.WriterConfigDescriptor()),
     ], semaphores=[], cbs=cbs)
 
@@ -887,11 +908,13 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
     if k_sel > 16:
         raise ValueError(f"k_sel {k_sel} exceeds a tile face; widen the index path")
 
-    # The gather is the expensive half: 63.15 us to copy gate|up and multiply it
-    # against 35.94 to multiply it *through the index*, because a copied weight
-    # crosses DRAM three times and an indexed one crosses it once.
+    # The gather is the expensive half: 59.73 us to copy gate|up and multiply it
+    # against 35.01 to multiply it *through the index*, because a copied weight
+    # crosses DRAM three times and an indexed one crosses it once. Four output
+    # columns a core is the measured optimum for both projections once the
+    # reader and the writer split the weight fetch between their two NOCs.
     both = (gather_gemv(x, gate_w, idx_pad, k_sel, 2,
-                        (1, 1, x.shape[-2], k_sel * 2 * n), 1, 8)
+                        (1, 1, x.shape[-2], k_sel * 2 * n), 1, 4)
             if x.shape[-2] <= TILE else None)
     if both is None:
         gu = _gather(gate_w, idx_pad, k_sel, 2,
