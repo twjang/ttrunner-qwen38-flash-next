@@ -4203,3 +4203,92 @@ through it comes back as garbage -- and only in the tiles that actually use it.
 wrong in the six passthrough ones, which is the shape of failure that a
 whole-tensor comparison reports as "a bit off". `fused_rope` now refuses a
 mismatched dtype rather than trusting the caller.
+
+## 24. What an op costs *here*, measured in the model rather than beside it
+
+Three changes in a row under-delivered by about the same factor -- the fused
+reinject (0.4 ms against 1.6 predicted), the raw gate stream (0.2 against 1.85),
+and 469 right-sized elementwise calls (0.0 against 1.7). All three were priced
+off "an op is 5.8 us", which was measured by timing sixty-four copies of one op
+in a trace of its own.
+
+`scripts/dev/marginal_op_cost.py` measures it where it lives instead: insert K
+extra ops into each of the 48 layers and take the slope.
+
+| what | in isolation | **marginal, in the model's trace** |
+|---|---:|---:|
+| `ttnn.multiply`, 320 tiles | 5.8 us | **5.33 us** |
+| `ttnn.multiply`, 1 tile | 5.8 | **3.00** |
+| a right-sized `generic_op`, 1 core | 2.06 | **0.83** |
+
+Two things fall out. An op's marginal cost **does** depend on its width, which
+the isolated measurement said it did not -- 3.0 us at one tile against 5.33 at
+three hundred and twenty. And a one-core `generic_op` is genuinely cheap, 0.83 us
+against a wide op's 5.33.
+
+`scripts/dev/program_switch_cost.py` rules out the other candidate: a trace of
+thirty-two *distinct* programs costs exactly what thirty-two copies of one costs
+(1.75 vs 1.74 us at one core, 5.46 vs 5.48 at a hundred and ten), and the
+per-launch figure holds from 256 launches to 8192. It is core count, not program
+switching, and not a dispatcher that saturates.
+
+So the step divides as:
+
+    2614 wide ops (65+ tiles) x 5.33 us     13.9 ms
+    ~2200 small ops x ~3 us                  6.6 ms
+    484 linears                             ~10 ms
+    bytes and collectives                    ~8 ms
+                                            -------
+                                            ~48.5 ms   against 49.1 measured
+
+INVARIANT 77: price a change by inserting the ops into the model, not by timing
+them beside it. `marginal_op_cost.py` is four lines of monkey-patch and it would
+have stopped three of this session's changes before they were written.
+
+### 24.1 The A/B rig was deciding things by drift
+
+Every comparison in this document until now was two processes and a subtraction,
+and this rig drifts about **a millisecond** between runs -- which is the size of
+most of what was being compared. Three pairs of `decode_ablation_check.py` on one
+change gave +0.64, +0.23 and -0.01 ms.
+
+`scripts/dev/ab_step.py` flips a module flag between captures **in one process**,
+building and releasing a `TracedDecoder` each time, and takes the minimum of nine
+timed steps twice each way. Its numbers repeat to a few hundredths.
+
+INVARIANT 78: an A/B worth under two milliseconds must be measured in one
+process. Anything else is measuring the machine's mood.
+
+### 24.2 Rejected: right-sizing the small elementwise ops
+
+`dispatch_floor.py` and the census made a good case -- half the step's calls
+touch 64 tiles or fewer, ttnn's elementwise ops take the whole grid, and a
+one-core launch is a third the price. 469 calls were converted, confirmed by the
+census dropping 5440 -> 4827.
+
+`ab_step.py` says it is **slower**: -1.28 ms and -0.24 ms over two rounds. Kept
+as `ops.ew_*` behind `TT_NO_SMALL_EW`, unused, because the helpers are correct
+(`small_ew_check.py`: every one matches ttnn and several are nearer float64) and
+the kernels are the raw material for fusing chains.
+
+Why it loses is worth writing down. `elementwise_shape_cost.py` shows ttnn's
+**data-movement** ops already right-size themselves -- a small `ttnn.slice` is
+2.03 us, a `typecast` 2.11, a `concat` 2.46 -- and only the *elementwise* ones
+take the full grid. So most of the 469 were replacing ops that were already
+cheap, and a persistent output buffer is not free either.
+
+INVARIANT 79: `ttnn.slice`, `typecast` and `concat` already size their grid to
+their data; `multiply`, `add`, `sigmoid` and `silu` do not. Only the second group
+is worth replacing, and only when the tensor is small.
+
+### 24.3 And the hazard that came with it
+
+A per-call-site output buffer aliases when one *wrapper* serves two live results:
+`_l2norm` calls `ew_scale` on a single line for both q and k, so both got the
+same buffer and the model's top-1 went from 73 % to **0.5 %**. The helpers now
+take a `site` argument for exactly this, and `_slice_last` and `_l2norm` pass
+their caller's line.
+
+INVARIANT 80: a persistent output buffer keyed by call site is keyed by the
+*wrapper's* line, not the caller's, and that is silent. Any helper that can be
+wrapped needs the caller's identity passed in.

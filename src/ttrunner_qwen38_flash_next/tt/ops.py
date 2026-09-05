@@ -17,8 +17,9 @@ Two ttnn facts shape this file:
 
 from __future__ import annotations
 
-import struct
 import os
+import struct
+import sys
 from pathlib import Path
 
 import torch
@@ -291,6 +292,215 @@ def fused_rope(x, cos_full, sin_full, rope_dim: int):
             warnings.warn(f"fused rope unavailable, using the ops: "
                           f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
         return None
+
+
+# --- right-sized elementwise and slice ----------------------------------------
+#
+# `dispatch_floor.py`: a launch is ~1.8 us plus 0.036 us a core, so one core is
+# 2.06 and a hundred and ten is 5.81 -- and ttnn's elementwise ops take the whole
+# grid whatever the tensor. `step_op_census.py` buckets the step's calls by their
+# largest operand and finds **over half of them at 64 tiles or fewer**, about
+# 10 ms of a 49 ms step spent starting cores with nothing to do.
+#
+# These run the same arithmetic in a `generic_op` whose core range is
+# `min(tiles, grid)`. Measured against `ttnn.multiply` on one tile: 2.01 us
+# against 5.87, **2.9x**, and identical against float64 (`small_ew_probe.py`).
+#
+# The output buffer is per **call site**, not per shape. `generic_op` cannot
+# allocate under trace capture, so it has to be persistent, and a shape-keyed
+# buffer would alias two live results of the same shape. A site produces one
+# value per layer and it is consumed before the layer ends, which is the same
+# property `_SWIGLU_OUT` and `_GM_OUT` already rely on. All of this Python runs
+# at capture time only -- the replay is recorded commands -- so looking the
+# caller up in the stack costs nothing at run time.
+_EW_OUT: dict = {}
+# Set TT_EW_STATS=1 to have `ew_stats()` report what was actually launched: how
+# many cores each converted call used, which is the whole point of the exercise.
+EW_STATS: dict = {}
+_EW_FELL_BACK = False
+_NO_SMALL_EW = bool(os.environ.get("TT_NO_SMALL_EW"))
+
+# Above this many tiles the full grid is the right answer and there is nothing
+# to win: at 64 tiles the right-sized launch is 4.38 us against 5.95 (1.36x) and
+# at 320 they are equal.
+_EW_MAX_TILES = 64
+
+EW_MUL, EW_ADD, EW_SUB, EW_SIGMOID, EW_SILU, EW_COPY, EW_MULS, EW_SIG_MULS = range(8)
+
+
+def _tile_count(t) -> int:
+    n = 1
+    sh = list(t.shape)
+    for d in sh[:-2]:
+        n *= d
+    return n * max(1, (sh[-2] + _TILE - 1) // _TILE) * output_tiles(sh[-1])
+
+
+def _ew_site(depth: int = 2):
+    f = sys._getframe(depth)
+    return (f.f_code.co_filename, f.f_lineno)
+
+
+def _ew_out(site, like, shape=None):
+    shape = tuple(shape or like.shape)
+    key = (site, shape, str(like.dtype), id(like.device()))
+    out = _EW_OUT.get(key)
+    if out is None:
+        out = ttnn.from_torch(
+            torch.zeros(*shape), dtype=like.dtype, layout=ttnn.TILE_LAYOUT,
+            device=like.device(), mesh_mapper=ttnn.ReplicateTensorToMesh(like.device()))
+        _EW_OUT[key] = out
+    return out
+
+
+def _ew_program(a, b, out, op, scalar, in_base, in_nt):
+    dev = a.device()
+    grid = dev.compute_with_storage_grid_size()
+    n_tiles = _tile_count(out)
+    n = min(n_tiles, grid.x * grid.y)
+    cols = min(n, grid.x)
+    rows = (n + grid.x - 1) // grid.x
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+    cores = [ttnn.CoreCoord(cx, cy) for cy in range(rows) for cx in range(cols)]
+    binary = op <= EW_SUB
+    acc = {}
+    for tag, t in (("a", a), ("b", b if binary else a), ("o", out)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"small_ew: {tag} must be interleaved")
+        acc[tag] = ct
+    if acc["o"][1] != acc["a"][1] or (binary and acc["b"][1] != acc["a"][1]):
+        raise RuntimeError("small_ew wants one dtype throughout")
+    work = [((n_tiles * i) // len(cores), (n_tiles * (i + 1)) // len(cores))
+            for i in range(len(cores))]
+    cbs = [ttnn.CBDescriptor(
+        total_size=2 * acc["a"][1], core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=a.dtype, page_size=acc["a"][1])])
+        for i in (0, 1, 2)]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("small_ew_reader.cpp",
+             [int(binary), acc["a"][1], in_base, in_nt, output_tiles(out.shape[-1])]
+             + acc["a"] + acc["b"],
+             [[a.buffer_address(), (b if binary else a).buffer_address(), lo, hi]
+              for lo, hi in work], ttnn.ReaderConfigDescriptor()),
+        kern("small_ew_compute.cpp", [op, scalar], [[hi - lo] for lo, hi in work],
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("small_ew_writer.cpp", acc["o"],
+             [[out.buffer_address(), lo, hi] for lo, hi in work],
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def _small_ew(op, a, b=None, scalar=0, out_shape=None, in_base=0, in_nt=0,
+              site=None):
+    """One elementwise op (or a tile-aligned slice) on only the cores it needs.
+
+    Returns None when it declines -- too big to gain, a dtype it does not
+    handle, or an output that would alias an input -- so the caller keeps its
+    own kwargs and its own fallback.
+    """
+    global _EW_FELL_BACK
+    if _NO_SMALL_EW:
+        return None
+    try:
+        if a.dtype not in (ttnn.bfloat16, ttnn.float32):
+            return None
+        if b is not None and (b.dtype != a.dtype or tuple(b.shape) != tuple(a.shape)):
+            return None
+        shape = tuple(out_shape or a.shape)
+        if _tile_count(a) > _EW_MAX_TILES:
+            return None
+        out = _ew_out(site or _ew_site(3), a, shape)
+        # An accumulator (`acc = add(acc, x)`) would read and write one buffer.
+        if out is a or out is b:
+            return None
+        prog = _ew_program(a, b, out, op, scalar, in_base,
+                           in_nt or output_tiles(a.shape[-1]))
+        if os.environ.get("TT_EW_STATS"):
+            n = min(_tile_count(out),
+                    a.device().compute_with_storage_grid_size().x
+                    * a.device().compute_with_storage_grid_size().y)
+            EW_STATS[(op, n)] = EW_STATS.get((op, n), 0) + 1
+        ttnn.generic_op([a, b if b is not None else a, out], prog)
+        return out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _EW_FELL_BACK:
+            _EW_FELL_BACK = True
+            import warnings
+            warnings.warn(f"small elementwise unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
+# `site` on every helper: a wrapper's own line is the same for all of its
+# callers, so without it two live results of one wrapper share a buffer. That is
+# not hypothetical -- `_l2norm` calls `ew_scale` on one line for both q and k,
+# and aliasing them took the model's top-1 from 73 % to 0.5 %.
+def ew_mul(a, b, site=None):
+    got = _small_ew(EW_MUL, a, b, site=site or _ew_site())
+    return got if got is not None else ttnn.multiply(a, b)
+
+
+def ew_add(a, b, site=None):
+    got = _small_ew(EW_ADD, a, b, site=site or _ew_site())
+    return got if got is not None else ttnn.add(a, b)
+
+
+def ew_sigmoid(a, site=None):
+    got = _small_ew(EW_SIGMOID, a, site=site or _ew_site())
+    return got if got is not None else ttnn.sigmoid(a)
+
+
+def ew_silu(a, site=None):
+    got = _small_ew(EW_SILU, a, site=site or _ew_site())
+    return got if got is not None else ttnn.silu(a)
+
+
+def ew_scale(a, scalar: float, site=None):
+    bits = struct.unpack("<I", struct.pack("<f", float(scalar)))[0]
+    got = _small_ew(EW_MULS, a, scalar=bits, site=(site or _ew_site(), bits))
+    return got if got is not None else ttnn.multiply(a, scalar)
+
+
+def ew_sigmoid_scale(a, scalar: float, site=None):
+    """2*sigmoid(x) and friends -- two ops for the price of one launch."""
+    bits = struct.unpack("<I", struct.pack("<f", float(scalar)))[0]
+    got = _small_ew(EW_SIG_MULS, a, scalar=bits, site=(site or _ew_site(), bits))
+    if got is not None:
+        return got
+    return ttnn.multiply(ttnn.sigmoid(a), scalar)
+
+
+def ew_slice_last(x, start: int, stop: int, site=None):
+    """`x[..., start:stop]` when both bounds are tile-aligned: a page copy.
+
+    `site` because this is usually reached through a wrapper, and a wrapper's own
+    line is the same for every caller -- which would give two live slices of one
+    tensor the same output buffer. The bounds go in the key too, so two slices on
+    one source line still get their own.
+    """
+    if start % _TILE or stop % _TILE or stop <= start:
+        s = list(x.shape)
+        return ttnn.slice(x, (0, 0, 0, start), (s[0], s[1], s[2], stop))
+    shape = list(x.shape)
+    shape[-1] = stop - start
+    got = _small_ew(EW_COPY, x, out_shape=shape, in_base=start // _TILE,
+                    in_nt=output_tiles(x.shape[-1]),
+                    site=(site or _ew_site(), start, stop))
+    if got is not None:
+        return got
+    s = list(x.shape)
+    return ttnn.slice(x, (0, 0, 0, start), (s[0], s[1], s[2], stop))
 
 
 def linear_rows(x, w, max_rows: int = ROW_GROUP, **kw):

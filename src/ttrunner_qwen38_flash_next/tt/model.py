@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -519,6 +520,7 @@ class TTModel:
 
     @staticmethod
     def _slice_last(x: ttnn.Tensor, start: int, stop: int) -> ttnn.Tensor:
+        # `ops.ew_slice_last` was tried here and is **slower**: see handoff 24.
         s = list(x.shape)
         return ttnn.slice(x, (0, 0, 0, start), (s[0], s[1], s[2], stop))
 
