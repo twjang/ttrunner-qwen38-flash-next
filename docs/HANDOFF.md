@@ -6559,6 +6559,38 @@ That also retires invariant 133's use as a planning tool. `0.37 us` a k-tile is 
 real description of an *isolated* matmul and does not predict what removing
 k-tiles is worth in the model.
 
+### 45.19 The collectives priced properly: ~2.2 ms, and that is the biggest lever left
+
+The `allreduce` ablation, paired against the baseline, three reps alternating
+(it stubs `TTModel.all_reduce`, so it covers the **84 wide** reduces -- 36
+`ssm_out` and 48 MoE -- and not the 97 narrow hyper-connection ones):
+
+| | base | stubbed | diff |
+|---|--:|--:|--:|
+| pair 1 | 32.44 | 30.24 | 2.20 |
+| pair 2 | 32.54 | 31.89 | 0.65 |
+| pair 3 | 32.66 | 30.44 | 2.22 |
+| **median** | | | **2.20** |
+
+Two of three agree to within 0.02 and one is an outlier, so ~2.2 ms is the
+number to plan against. **This is the largest single identified cost remaining**,
+it is measured in the model rather than in isolation, and unlike everything in
+45.7 through 45.18 it has not been refuted.
+
+Note what it does *not* say. 44.2 booked the collectives at 3.4 ms and 45.5's
+`allreduce` ablation read 3.54 -- both single unpaired samples, and pair 2 above
+shows this ablation swinging 1.5 ms. Do not subtract 2.2 from 3.54 and call the
+composite path worth 1.3 ms; its own paired A/B said -0.45, and that is the
+number with five pairs behind it.
+
+So the fabric kernel's case, stated honestly for the first time: it is competing
+for a **2.2 ms** pot, not the 3.4-4.8 ms this file has been quoting. Getting the
+84 reduces from ~26 us to the ~8 us a single-launch line reduce should manage
+would be ~1.5 ms of it -- against a build that needs cross-device semaphores in a
+`generic_op`, on a step whose stability degrades as generic_op programs are added
+(45.14), and a reduction-order quality gate (35.1). That is the trade; it is
+worth taking only because nothing else identified is bigger.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
@@ -6597,9 +6629,10 @@ What is left, with what each is actually worth:
    (45.14) and the one mechanism found does not explain it (45.16). It caps all
    future generic_op work. `TT_METAL_WATCHER` aborts here, so it can only be
    bisected -- and the base rate is ~12 %, so every verdict needs four runs.
-3. **The fabric all-reduce**, 0.6-1.3 ms and a hard build -- but 45.5 already
-   took the cheap half of the same idea for -0.45 ms with no kernel, so what is
-   left is the 4x gather the composite path pays and nothing else.
+3. **The fabric all-reduce** -- now priced at 45.19: the 84 wide reduces cost
+   **2.2 ms** in model, of which a single-launch line reduce should recover
+   ~1.5. Largest identified item left, and the only one on this list measured in
+   the model rather than in isolation.
 4. **`decode_step` as one kernel**, ~0.45 ms corrected, in the largest component.
 
 And what is closed, so nobody re-opens it: byte reduction (45.7), the `attn_qkv`
