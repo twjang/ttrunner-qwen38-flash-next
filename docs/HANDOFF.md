@@ -6484,6 +6484,47 @@ The `TT_KSG_PARTIAL` flag stays, off, as the way to re-test this cheaply. The
 plan's full-coverage requirement stays on, because nothing has shown partial
 coverage safe.
 
+### 45.17 The cost is the K loop, and that re-opens the k-split
+
+45.7's shape prices, read again with the right question. The times barely move
+with output width, so subtract the width and look at what is left:
+
+| shape | us | k-tiles | us per k-tile |
+|---|--:|--:|--:|
+| [2560, 4608] | 36.84 | 80 | 0.46 |
+| [2560, 2560] | 34.64 | 80 | 0.43 |
+| [2560, 1536] | 30.77 | 80 | 0.38 |
+| [2560, 1312] | 30.79 | 80 | 0.38 |
+| [2560, 352] | 29.54 | 80 | 0.37 |
+| [640, 2560] | 32.08 | 20 | -- |
+
+**Every K = 2560 matmul lands near 29 us plus its bytes**, because at M = 1 a
+core walks its 80 k-tiles serially at ~0.37 us each. That is invariant 69 stated
+as a budget rather than an observation, and it is the ~30 us floor of invariant
+118. `[640, 2560]` breaks the pattern in the right direction: a quarter of the
+k-tiles, and it is the cheapest per call of the wide shapes.
+
+So the model's matmul time is roughly `0.37 us x sum(k-tiles over all calls)`,
+and the only three things that move it are fewer calls, a shorter K, or
+**splitting the K loop across cores** -- which is exactly what `ksgemv` does, and
+exactly why it measures 3.14x on `hc_down`: ten groups, eight k-tiles a core.
+
+Which re-opens 45.14. Its "the sites buy nothing" came from **single unpaired
+runs** -- router 32.94, qkv 32.47, indexer 32.40 -- against a baseline whose own
+spread is 31.36 to 33.01. Invariant 117 says this rig supports only paired
+alternating readings and that reading violated it. The k-tiles still unsplit:
+
+    qsa k|v   24 calls x 80    indexer 24 x 80    shexp 48 x 80
+    = 7680 k-tiles = ~2.8 ms, most of which a k-split recovers
+
+(The router and ssm_alpha|beta were **already** on `ksplit_linear` before this
+session, so 45.8's census -- which compared `ksgemv` against `ttnn.linear` --
+overstated those two: the model was never paying 36 us for the router.)
+
+INVARIANT 133: at M = 1 a matmul costs ~0.37 us per k-tile plus its bytes. Price
+a matmul change by the k-tiles it removes or parallelises, not by its output
+width and not by its bytes.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
