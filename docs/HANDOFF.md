@@ -6326,6 +6326,43 @@ INVARIANT 127: invariant 105's failure mode is real but it is not the
 explanation for every capture-adjacent hang. It costs one run to rule out --
 triple the region and re-run -- and that is cheaper than reasoning about it.
 
+### 45.13 The 4/4 verdicts are weaker than they looked
+
+With the full-coverage guard in place, every site runs **alone**, and two of them
+run together:
+
+| config | result |
+|---|---|
+| baseline | 32.40, 33.03 |
+| `router` | 32.94 |
+| `qkv` | 32.47 |
+| `indexer` | 32.40 (after the guard restore; 3 hangs then OK) |
+| `router,qkv` | 33.25 (2 hangs then OK) |
+| `router,qkv,indexer` | LOST 4/4 |
+
+And that last row has to be read against the retry counts beside it. **The 4/4
+verdicts in 45.10 were priced at a 40 % hang rate, where four in a row is 2.6 %.
+The rate in these runs is not 40 %** -- `indexer` needed four tries and
+`router,qkv` three -- and at 70 % four in a row is **24 %**, which is not
+evidence of anything.
+
+So what still stands, and what does not:
+
+* **The mechanism stands.** A core outside every group runs with all-zero
+  runtime args, so `is_head` is 0 and it increments the semaphore at (0, 0).
+  That is read from the kernel and the program builder, not inferred from the
+  hang counts, and it is a bug whether or not it is *this* hang.
+* **The attribution is weak.** "shexp and ssm_ab hang because their plans are
+  partial" rests on 4/4 runs that a 70 % base rate produces one time in four.
+  The full-coverage guard is still the right conservative default -- it costs
+  two call sites and cannot make anything worse -- but it is not established
+  that partial coverage is what hung them.
+
+INVARIANT 128: a hang verdict's strength is `p_base ^ n`, and `p_base` is not a
+constant. Re-measure the base rate in the same session before quoting a run of
+failures as proof, or the same four hangs mean 2.6 % or 24 % depending on a
+number nobody checked.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
