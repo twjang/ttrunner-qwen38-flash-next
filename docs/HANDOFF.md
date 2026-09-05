@@ -6525,6 +6525,40 @@ INVARIANT 133: at M = 1 a matmul costs ~0.37 us per k-tile plus its bytes. Price
 a matmul change by the k-tiles it removes or parallelises, not by its output
 width and not by its bytes.
 
+### 45.18 Closed, with paired data: the k-split extension is a small loss
+
+45.17 re-opened 45.14 on the grounds that its reading was unpaired. Paired
+properly -- four reps, alternating:
+
+| | off | on | diff |
+|---|--:|--:|--:|
+| pair 1 | 32.36 | 32.68 | +0.32 |
+| pair 2 | 32.77 | 32.71 | -0.06 |
+| pair 3 | 32.44 | 32.80 | +0.36 |
+| pair 4 | 32.25 | 32.59 | +0.34 |
+| **mean** | | | **+0.24** |
+
+Three of four positive. **The k-split on `qkv` and `indexer` is a small loss**,
+so 45.14's conclusion was right and 45.17's re-opening was wrong. The extension
+is closed for good.
+
+The reconciliation is worth more than the result. 45.17's ~2.8 ms was computed
+from `ksgemv_check`'s isolated numbers on **both** arms -- 36 us for
+`ttnn.linear`, 19 for the k-split -- and invariant 89's 2-4x over-pricing does
+not apply evenly to the two. `ttnn.linear` in the model goes through
+`fast_linear`'s program config and is much cheaper than its isolated 36; the
+k-split's own launch and `fused_group_sum` fold do not shrink the same way. The
+advantage is an artifact of the harness, and what is left is the fold's cost.
+
+INVARIANT 134: never compute a *difference* from two isolated timings. Invariant
+89's discount is not a constant factor across ops -- it is largest for the op
+with the most per-call overhead -- so a subtraction of two over-priced numbers
+can have the wrong **sign**. Measure the difference in the model, paired.
+
+That also retires invariant 133's use as a planning tool. `0.37 us` a k-tile is a
+real description of an *isolated* matmul and does not predict what removing
+k-tiles is worth in the model.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
@@ -6554,7 +6588,10 @@ What is left, with what each is actually worth:
 1. **`TT_GG_COLS=1`**, the only untried item left with a mechanism and a
    component worth attacking: it doubles the cores on the MoE's two largest
    kernels inside 5.17 ms. It hangs 3-of-3 today and 45.16 shows the idle-core
-   guard is *not* the reason, so this needs its own bisection.
+   guard is *not* the reason, so this needs its own bisection. Note 45.18 before
+   pricing it: its case rests on the same isolated arithmetic that gave the
+   k-split the wrong sign, so measure it paired in the model before believing
+   any estimate of what it is worth.
 2. **The traced-step instability**, as a correctness item. Enabling `generic_op`
    call sites destabilises the capture in proportion to how many are added
    (45.14) and the one mechanism found does not explain it (45.16). It caps all
