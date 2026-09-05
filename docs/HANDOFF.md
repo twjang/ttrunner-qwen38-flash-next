@@ -6591,6 +6591,28 @@ would be ~1.5 ms of it -- against a build that needs cross-device semaphores in 
 (45.14), and a reduction-order quality gate (35.1). That is the trade; it is
 worth taking only because nothing else identified is bigger.
 
+### 45.20 The link count is already right for the composite path too
+
+Invariant 93 says sweep `num_links` per shape because it is free and exact, and
+45.5 changed the *algorithm* under the setting -- the composite path all-gathers
+where the native one reduce-scattered, moving four times the data -- so the 3
+that section 31.1 chose for `all_reduce` was worth re-checking. Two reps each:
+
+    1 link   33.43   33.49
+    3 links  32.23   32.37     <- current
+    4 links  32.28
+
+**Three and four tie; one is ~1.15 ms worse.** So the setting is already optimal
+and there is nothing here. Worth the twenty minutes anyway: it was exact (no
+quality gate needed), it was the cheapest possible shot at 45.19's 2.2 ms, and
+a sweep that has to be redone after an algorithm change is exactly the kind of
+thing that goes stale silently.
+
+It also puts a floor under the fabric-kernel case. One link costs 1.15 ms more
+than three, so the wire *is* doing measurable work on this path -- the 2.2 ms is
+not pure dispatch latency, and a hand-rolled reduce inherits whatever part of it
+is bytes on the wire.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
