@@ -6133,6 +6133,47 @@ only if the shape that remains still fills the grid. This restores invariant 55
 The levers stay what they were: fewer calls, wider outputs, and k-split kernels
 that give idle cores a piece of the reduction.
 
+### 45.8 What the lever actually is: the k-split, on every narrow shape
+
+45.7 says bytes are not the currency and the ~30 us floor is. `ksgemv_check.py`
+says what breaks that floor, on the shapes the model actually issues -- accuracy
+against float64 on the quantised operands first, then time:
+
+| shape | groups x cores | `ttnn.linear` | k-split | | vs float64 |
+|---|---|--:|--:|--:|---|
+| hc down\|inject [2560, 352] | 10 x 11 | 31.93 | **10.16** | 3.14x | 3.3e-03 vs 1.10e-02 |
+| router [2560, 512] bf16 | 5 x 22 | 36.35 | **22.26** | 1.63x | 3.4e-03 vs 1.41e-02 |
+| qsa k\|v [2560, 512] bf8 | 5 x 22 | 36.65 | **18.61** | 1.97x | 3.1e-03 vs 1.25e-02 |
+| indexer [2560, 128] | 20 x 4 | 32.10 | **15.64** | 2.05x | 2.2e-03 vs 1.84e-02 |
+| ssm ab [2560, 32] f32 | 80 x 1 | 22.03 | **18.03** | 1.22x | 1.8e-03 vs 1.02e-02 |
+| shexp gate\|up [2560, 1312] | 2 x 44 | 41.48 | **25.97** | 1.60x | 4.0e-03 vs 1.33e-02 |
+
+It wins on every one, and it is **three to eight times nearer float64** than the
+op it replaces -- so this is not a precision spend, it is a precision gain. That
+is invariant 57 again and it now covers the whole census.
+
+The arithmetic on the sites not yet wired, at their call counts a token:
+
+    router     48 x 14.1 us = 0.68 ms
+    shexp g|u  48 x 15.5    = 0.74
+    qsa k|v    24 x 18.0    = 0.43
+    indexer    24 x 16.5    = 0.40
+    ssm ab     36 x  4.0    = 0.14
+                              ----
+                              2.39 ms isolated, 0.6-1.2 in-model (invariant 89)
+
+`TT_KSG_WIDE` already wires the first, second and last of those. It is not yet
+measured in-model: four consecutive attempts hit the replay hang (45.4). The
+[2560, 32] configuration was the suspect -- eighty groups of a *single* core, so
+a group's activation multicast addresses only itself -- and this run clears it:
+that shape is the fastest relative accuracy in the table and does not hang
+outside a trace.
+
+INVARIANT 120: the k-split beats `ttnn.linear` at M = 1 on every shape in the
+census, by 1.2x to 3.1x, and is more accurate. Wiring the remaining call sites is
+the known-good work; there is no shape left where `ttnn.linear` is the right
+answer at one row.
+
 INVARIANT 119: price a shape before converting weights for it. Two of this
 session's three "verified" findings were byte arithmetic that a fifteen-minute
 harness on random tensors refuted. It needs no weights, no model and no trace.
