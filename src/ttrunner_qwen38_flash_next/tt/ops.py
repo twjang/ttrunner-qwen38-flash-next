@@ -79,6 +79,92 @@ def swiglu(gate: ttnn.Tensor, up: ttnn.Tensor) -> ttnn.Tensor:
 ROW_GROUP = 128
 
 
+# --- the decode matmul's program config --------------------------------------
+#
+# `ttnn.linear` with no program config picks one itself, and at M=1 the one it
+# picks reads **two** k-tiles a block. Three things were ruled out before this
+# was found: the time does not depend on the weight's dtype ([2560, 3200] is
+# 61.4 us at bfloat4_b, bfloat8_b *and* bfloat16, `matmul_dtype_width.py`), it
+# does not depend on MathFidelity (HiFi4 through LoFi within 2 %,
+# `matmul_fidelity.py`), and it tracks the length of the K loop at ~0.65 us a
+# k-tile across every shape in the census. That is read latency, not throughput,
+# and `in0_block_w` is how many k-tiles a core pulls before it computes.
+#
+# Raising it to eight (`matmul_program_config.py`):
+#
+#     MoE gate|up   [2560, 3200]   61.35 -> 20.19 us   3.04x
+#     attn_output   [6144, 2560]  123.55 -> 47.32      2.61x
+#     shexp gate|up [2560, 1280]   40.54 -> 15.82      2.56x
+#     MoE down      [1600, 2560]   34.55 -> 17.48      1.98x   (block 50)
+#
+# The error moves because the reduction is blocked differently, and it moves in
+# both directions -- against float64 the gate|up is *better* at 8 (1.37e-02
+# against 1.45e-02) and the shared expert worse (2.60e-02 against 1.28e-02).
+# Blocking the whole K at once is worse on both counts (4.69e-02 and slower), so
+# eight is a real optimum and not just the largest value that fits.
+_MM_CFG: dict = {}
+_NO_MM_CFG = bool(os.environ.get("TT_NO_MM_CONFIG"))
+
+
+def decode_matmul_config(x, w):
+    """A 1D-multicast config for an M <= 32 matmul, or None to let ttnn choose.
+
+    Cached on the shapes, because building one is host work and the model asks
+    for the same dozen shapes 484 times a token.
+    """
+    if _NO_MM_CFG:
+        return None
+    key = (tuple(x.shape), tuple(w.shape), id(x.device()))
+    if key in _MM_CFG:
+        return _MM_CFG[key]
+
+    cfg = None
+    try:
+        m, kdim = x.shape[-2], x.shape[-1]
+        if m <= _TILE and len(w.shape) == 4 and w.shape[-2] == kdim:
+            grid = x.device().compute_with_storage_grid_size()
+            n_cores = grid.x * grid.y
+            kt = kdim // _TILE
+            nt = output_tiles(w.shape[-1])
+            per_core_n = (nt + n_cores - 1) // n_cores
+            # in0_block_w has to divide the K tiles exactly; take the largest
+            # that does, up to eight.
+            blk = next((b for b in (8, 4, 2) if kt % b == 0), 1)
+            sub_w = next((sw for sw in (4, 2, 1) if per_core_n % sw == 0), 1)
+            if blk > 2 or per_core_n > 1:
+                cfg = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                    compute_with_storage_grid_size=grid,
+                    in0_block_w=blk,
+                    out_subblock_h=1,
+                    out_subblock_w=sub_w,
+                    per_core_M=1,
+                    per_core_N=per_core_n,
+                    fuse_batch=True,
+                    fused_activation=None,
+                    mcast_in0=True,
+                )
+    except Exception:                                               # noqa: BLE001
+        cfg = None
+    _MM_CFG[key] = cfg
+    return cfg
+
+
+def fast_linear(x, w, **kw):
+    """`ttnn.linear` with the decode program config, falling back to the op.
+
+    The fallback is not decoration: a config that a shape rejects raises at
+    dispatch, and the shapes this model uses are not all alike.
+    """
+    if "program_config" not in kw:
+        pc = decode_matmul_config(x, w)
+        if pc is not None:
+            try:
+                return ttnn.linear(x, w, program_config=pc, **kw)
+            except Exception:                                       # noqa: BLE001
+                _MM_CFG[(tuple(x.shape), tuple(w.shape), id(x.device()))] = None
+    return ttnn.linear(x, w, **kw)
+
+
 def linear_rows(x, w, max_rows: int = ROW_GROUP, **kw):
     """`ttnn.linear`, but never on more than `max_rows` rows at a time.
 
@@ -104,7 +190,7 @@ def linear_rows(x, w, max_rows: int = ROW_GROUP, **kw):
         # and the shapes with only two or three reduction groups pay the kernel
         # launch and the `ttnn.sum` without earning them back. It is a per-shape
         # decision, made at the call site where it has been measured.
-        return ttnn.linear(x, w, **kw)
+        return fast_linear(x, w, **kw)
     shape = list(x.shape)
     outs = []
     for lo in range(0, m, max_rows):

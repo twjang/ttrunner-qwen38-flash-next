@@ -24,7 +24,7 @@ from pathlib import Path
 import torch
 import ttnn
 
-from .ops import HIFI4, ksplit_linear
+from .ops import HIFI4, fast_linear, ksplit_linear
 
 TILE = 32
 _MM1D = ttnn._ttnn.operations.matmul.MatmulMultiCoreReuseMultiCast1DProgramConfig
@@ -196,7 +196,7 @@ def moe_block(
     # `ksplit_linear` declines anything narrower in groups than that pays for.
     logits = ksplit_linear(x, router_w)
     if logits is None:
-        logits = ttnn.linear(x, router_w, compute_kernel_config=HIFI4)
+        logits = fast_linear(x, router_w, compute_kernel_config=HIFI4)
     probs = ttnn.softmax(logits, dim=-1, compute_kernel_config=HIFI4)
 
     # Routing is global -- the router is replicated and top-k is over all of
@@ -289,7 +289,7 @@ def route(x, router_w, top_k: int):
     in 32-row groups, which is what `_MAX_MOE_CHUNK` pins, and computes the
     experts over the whole chunk.
     """
-    logits = ttnn.linear(x, router_w, compute_kernel_config=HIFI4)
+    logits = fast_linear(x, router_w, compute_kernel_config=HIFI4)
     probs = ttnn.softmax(logits, dim=-1, compute_kernel_config=HIFI4)
     values, _ = ttnn.topk(probs, k=top_k, dim=-1, largest=True, sorted=True)
     v = list(values.shape)
@@ -736,7 +736,7 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
         raise ValueError(f"k_sel {k_sel} exceeds a tile face; widen the index path")
 
     gu = _gather(gate_w, idx_pad, k_sel, 2, (1, 1, gate_w.shape[-2], k_sel * 2 * n), 1)
-    both = ttnn.linear(x, gu, compute_kernel_config=HIFI4)
+    both = fast_linear(x, gu, compute_kernel_config=HIFI4)
     hidden = fused_swiglu(both, k_sel * n)
 
     # Broadcast each expert's score across its n columns. `repeat_interleave` is
@@ -754,7 +754,7 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
     scaled = ttnn.multiply(hidden, ttnn.matmul(vals, spread, compute_kernel_config=HIFI4))
 
     dw = _gather(down_w, idx_pad, k_sel, 0, (1, 1, k_sel * n, hidden_size), 1)
-    return ttnn.linear(scaled, dw, compute_kernel_config=HIFI4)
+    return fast_linear(scaled, dw, compute_kernel_config=HIFI4)
 
 
 _SHEXP_GU: dict = {}
@@ -775,14 +775,14 @@ def shared_expert(
     if fused is None:
         fused = ttnn.concat([gate_w, up_w], dim=-1)
         _SHEXP_GU[key] = fused
-    both = ttnn.linear(x, fused, compute_kernel_config=HIFI4)
+    both = fast_linear(x, fused, compute_kernel_config=HIFI4)
     n = gate_w.shape[-1]
     e, mrows = both.shape[1], both.shape[2]
     hidden = ttnn.multiply(
         ttnn.silu(ttnn.slice(both, (0, 0, 0, 0), (1, e, mrows, n))),
         ttnn.slice(both, (0, 0, 0, n), (1, e, mrows, 2 * n)),
     )
-    out = ttnn.linear(hidden, down_w, compute_kernel_config=HIFI4)
+    out = fast_linear(hidden, down_w, compute_kernel_config=HIFI4)
     # The sigmoid gate is a single output column, and a single column is one
     # output tile on one core of a hundred and ten: measured 22.13 us a call for
     # a 10 KB weight, **0.1 % of bandwidth**, 48 calls a token. It is the exact
@@ -790,7 +790,7 @@ def shared_expert(
     # 2560-long reduction instead.
     gate = None if _NO_SHEXP_KSPLIT else ksplit_linear(x, gate_vec)
     if gate is None:
-        gate = ttnn.linear(x, gate_vec, compute_kernel_config=HIFI4)
+        gate = fast_linear(x, gate_vec, compute_kernel_config=HIFI4)
     return ttnn.multiply(out, ttnn.sigmoid(gate))
 
 

@@ -3893,3 +3893,72 @@ Below about 20 us a call there is nothing left for a split to win.
 
 The two that matter are the first and second: 4.9 ms between them at ~20 % of
 bandwidth, both of them the MoE's own matmuls, and both fed by a gather.
+
+## 19. The decode matmul was reading two k-tiles at a time: 59.2 -> 51.7 ms
+
+The linears were 27 ms of a 59 ms step at about 26 % of bandwidth, and invariant
+38 said why: output width sets how many cores get work. That turns out to be the
+wrong diagnosis for most of them, and finding out took three eliminations.
+
+**Not bandwidth.** `scripts/dev/matmul_dtype_width.py` runs the same widths at
+three weight dtypes. At `[2560, 3200]`, bfloat4_b, bfloat8_b and bfloat16 all
+take **61.4 us** -- identical, while the weight is 4.6, 8.7 and 16.4 MB. A
+matmul whose time does not move when its operand quadruples in size is not
+reading-bound.
+
+**Not the FPU.** `scripts/dev/matmul_fidelity.py`: HiFi4, HiFi3, HiFi2 and LoFi
+are within 2 % on every shape in the census. The four-pass mode costs nothing
+here, which also means it buys nothing -- these operands are 7 and 3 mantissa
+bits.
+
+**It is the K loop, at ~0.65 us a k-tile** across every shape: `[2560, 1280]`
+40 us for 80 tiles, `[1600, 2560]` 35 for 50, `[6144, 2560]` 124 for 192. That
+is read *latency*, and `in0_block_w` -- how many k-tiles a core pulls before it
+computes -- is the knob. `ttnn.linear` with no program config picks **two**.
+
+`scripts/dev/matmul_program_config.py`, at `in0_block_w = 8`:
+
+| shape | default | blk 8 | | error vs float64 |
+|---|---:|---:|---:|---|
+| MoE gate\|up [2560, 3200] | 61.35 us | **20.19** | 3.04x | 1.37e-02 (default 1.45e-02) |
+| attn_output [6144, 2560] | 123.55 | **47.32** | 2.61x | 2.52e-02 (2.33e-02) |
+| shexp gate\|up [2560, 1280] | 40.54 | **15.82** | 2.56x | 2.60e-02 (1.28e-02) |
+| MoE down [1600, 2560] | 34.55 | 17.48 (blk 50) | 1.98x | 3.97e-02 (2.01e-02) |
+
+Blocking the *whole* K at once is worse on both counts -- slower than 8 and
+4.69e-02 -- so eight is a real optimum rather than the largest value that fits.
+Four is the accuracy optimum (1.16e-02 on the gate\|up, better than either) at
+about 1.8-2.4x, which is the setting to reach for if the error ever matters.
+
+Deployed as `ops.fast_linear`, which builds and caches a
+`MatmulMultiCoreReuseMultiCast1DProgramConfig` per shape and falls back to the
+plain op for anything the config rejects. **Two A/B pairs: 51.68 and 51.72 ms
+against 59.39 and 58.98.**
+
+INVARIANT 69: at M=1 these matmuls are latency-bound on their weight reads, not
+bandwidth-bound and not compute-bound. The knob is `in0_block_w`, the default is
+2, and 8 is worth 2.5-3x. Invariant 38's "output width decides it" describes the
+*narrow* shapes; for everything wider than a few tiles this is the real limit,
+and the two are separate problems.
+
+### 19.1 The quality harness is not deterministic, and never was
+
+Chasing an inconsistency in the numbers above turned up something that
+retroactively qualifies every quality claim in this document. Four runs of
+`device_quality.py 192` on **identical code**:
+
+    top-1  137, 140, 140, 143  of 191
+    top-5  171, 172, 173, 174
+    NLL    1.225, 1.211, 1.205, 1.213
+
+A spread of six tokens in top-1 and 0.02 in NLL, with nothing changed between
+runs. The likely cause is the collective: `ttnn.all_reduce` over four devices
+sums its partials in whatever order they arrive, float addition is not
+associative, and the MoE and the hyper-connection each all-reduce every layer.
+
+INVARIANT 70: on this rig a difference of six top-1 tokens in 191, or 0.02 of
+NLL, is **noise**. Any comparison closer than that needs repeated runs or a
+larger sample, and several in this session were closer than they looked. The two
+that survive it are the k-split zero bug (median NLL 0.415 -> 0.236, against a
+0.226-0.232 spread) and the exact-vs-threshold router rule, which was
+indistinguishable and is now known to have been *comfortably* indistinguishable.

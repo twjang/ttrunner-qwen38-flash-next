@@ -31,7 +31,8 @@ import ttnn
 from ..reference.config import Qwen4ExpConfig
 from ..reference.weights import WeightStore
 from . import linear_attn, moe
-from .ops import linear_rows, HIFI4, ksplit_linear, gated_residual_mix, grouped_rms_norm, reinject, rms_norm
+from .ops import (linear_rows, HIFI4, fast_linear, ksplit_linear, gated_residual_mix,
+                  grouped_rms_norm, reinject, rms_norm)
 from .weights import TTWeights
 
 
@@ -854,7 +855,7 @@ class TTModel:
         nb, k = self.max_blocks, self.indexer_topk
 
         # -- compressed keys ------------------------------------------------
-        k_raw = ttnn.linear(
+        k_raw = fast_linear(
             mixed, self.w.blk(layer, "indexer.k_proj.weight"), compute_kernel_config=HIFI4
         )                                                        # [1,1,B,d]
         if st.indexer_ring is None:
@@ -920,7 +921,7 @@ class TTModel:
         # Contracting the *block* cache against a single query column keeps the
         # 65536 x 128 cache where it is; scoring the other way round would
         # transpose 16 MB a layer a step.
-        q_idx = ttnn.linear(
+        q_idx = fast_linear(
             mixed, self.w.blk(layer, "indexer.q_proj.weight"), compute_kernel_config=HIFI4
         )
         q_idx = ttnn.reshape(q_idx, (1, batch, cfg.indexer_heads, d))
@@ -1220,17 +1221,17 @@ class TTModel:
         hd, n_q, n_kv = cfg.head_dim, cfg.num_attention_heads, cfg.num_kv_heads
         batch = mixed.shape[-2]
 
-        qg = ttnn.linear(mixed, self.w.blk(layer, "attn_q.weight"), compute_kernel_config=HIFI4)
+        qg = fast_linear(mixed, self.w.blk(layer, "attn_q.weight"), compute_kernel_config=HIFI4)
         qg = ttnn.reshape(qg, (1, batch, n_q, hd * 2))      # [q | gate] interleaved per head
         q = self._slice_last(qg, 0, hd)
         gate = self._slice_last(qg, hd, hd * 2)
 
         k = ttnn.reshape(
-            ttnn.linear(mixed, self.w.blk(layer, "attn_k.weight"), compute_kernel_config=HIFI4),
+            fast_linear(mixed, self.w.blk(layer, "attn_k.weight"), compute_kernel_config=HIFI4),
             (1, batch, n_kv, hd),
         )
         v = ttnn.reshape(
-            ttnn.linear(mixed, self.w.blk(layer, "attn_v.weight"), compute_kernel_config=HIFI4),
+            fast_linear(mixed, self.w.blk(layer, "attn_v.weight"), compute_kernel_config=HIFI4),
             (1, batch, n_kv, hd),
         )
         q = rms_norm(q, self.w.blk(layer, "attn_q_norm.weight"), cfg.rms_norm_eps)
@@ -1337,7 +1338,7 @@ class TTModel:
         out = ttnn.reshape(out, (1, 1, batch, n_q * hd))
         gate = ttnn.reshape(gate, (1, 1, batch, n_q * hd))
         out = ttnn.multiply(out, ttnn.sigmoid(gate))
-        return ttnn.linear(out, self.w.blk(layer, "attn_output.weight"), compute_kernel_config=HIFI4)
+        return fast_linear(out, self.w.blk(layer, "attn_output.weight"), compute_kernel_config=HIFI4)
 
     # -- PLE (n-gram) injection, one token ------------------------------------
 
@@ -1493,7 +1494,7 @@ class TTModel:
             ttnn.multiply(normed, ttnn.sigmoid(z_heads)), (1, 1, k, vd)
         )
         return self.all_reduce(
-            ttnn.linear(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
+            fast_linear(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
         )
 
     def _ple_step_n(
@@ -1541,7 +1542,7 @@ class TTModel:
         hd, n_q, n_kv = cfg.head_dim, cfg.num_attention_heads, cfg.num_kv_heads
 
         qg = ttnn.reshape(
-            ttnn.linear(mixed, self.w.blk(layer, "attn_q.weight"), compute_kernel_config=HIFI4),
+            fast_linear(mixed, self.w.blk(layer, "attn_q.weight"), compute_kernel_config=HIFI4),
             (1, k, n_q, hd * 2),
         )
         q = rms_norm(self._slice_last(qg, 0, hd), self.w.blk(layer, "attn_q_norm.weight"),
@@ -1549,13 +1550,13 @@ class TTModel:
         gate = self._slice_last(qg, hd, hd * 2)
         kt = rms_norm(
             ttnn.reshape(
-                ttnn.linear(mixed, self.w.blk(layer, "attn_k.weight"), compute_kernel_config=HIFI4),
+                fast_linear(mixed, self.w.blk(layer, "attn_k.weight"), compute_kernel_config=HIFI4),
                 (1, k, n_kv, hd),
             ),
             self.w.blk(layer, "attn_k_norm.weight"), cfg.rms_norm_eps,
         )
         vt = ttnn.reshape(
-            ttnn.linear(mixed, self.w.blk(layer, "attn_v.weight"), compute_kernel_config=HIFI4),
+            fast_linear(mixed, self.w.blk(layer, "attn_v.weight"), compute_kernel_config=HIFI4),
             (1, k, n_kv, hd),
         )
 
@@ -1606,7 +1607,7 @@ class TTModel:
 
         out = ttnn.reshape(out, (1, 1, k, n_q * hd))
         gate = ttnn.reshape(gate, (1, 1, k, n_q * hd))
-        return ttnn.linear(
+        return fast_linear(
             ttnn.multiply(out, ttnn.sigmoid(gate)),
             self.w.blk(layer, "attn_output.weight"), compute_kernel_config=HIFI4,
         )
@@ -1623,10 +1624,10 @@ class TTModel:
         emb = self._input(ngram_name, self.ngram_embed(histories), ttnn.bfloat16)
 
         key = grouped_rms_norm(
-            ttnn.linear(emb, self.w.blk(layer, "ple_key.weight"), compute_kernel_config=HIFI4),
+            fast_linear(emb, self.w.blk(layer, "ple_key.weight"), compute_kernel_config=HIFI4),
             self.w.blk(layer, "ple_norm_key.weight"), cfg.rms_norm_eps, cfg.hidden_size, cfg.hc_count,
         )
-        value = ttnn.linear(emb, self.w.blk(layer, "ple_value.weight"), compute_kernel_config=HIFI4)
+        value = fast_linear(emb, self.w.blk(layer, "ple_value.weight"), compute_kernel_config=HIFI4)
         query = grouped_rms_norm(
             hidden, self.w.blk(layer, "ple_norm_query.weight"), cfg.rms_norm_eps,
             cfg.hidden_size, cfg.hc_count,
@@ -1972,7 +1973,7 @@ class TTModel:
         Returns [B, vocab_size].
         """
         batch = hidden.shape[-2]
-        part = ttnn.linear(hidden, self.w.get("output.weight"), compute_kernel_config=HIFI4)
+        part = fast_linear(hidden, self.w.get("output.weight"), compute_kernel_config=HIFI4)
         full = ttnn.to_torch(part, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=-1))
         return full.reshape(batch, -1)[:, : self.cfg.vocab_size]
 
@@ -1999,7 +2000,7 @@ class TTModel:
             return None
         width = vocab // n_dev
 
-        part = ttnn.linear(hidden, self.w.get("output.weight"), compute_kernel_config=HIFI4)
+        part = fast_linear(hidden, self.w.get("output.weight"), compute_kernel_config=HIFI4)
         best = ttnn.max(part, dim=-1, keepdim=True)
         where = ttnn.argmax(part, dim=-1, keepdim=True)
         # [n_dev, 1, B, 1] once the per-device results are stacked
