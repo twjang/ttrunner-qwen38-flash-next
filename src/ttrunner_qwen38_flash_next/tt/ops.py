@@ -1094,6 +1094,104 @@ def output_tiles(width: int) -> int:
     return max(1, (width + _TILE - 1) // _TILE)
 
 
+_KS_SUM_OUT: dict = {}
+_KS_SUM_FELL_BACK = False
+_NO_FUSED_KSPLIT_SUM = bool(os.environ.get("TT_NO_FUSED_KSPLIT_SUM"))
+
+
+def _ksplit_sum_program(parts, out, groups: int, stride: int, n_out: int):
+    grid = parts.device().compute_with_storage_grid_size()
+    n = min(n_out, grid.x * grid.y)
+    cols = min(n, grid.x)
+    rows = (n + grid.x - 1) // grid.x
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+    cores = [ttnn.CoreCoord(cx, cy) for cy in range(rows) for cx in range(cols)]
+
+    acc = []
+    for t in (parts, out):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError("ksplit sum: both operands must be interleaved")
+        acc.append(ct)
+    page = acc[0][1]
+    if acc[1][1] != page:
+        raise RuntimeError("ksplit sum: partials and output must share a page size")
+
+    work = [((n_out * i) // len(cores), (n_out * (i + 1)) // len(cores))
+            for i in range(len(cores))]
+    # The input buffer holds all G partials at once, so the reader can issue G
+    # reads against one barrier instead of G round trips.
+    cbs = [ttnn.CBDescriptor(
+        total_size=(groups if i == 0 else 2) * page, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=parts.dtype, page_size=page)])
+        for i in (0, 1)]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("ksplit_sum_reader.cpp", [groups, stride, page] + acc[0],
+             [[parts.buffer_address(), lo, hi] for lo, hi in work],
+             ttnn.ReaderConfigDescriptor()),
+        kern("ksplit_sum_compute.cpp", [groups], [[lo, hi] for lo, hi in work],
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("ksplit_sum_writer.cpp", acc[1],
+             [[out.buffer_address(), lo, hi] for lo, hi in work],
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def fused_group_sum(parts, key):
+    """`sum(parts, dim=1, keepdim=True)` on the cores the output needs, or None.
+
+    `ttnn.sum` takes the whole grid to reduce at most a hundred and ten tiles to
+    ten: **6.51 us**, 193 times a token, where `dispatch_floor.py` prices ten
+    cores at 2.46. The reduction is also kept in fp32 dest here, where the op
+    rounds to the tensor's dtype as it accumulates.
+    """
+    global _KS_SUM_FELL_BACK
+    if _NO_FUSED_KSPLIT_SUM:
+        return None
+    try:
+        shape = list(parts.shape)
+        groups = shape[1]
+        mt = max(1, (shape[-2] + _TILE - 1) // _TILE)
+        nt = output_tiles(shape[-1])
+        stride = mt * nt
+        # Only where `ttnn.sum` stops being cheap. Measured on the three shapes
+        # the model reduces: at 110 input tiles it is 6.68 us against the
+        # kernel's 4.15, but at 96 and at 30 it is 3.37 and 3.15 against 4.43 and
+        # 3.91 -- already at the floor, with nothing for a right-sized launch to
+        # take back. The grid is the crossover, which is what it should be.
+        if groups * stride < parts.device().compute_with_storage_grid_size().x \
+                * parts.device().compute_with_storage_grid_size().y:
+            return None
+        okey = (key, id(parts.device()), tuple(shape), str(parts.dtype))
+        out = _KS_SUM_OUT.get(okey)
+        if out is None:
+            out = ttnn.from_torch(
+                torch.zeros(shape[0], 1, shape[2], shape[3]), dtype=parts.dtype,
+                layout=ttnn.TILE_LAYOUT, device=parts.device(),
+                mesh_mapper=ttnn.ReplicateTensorToMesh(parts.device()))
+            _KS_SUM_OUT[okey] = out
+        ttnn.generic_op([parts, out],
+                        _ksplit_sum_program(parts, out, groups, stride, stride))
+        return out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _KS_SUM_FELL_BACK:
+            _KS_SUM_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused ksplit sum unavailable, using ttnn.sum: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 def ksplit_linear(x, w):
     """`x @ w` with the reduction split across cores, or None if it would not pay.
 
@@ -1122,7 +1220,8 @@ def ksplit_linear(x, w):
         _KSPLIT[key] = got
     out = got[0]
     ttnn.generic_op([x, w, out], _ksplit_build(x, w, out, groups, kt, nt))
-    return ttnn.sum(out, dim=1, keepdim=True)
+    reduced = fused_group_sum(out, key=key)
+    return reduced if reduced is not None else ttnn.sum(out, dim=1, keepdim=True)
 
 # --- down and inject as one matmul -------------------------------------------
 #
