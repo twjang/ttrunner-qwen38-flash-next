@@ -6169,6 +6169,23 @@ a group's activation multicast addresses only itself -- and this run clears it:
 that shape is the fastest relative accuracy in the table and does not hang
 outside a trace.
 
+### 45.9 The k-split hangs *in the trace* and had to be split by call site
+
+`TT_KSG_WIDE=1` -- the router, the shared expert's gate|up and ssm_alpha|beta on
+`ksgemv` -- hung traced replay **five times out of five**. The general replay
+hang (45.4) is about two runs in five, so five in a row is 1 %: this is
+systematic, not that. And every one of the three shapes runs clean *outside* a
+trace, at the accuracies and speeds in 45.8. So it is trace-specific, which is
+the same family as `_KSG_FOLD`: fine in isolation, fine at ninety-six reps, and
+then no device program event after the first inside the 48-layer step.
+
+A boolean cannot find that. `TT_KSG_WIDE` is now a comma list -- `router`,
+`shexp`, `ab`, `qkv`, `indexer`, or `1` for all -- so each call site runs alone.
+
+INVARIANT 121: a flag that turns on several call sites at once cannot be
+bisected, and a kernel that only fails inside the full traced step is the only
+kind this project has left. Wire each site behind its own name from the start.
+
 INVARIANT 120: the k-split beats `ttnn.linear` at M = 1 on every shape in the
 census, by 1.2x to 3.1x, and is more accurate. Wiring the remaining call sites is
 the known-good work; there is no shape left where `ttnn.linear` is the right
