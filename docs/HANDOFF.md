@@ -4920,3 +4920,87 @@ order:
    contiguous; `matmul_init` already takes a transpose flag.
 3. **`all_reduce`**, 181 calls, ~2 ms. 13.29 us to reduce 22 KB across four
    devices is latency, not bandwidth, and nothing was tried here this session.
+
+## 31. The collectives, and the end of the session
+
+    47.87 -> 35.9 ms a token, median of three; 35.17 best
+    20.9  -> 27.9 tokens a second, 28.4 at the best step
+
+Three more after section 30:
+
+| | `ab_step.py` |
+|---|---:|
+| three links on the wide all-reduce | +0.75 |
+| the MoE router weight in bfloat16 | ~+0.3 |
+| (the hyper-connection norm, 30) | +0.88 |
+
+### 31.1 The collective is a step function, and nobody had touched `num_links`
+
+`ttnn.all_reduce` on this 1x4 mesh:
+
+    width      32     352    1024    2560    5120   10240   20480
+    us       11.7    12.8    39.2    39.2    39.3    43.9    57.6
+
+Flat from 1024 to 5120 -- so **two 2560-wide reduces merged into one 5120-wide
+would be free**. There is no pair in a layer available at the same time: the
+attention output and the MoE's routed sum are separated by the whole
+hyper-connection.
+
+What was available is the link count, which nothing had ever swept. Three links
+beat the default by 6 us at 2560 wide and are bit-identical; below the grid the
+op is at a fixed-cost floor (12.8 us to reduce 0.7 KB across four chips) and the
+extra links only add setup. `ops.all_reduce` picks by tile count.
+
+INVARIANT 93: `ttnn.all_reduce`'s default `num_links` is not the best one. Sweep
+it per shape; it is free and it is exact.
+
+Two collective dead ends, measured:
+
+* `all_reduce_async` without semaphores **is** `all_reduce` -- same 39.2 us.
+  With persistent ones it TT_FATALs on the semaphore count.
+* Its buffered overload, the `use_optimal_ccl_for_llama` path, fails at every
+  buffer shape with **"This kernel does not support blackhole dram"**. Not
+  available on this hardware.
+
+### 31.2 Rejected: replicating the hyper-connection down weight
+
+`down_w` is row-sharded, so its matmul returns a partial and costs a collective.
+Gathering the weight once at load would remove both. Measured:
+
+    split matmul + all_reduce   24.40 us
+    replicated matmul           39.97 us
+
+The replicated form is a [10240, 352] matmul -- 320 k-tiles over eleven output
+tiles, eleven cores chewing 320 tile-matmuls each. The existing plan was right,
+and for the reason section 25 gave, which still holds.
+
+### 31.3 What the remaining gap actually is
+
+    matmuls        10.42 ms   roofline 6.11   59 %
+    all_reduce      ~3.8      181 calls, at the CCL's fixed cost
+    everything else ~22
+
+    2825 launches a step, against the ~700 a 10 ms step allows.
+
+The matmul gap is **M = 1**, not configuration. A tile matmul computes a 32x32
+output whatever M is, so at batch 1 thirty-one rows of every one are thrown away;
+`fast_linear`'s config is at or near the best of everything tried (28.2), and the
+narrow shapes are compute-bound on the eleven-to-sixteen cores their output width
+affords. Nothing in the op set fixes that.
+
+So the honest statement of the remaining distance: **reaching 127 tok/s needs
+either a batch or a different decomposition of the model onto the grid, not more
+fusion.** Everything this session could remove by fusing, it removed -- 5640
+launches became 2825 -- and the step came down by a third.
+
+The three items still on the table, with their measured sizes:
+
+1. **Multicast the activation in `gather_gemv`** (~1.1 ms). 2.1 MB of the
+   6.9 the gate|up GEMV moves is the activation read once per core. `ttnn`'s own
+   matmul multicasts (`mcast_in0=True`); this kernel does not.
+   `ttnn.SemaphoreDescriptor` and the NOC multicast API are both available; the
+   work is the sender/receiver split and the logical-to-physical core mapping.
+2. **Transposed expert weights** (~0.8 ms), a conversion-time change;
+   `matmul_init` already takes the transpose flag.
+3. **The 2560-wide all-reduce**, 3.15 ms at three links, if a pair of them can
+   ever be made simultaneous.
