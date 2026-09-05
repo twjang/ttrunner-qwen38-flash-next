@@ -668,21 +668,29 @@ class TTModel:
         return ttnn.to_memory_config(t, mem)
 
     def conv_taps(self, key: tuple, weight: ttnn.Tensor, channels: int, k: int,
-                  rows: bool = False) -> list:
+                  rows: bool = False, dtype=None) -> list:
         """The kernel's `k` per-tap columns, sliced once and reused.
 
         `rows` gives them as [1, 1, 1, C] instead of [1, 1, C, 1], for the decode
         conv that keeps its channels on the last axis. The transpose runs once
         per layer at first use and is then cached like the columns are.
         """
-        hit = self._conv_taps.get((key, rows))
+        hit = self._conv_taps.get((key, rows, dtype))
         if hit is None:
             hit = [
                 ttnn.slice(weight, (0, 0, 0, tap), (1, 1, channels, tap + 1)) for tap in range(k)
             ]
             if rows:
                 hit = [ttnn.transpose(t, -2, -1) for t in hit]
-            self._conv_taps[(key, rows)] = hit
+            if dtype is not None:
+                # The conv weight is stored float32 while the stream is
+                # bfloat16, and a compute kernel configures its unpacker from
+                # one circular buffer -- a float32 tile read through a bfloat16
+                # one is garbage (invariant 76). The op path converts on every
+                # multiply anyway, so rounding once here costs nothing it was
+                # not already paying.
+                hit = [t if t.dtype == dtype else ttnn.typecast(t, dtype) for t in hit]
+            self._conv_taps[(key, rows, dtype)] = hit
         return hit
 
     def _causal_conv_step(
@@ -733,6 +741,16 @@ class TTModel:
             # full-tile reduction. Invariant 42's ~5.5 us floor is for
             # *elementwise* ops; `concat` and `sum` are data movement and cost
             # with the padding, so fewer calls is not automatically less work.
+            # One launch for the whole thing, including the ring shift, when the
+            # kernel takes the shapes: eleven wide ops a layer become one.
+            if depth == 3 and k == 4:
+                fused = ops.fused_conv_step(
+                    x_col, state,
+                    self.conv_taps(("ssm", layer), weight, channels, k, rows,
+                                   dtype=x_col.dtype),
+                    key=("ssm", layer))
+                if fused is not None:
+                    return fused, state
             acc = None
             for tap in range(k):
                 age = depth - tap                   # 3, 2, 1, 0 steps back

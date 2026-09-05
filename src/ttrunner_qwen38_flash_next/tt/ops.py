@@ -332,6 +332,118 @@ def _rope_program(x, cos, sin, out, nt, nt_rope):
     ], semaphores=[], cbs=cbs)
 
 
+_CONV_OUT: dict = {}
+_CONV_FELL_BACK = False
+_NO_FUSED_CONV = bool(os.environ.get("TT_NO_FUSED_CONV"))
+
+
+def _conv_step_program(x, state, taps, out):
+    grid = x.device().compute_with_storage_grid_size()
+    n_tiles = _tile_count(x)
+    n = min(n_tiles, grid.x * grid.y)
+    cols = min(n, grid.x)
+    rows = (n + grid.x - 1) // grid.x
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+    cores = [ttnn.CoreCoord(cx, cy) for cy in range(rows) for cx in range(cols)]
+
+    tensors = [x] + list(state) + list(taps)
+    acc = []
+    for t in tensors + [out]:
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError("fused conv: every operand must be interleaved")
+        acc.append(ct)
+    page = acc[0][1]
+    if any(a[1] != page for a in acc):
+        raise RuntimeError("fused conv: every operand must share one page size")
+
+    work = [((n_tiles * i) // len(cores), (n_tiles * (i + 1)) // len(cores))
+            for i in range(len(cores))]
+    # Nine buffers of one tile each, double-buffered: eight inputs and the
+    # output. At 2 KB a bfloat16 tile that is 36 KB of L1 a core.
+    cbs = [ttnn.CBDescriptor(
+        total_size=2 * page, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=x.dtype, page_size=page)])
+        for i in range(9)]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    addrs = [t.buffer_address() for t in tensors]
+    read_ct = [page]
+    for a in acc[:-1]:
+        read_ct += a
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("conv_step_reader.cpp", read_ct,
+             [addrs + [lo, hi] for lo, hi in work], ttnn.ReaderConfigDescriptor()),
+        kern("conv_step_compute.cpp", [], [[lo, hi] for lo, hi in work],
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("conv_step_writer.cpp", acc[-1],
+             [[out.buffer_address(), lo, hi] for lo, hi in work],
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def fused_conv_step(x, state, taps, key=None):
+    """`silu(sum_j taps[j] * hist[j])` and the ring shift, in one launch, or None.
+
+    `state` is [newest, middle, oldest] and `taps` is oldest-first, which is the
+    pairing `_causal_conv_step` uses (age = k-1-tap). The ring is advanced **in
+    place** by the reader, so this returns only the output.
+
+    Replaces eleven wide ops a layer -- four multiplies, three adds, three ring
+    copies and a silu -- with one launch whose bytes are ~9 us a layer.
+    """
+    global _CONV_FELL_BACK
+    if _NO_FUSED_CONV:
+        return None
+    try:
+        # Loudly, not silently. This declined for a whole measurement round
+        # because the conv weight is float32 and the stream is bfloat16, and a
+        # quiet `return None` made the A/B compare the op path with itself
+        # (invariant 71).
+        why = None
+        if len(state) != 3 or len(taps) != 4:
+            why = f"expected 3 history columns and 4 taps, got {len(state)} and {len(taps)}"
+        shape = list(x.shape)
+        if why is None and any(list(t.shape) != shape for t in list(state) + list(taps)):
+            why = ("operand shapes differ: "
+                   + ", ".join(str(list(t.shape)) for t in [x] + list(state) + list(taps)))
+        if why is None and any(t.dtype != x.dtype for t in list(state) + list(taps)):
+            why = ("operand dtypes differ: "
+                   + ", ".join(str(t.dtype) for t in [x] + list(state) + list(taps)))
+        if why is not None:
+            if not _CONV_FELL_BACK:
+                _CONV_FELL_BACK = True
+                import warnings
+                warnings.warn(f"fused conv declined, using the ops: {why}",
+                              RuntimeWarning, stacklevel=2)
+            return None
+        okey = (key, id(x.device()), tuple(shape), str(x.dtype))
+        out = _CONV_OUT.get(okey)
+        if out is None:
+            out = ttnn.from_torch(
+                torch.zeros(*shape), dtype=x.dtype, layout=ttnn.TILE_LAYOUT,
+                device=x.device(), mesh_mapper=ttnn.ReplicateTensorToMesh(x.device()))
+            _CONV_OUT[okey] = out
+        ttnn.generic_op([x] + list(state) + list(taps) + [out],
+                        _conv_step_program(x, state, taps, out))
+        return out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _CONV_FELL_BACK:
+            _CONV_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused conv unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 def fused_rope(x, cos_full, sin_full, rope_dim: int):
     """`x` with its first `rope_dim` channels rotated, in one launch, or None.
 
