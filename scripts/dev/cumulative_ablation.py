@@ -34,7 +34,17 @@ STUBS = {
                                 lambda self, mixed, *a, **k: mixed),
     "reinject": lambda: setattr(ops, "reinject",
                                 lambda hyper, branch, inject, hc, base=None: hyper),
-    "ple":      lambda: setattr(mm.TTModel, "_ple_inject",
+    # `_ple_step`, not `_ple_inject`: `_layer` calls the former, and stubbing the
+    # latter left the whole PLE path running while reporting it as free.
+    "ple":      lambda: setattr(mm.TTModel, "_ple_step",
+                                lambda self, hidden, *a, **k: hidden),
+    # Not a component -- a probe. With every component stubbed, what is left is
+    # the stubs' own work plus the glue, and the collective is most of the first.
+    "allreduce": lambda: (setattr(mm.TTModel, "all_reduce", lambda self, t: t),
+                          setattr(ops, "all_reduce", lambda t: t)),
+    # The whole layer, so what is left is the trace machinery, the embedding and
+    # the output head -- the floor under everything.
+    "layers":   lambda: setattr(mm.TTModel, "_layer",
                                 lambda self, hidden, *a, **k: hidden),
 }
 for name in ORDER:

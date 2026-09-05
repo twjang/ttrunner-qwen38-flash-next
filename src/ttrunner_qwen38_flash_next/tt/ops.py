@@ -73,6 +73,17 @@ def grouped_rms_norm(
     width = shape[-1]
     assert width == groups * group_size, f"{width} != {groups}*{group_size}"
 
+    # The cast here rather than at the call sites: the norm weights are stored
+    # float32 and `fused_group_norm` needs the activation's dtype, so a caller
+    # that did not know silently got the six-op path. The PLE's three norms did
+    # exactly that for as long as the fused kernel has existed -- and only the
+    # *first* decline warns, so fixing the one in `gated_residual_mix` hid them.
+    weight = as_dtype(weight, x.dtype)
+    fused = fused_group_norm(x, weight, eps, group_size, groups,
+                             key=("grn", id(weight)))
+    if fused is not None:
+        return fused[0]
+
     # Fold the group axis into rows so the normalised axis is the last one.
     folded = ttnn.reshape(x, (shape[0], shape[1], shape[2] * groups, group_size))
     normed = _sharded_rms_norm(folded, eps)
