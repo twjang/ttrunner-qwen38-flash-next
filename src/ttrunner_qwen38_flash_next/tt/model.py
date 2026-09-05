@@ -31,8 +31,8 @@ import ttnn
 from ..reference.config import Qwen4ExpConfig
 from ..reference.weights import WeightStore
 from . import linear_attn, moe
-from .ops import (linear_rows, HIFI4, fast_linear, ksplit_linear, gated_residual_mix,
-                  grouped_rms_norm, reinject, rms_norm)
+from .ops import (linear_rows, HIFI4, fast_linear, fused_rope, ksplit_linear,
+                  gated_residual_mix, grouped_rms_norm, reinject, rms_norm)
 from .weights import TTWeights
 
 
@@ -41,6 +41,10 @@ from .weights import TTWeights
 _MISSING = object()
 
 KV_BLOCK = 32
+
+# Rows in a tile. The rope tables are bound row-expanded to this for the fused
+# kernel; on device it is the same two tiles either way.
+TILE_ROWS = 32
 
 # The DeltaNet op's fixed chunk width, which is also `prefill`'s default chunk
 # and therefore the width the traced prefill path will capture.
@@ -518,8 +522,46 @@ class TTModel:
         s = list(x.shape)
         return ttnn.slice(x, (0, 0, 0, start), (s[0], s[1], s[2], stop))
 
-    def _apply_rope_dev(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor) -> ttnn.Tensor:
-        """Rotate the leading rope_dim dims; leave the rest untouched."""
+    def _rope_tables(self, name: str, cos_t, sin_t, key):
+        """The rope tables, bound twice: [.., 1, rot] for the ops and row-expanded
+        for the kernel.
+
+        The expanded pair is the *same two tiles* on device -- a one-row tensor
+        already occupies a 32-row tile -- so it costs a slightly larger
+        host-to-device copy and nothing else. The kernel needs it because the
+        SFPU multiplies whole tiles and cannot broadcast a row.
+        """
+        cos = self._input(f"{name}_cos", cos_t, ttnn.float32, key=key)
+        sin = self._input(f"{name}_sin", sin_t, ttnn.float32, key=key)
+        # **bfloat16**, not float32: the compute kernel configures its unpacker
+        # from the activation's circular buffer, so a float32 table read through
+        # it is garbage. Rounding the tables costs nothing measurable -- against
+        # float64 the kernel is 1.73e-03 where the ops path is 2.08e-03, because
+        # it accumulates the pair of products in fp32 registers instead of
+        # rounding between them (`rope_kernel_check.py`).
+        sh = list(cos_t.shape)
+        full = (
+            self._input(f"{name}_cos_f",
+                        cos_t.expand(sh[0], sh[1], TILE_ROWS, sh[3]).contiguous(),
+                        ttnn.bfloat16, key=key),
+            self._input(f"{name}_sin_f",
+                        sin_t.expand(sh[0], sh[1], TILE_ROWS, sh[3]).contiguous(),
+                        ttnn.bfloat16, key=key),
+        )
+        return cos, sin, full
+
+    def _apply_rope_dev(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor,
+                        full=None) -> ttnn.Tensor:
+        """Rotate the leading rope_dim dims; leave the rest untouched.
+
+        Eleven ttnn ops, three dozen times a token, on tensors of eight tiles or
+        fewer -- so `full` hands the whole thing to one kernel when the tables
+        have been bound row-expanded for it.
+        """
+        if full is not None:
+            got = fused_rope(x, full[0], full[1], self.cfg.rope_dim)
+            if got is not None:
+                return got
         rot = self.cfg.rope_dim
         half = rot // 2
         x_rot = self._slice_last(x, 0, rot)
@@ -875,11 +917,9 @@ class TTModel:
         pooled = ttnn.reshape(pooled, (1, batch, 1, d))
         # roped at the block's *start*, which is where its first token sat
         b_cos, b_sin = self.rope([ratio * (p // ratio) for p in positions])
-        pooled = self._apply_rope_dev(
-            pooled,
-            self._input("idx_block_cos", b_cos, ttnn.float32, key=tuple(positions)),
-            self._input("idx_block_sin", b_sin, ttnn.float32, key=tuple(positions)),
-        )
+        b_cos_d, b_sin_d, b_full = self._rope_tables(
+            "idx_block", b_cos, b_sin, tuple(positions))
+        pooled = self._apply_rope_dev(pooled, b_cos_d, b_sin_d, b_full)
         if st.indexer_blocks is None:
             st.indexer_blocks = ttnn.zeros(
                 (batch, 1, nb, d), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh
@@ -1239,10 +1279,10 @@ class TTModel:
 
         positions_for_rope = list(position) if isinstance(position, (list, tuple)) else [position] * batch
         cos_t, sin_t = self.rope(positions_for_rope)
-        cos = self._input("rope_cos", cos_t, ttnn.float32, key=tuple(positions_for_rope))
-        sin = self._input("rope_sin", sin_t, ttnn.float32, key=tuple(positions_for_rope))
-        q = self._apply_rope_dev(q, cos, sin)
-        k = self._apply_rope_dev(k, cos, sin)
+        cos, sin, rope_full = self._rope_tables(
+            "rope", cos_t, sin_t, tuple(positions_for_rope))
+        q = self._apply_rope_dev(q, cos, sin, rope_full)
+        k = self._apply_rope_dev(k, cos, sin, rope_full)
 
         self._ensure_kv(st, batch, n_kv, hd)
         positions = list(position) if isinstance(position, (list, tuple)) else [position] * batch

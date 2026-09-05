@@ -180,6 +180,119 @@ def fast_linear(x, w, **kw):
     return ttnn.linear(x, w, **kw)
 
 
+# --- rotary embedding, in one pass -------------------------------------------
+#
+# `_apply_rope_dev` is eleven ttnn ops -- six slices, a negate, two concats, two
+# multiplies and an add -- on tensors of eight tiles or fewer, three dozen times
+# a token. At 5.8 us an op whatever its shape (invariant 66) that is ~64 us a
+# call and about 3 ms of a 49 ms step, to rotate 64 of 256 channels.
+#
+# It collapses because **rope_dim is 64 and half is 32, which is exactly one
+# tile**: the rotation `[-second, first]` is a swap of two whole tiles rather
+# than a shuffle inside one, so every output tile is either a fused pair of
+# multiplies or a straight copy.
+_ROPE_OUT: dict = {}
+_ROPE_FELL_BACK = False
+_NO_FUSED_ROPE = bool(os.environ.get("TT_NO_FUSED_ROPE"))
+
+
+def _rope_program(x, cos, sin, out, nt, nt_rope):
+    grid = x.device().compute_with_storage_grid_size()
+    n_tiles = 1
+    for d in list(out.shape)[:-2]:
+        n_tiles *= d
+    n_tiles *= max(1, (out.shape[-2] + _TILE - 1) // _TILE) * nt
+    n = min(n_tiles, grid.x * grid.y)
+    cols = min(n, grid.x)
+    rows = (n + grid.x - 1) // grid.x
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+    cores = [ttnn.CoreCoord(cx, cy) for cy in range(rows) for cx in range(cols)]
+
+    acc = {}
+    for tag, t in (("x", x), ("c", cos), ("s", sin), ("o", out)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"fused rope: {tag} must be interleaved")
+        acc[tag] = ct
+    if acc["o"][1] != acc["x"][1] or acc["c"][1] != acc["s"][1]:
+        raise RuntimeError("fused rope: x and out share a dtype, cos and sin share one")
+
+    work = [((n_tiles * i) // len(cores), (n_tiles * (i + 1)) // len(cores))
+            for i in range(len(cores))]
+    cbs = [ttnn.CBDescriptor(
+        total_size=2 * acc["x"][1], core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=x.dtype, page_size=acc["x"][1])])
+        for i in (0, 1, 4)]
+    cbs += [ttnn.CBDescriptor(
+        total_size=2 * acc["c"][1], core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=cos.dtype, page_size=acc["c"][1])])
+        for i in (2, 3)]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("rope_reader.cpp", [nt, nt_rope] + acc["x"] + acc["c"] + acc["s"],
+             [[x.buffer_address(), cos.buffer_address(), sin.buffer_address(), lo, hi]
+              for lo, hi in work], ttnn.ReaderConfigDescriptor()),
+        kern("rope_compute.cpp", [nt, nt_rope], [[lo, hi] for lo, hi in work],
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("rope_writer.cpp", acc["o"],
+             [[out.buffer_address(), lo, hi] for lo, hi in work],
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def fused_rope(x, cos_full, sin_full, rope_dim: int):
+    """`x` with its first `rope_dim` channels rotated, in one launch, or None.
+
+    `cos_full` and `sin_full` must be row-expanded to a whole tile: the SFPU
+    multiplies whole tiles and cannot broadcast a row, and the tables are
+    [.., 1, rope_dim] as the ops path wants them. Expanding costs nothing on
+    device -- a one-row tensor already occupies a 32-row tile.
+    """
+    global _ROPE_FELL_BACK
+    if _NO_FUSED_ROPE:
+        return None
+    try:
+        hd = x.shape[-1]
+        nt, nt_rope = hd // _TILE, rope_dim // _TILE
+        if hd % _TILE or rope_dim % _TILE or nt_rope != 2 or nt < 2:
+            return None
+        # The tables must share `x`'s dtype. The compute kernel configures its
+        # unpacker once, from the activation's circular buffer, so a float32
+        # table read through it comes back as garbage -- and only in the two
+        # rotated tiles, which is exactly the failure that is easiest to miss
+        # (`rope_kernel_check.py` measured 1.96e+36 there and nothing wrong in
+        # the six passthrough tiles).
+        if cos_full.dtype != x.dtype or sin_full.dtype != x.dtype:
+            return None
+        key = (id(x.device()), tuple(x.shape), str(x.dtype))
+        out = _ROPE_OUT.get(key)
+        if out is None:
+            out = ttnn.from_torch(
+                torch.zeros(*x.shape), dtype=x.dtype, layout=ttnn.TILE_LAYOUT,
+                device=x.device(), mesh_mapper=ttnn.ReplicateTensorToMesh(x.device()))
+            _ROPE_OUT[key] = out
+        ttnn.generic_op([x, cos_full, sin_full, out],
+                        _rope_program(x, cos_full, sin_full, out, nt, nt_rope))
+        return out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _ROPE_FELL_BACK:
+            _ROPE_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused rope unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 def linear_rows(x, w, max_rows: int = ROW_GROUP, **kw):
     """`ttnn.linear`, but never on more than `max_rows` rows at a time.
 

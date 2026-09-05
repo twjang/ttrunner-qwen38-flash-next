@@ -4118,3 +4118,88 @@ to 32, which `moe_rows_check.py` now reports as 0.000 % where it had been 1.562.
 
 Single-stream remains 49 ms and 32.6 needs the op count roughly halved; the two
 halves of that are in 17.1, and 20.2 bounds what fusion can return.
+
+## 23. A launch costs what its core count costs, and ttnn always takes the grid
+
+The batch-1 step is 49 ms against a **memory roofline of 7.9 ms** -- the census
+says 3.05 GB a device a token, and 388 GB/s is measured. Sixteen per cent. The
+other 41 ms had been attributed to "5764 ops at 5.8 us", which is true and was
+treated as a floor. It is not one.
+
+`scripts/dev/dispatch_floor.py` prices a `generic_op` that reads a single page,
+by the size of its core range:
+
+| cores | us |
+|---:|---:|
+| 1 | **2.06** |
+| 8 | 2.31 |
+| 32 | 3.15 |
+| 64 | 4.27 |
+| 110 | 5.81 |
+| `ttnn.multiply`, any shape | 5.78 |
+
+A launch is about **1.8 us plus 0.036 us a core**. And ttnn's elementwise ops take
+the whole grid whatever the tensor: a one-tile `ttnn.multiply` costs the
+hundred-and-ten-core price.
+
+`step_op_census.py`, bucketing every call by its largest operand:
+
+| tiles | calls | now | on its own cores | saving |
+|---:|---:|---:|---:|---:|
+| 1 | 780 | 4.52 ms | 1.43 | **3.09** |
+| 2-4 | 616 | 3.57 | 1.20 | 2.38 |
+| 5-16 | 698 | 4.05 | 1.66 | 2.39 |
+| 17-32 | 168 | 0.97 | 0.50 | 0.48 |
+| 33-64 | 888 | 5.15 | 3.64 | 1.51 |
+| 65+ | 2614 | 15.16 | 15.06 | 0.10 |
+| | | | | **9.95 ms** |
+
+**Over half the step's calls touch 64 tiles or fewer**, and about 10 ms of the
+step is starting cores that have nothing to do.
+
+INVARIANT 75: invariant 66 is half a sentence. An op's *bytes* are free at these
+shapes; its *launch* costs by core count, and ttnn picks the whole grid. So a
+kernel is worth writing not only when it fuses several ops but when it replaces
+**one** op on a small tensor -- `small_ew_probe.py` measures a right-sized
+generic_op at 2.01 us against 5.87 for `ttnn.multiply` on one tile, **2.9x**, and
+identical to it against float64.
+
+That also explains why the fused `reinject` lost (20.2): it took the whole grid
+*and* did per-tile scalar work, so it paid the full launch and then some.
+
+### 23.1 Where the small calls are
+
+`step_op_census.py` now walks the stack for every call whose largest operand is
+16 tiles or fewer, so the work can be aimed at source lines:
+
+    ops.py:755-756   the hyper-connection injection tail   384 calls
+    ops.py:569-572   its all-reduce, silu and slice        288
+    model.py:519-531 `_apply_rope_dev`                     ~530
+    model.py:776-778 the DeltaNet gate chain               216
+    moe.py:200,818   the router softmax, the shexp gate     96
+
+### 23.2 Deployed: rotary embedding in one launch, 51.49 -> 49.95 ms
+
+`_apply_rope_dev` was eleven ops -- six slices, a negate, two concats, two
+multiplies and an add -- on tensors of eight tiles or fewer, three dozen times a
+token. It collapses because **rope_dim is 64 and half is 32, which is exactly one
+tile**: the rotation `[-second, first]` is a swap of two whole tiles rather than
+a shuffle inside one, so every output tile is either a fused pair of multiplies
+or a copy.
+
+    out tile 0 = x0 * cos0 - x1 * sin0
+    out tile 1 = x1 * cos1 + x0 * sin1
+    out tile j = x j                       (j >= 2)
+
+Two A/B pairs: **49.61/50.29 ms against 51.38/51.59.** Quality is unchanged and
+slightly ahead -- 140/191 top-1 against 137, NLL 1.216 against 1.218 -- because
+the kernel keeps the pair of products in fp32 registers instead of rounding
+between them. Against float64 it is 1.73e-03 where the ops are 2.08e-03.
+
+INVARIANT 76: a kernel's circular buffers must share the activation's dtype. The
+compute kernel configures its unpacker once, from `cb_a`, so a float32 table read
+through it comes back as garbage -- and only in the tiles that actually use it.
+`rope_kernel_check.py` measured **1.96e+36** in the two rotated tiles and nothing
+wrong in the six passthrough ones, which is the shape of failure that a
+whole-tensor comparison reports as "a bit off". `fused_rope` now refuses a
+mismatched dtype rather than trusting the caller.
