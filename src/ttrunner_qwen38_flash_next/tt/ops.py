@@ -18,6 +18,7 @@ Two ttnn facts shape this file:
 from __future__ import annotations
 
 import struct
+import os
 from pathlib import Path
 
 import torch
@@ -254,6 +255,7 @@ def fused_gated_mean(mix, normed, hc_count: int, hidden_size: int,
 # a pairwise summation and better conditioned than one long serial accumulation.
 # The two differ from each other by 1.73e-02, which is what nearly got this
 # discarded -- divergence from `ttnn.linear` is not error (invariant 57).
+_NO_FUSED_REINJECT = bool(os.environ.get("TT_NO_FUSED_REINJECT"))
 _KSPLIT: dict = {}
 _KS_KDIR = Path(__file__).resolve().parents[3] / "scripts" / "kernels"
 
@@ -455,6 +457,94 @@ def gated_residual_mix(
     return mixed, inject
 
 
+_REINJECT_OUT: dict = {}
+
+
+def _reinject_output(hyper):
+    """The persistent output, one per (device, shape, dtype).
+
+    `generic_op` needs its output pre-allocated and allocating inside a trace
+    capture corrupts the replay, so this is made once and reused by all 96 calls
+    -- safe because each call's result is consumed by the next layer before the
+    one after it runs, and a trace replays in order.
+    """
+    key = (id(hyper.device()), tuple(hyper.shape), str(hyper.dtype))
+    out = _REINJECT_OUT.get(key)
+    if out is None:
+        out = ttnn.from_torch(
+            torch.zeros(*hyper.shape), dtype=hyper.dtype, layout=ttnn.TILE_LAYOUT,
+            device=hyper.device(), mesh_mapper=ttnn.ReplicateTensorToMesh(hyper.device()))
+        _REINJECT_OUT[key] = out
+    return out
+
+
+def _reinject_program(hyper, branch, inject, out, hc_count: int):
+    grid = hyper.device().compute_with_storage_grid_size()
+    cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
+    crs = ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    acc = {}
+    for tag, t in (("h", hyper), ("b", branch), ("i", inject), ("o", out)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"fused reinject: {tag} must be interleaved")
+        acc[tag] = ct
+    tile_bytes = acc["h"][1]
+    if acc["b"][1] != tile_bytes or acc["o"][1] != tile_bytes:
+        raise RuntimeError("fused reinject wants one dtype for hyper, branch and out")
+    if hyper.dtype == ttnn.bfloat16:
+        bf16 = 1
+    elif hyper.dtype == ttnn.float32:
+        bf16 = 0
+    else:
+        raise RuntimeError(f"fused reinject: dtype {hyper.dtype} unsupported")
+
+    hidden = branch.shape[-1]
+    nt_h = hidden // TILE
+    mt = max(branch.shape[-2] // TILE, 1)
+    if hyper.shape[-1] != hc_count * hidden:
+        raise RuntimeError("fused reinject: hyper is not hc_count * hidden wide")
+    total = mt * hc_count * nt_h
+    work = [((total * c) // len(cores), (total * (c + 1)) // len(cores))
+            for c in range(len(cores))]
+
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=2 * tile_bytes, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=i, data_format=hyper.dtype, page_size=tile_bytes)])
+        for i in (0, 1, 2, 4)
+    ] + [
+        ttnn.CBDescriptor(
+            total_size=2 * acc["i"][1], core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=3, data_format=inject.dtype, page_size=acc["i"][1])]),
+    ]
+
+    def kern(name, ct, args, cfg):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, a) for c, a in zip(cores, args)], config=cfg)
+
+    return ttnn.ProgramDescriptor(
+        kernels=[
+            kern("reinject_reader.cpp",
+                 [nt_h, hc_count, mt, tile_bytes, acc["i"][1], bf16]
+                 + acc["h"] + acc["b"] + acc["i"],
+                 [[hyper.buffer_address(), branch.buffer_address(),
+                   inject.buffer_address(), lo, hi] for lo, hi in work],
+                 ttnn.ReaderConfigDescriptor()),
+            kern("reinject_compute.cpp", [], [[hi - lo] for lo, hi in work],
+                 ttnn.ComputeConfigDescriptor()),
+            kern("reinject_writer.cpp", acc["o"],
+                 [[out.buffer_address(), lo, hi] for lo, hi in work],
+                 ttnn.WriterConfigDescriptor()),
+        ],
+        semaphores=[], cbs=cbs)
+
+
 def reinject(hyper: ttnn.Tensor, branch: ttnn.Tensor, inject: ttnn.Tensor, hc_count: int) -> ttnn.Tensor:
     """hyper + (branch outer-product inject), flattened back to hc_count*hidden.
 
@@ -473,6 +563,20 @@ def reinject(hyper: ttnn.Tensor, branch: ttnn.Tensor, inject: ttnn.Tensor, hc_co
     nothing and is fastest. This runs 96 times per token, where it had been 61 %
     of the whole decode step.
     """
+    # Worth ~0.4 ms a token, not the ~1.9 the byte count predicted: three
+    # on/off pairs measured 59.93/58.36/58.74 against 59.80/59.10/59.29. Two of
+    # the three favour the kernel and the mean is 0.39 ms, which is also the
+    # first honest look at this rig's between-run drift -- about 1 ms, so a
+    # single pair cannot resolve anything smaller.
+    if not _NO_FUSED_REINJECT:
+        try:
+            out = _reinject_output(hyper)
+            ttnn.generic_op([hyper, branch, inject, out],
+                            _reinject_program(hyper, branch, inject, out, hc_count))
+            return out
+        except Exception:                                       # noqa: BLE001
+            pass
+
     hidden = branch.shape[-1]
     m = branch.shape[-2]
     prod = ttnn.multiply(inject, branch)                       # [.., hc, M, hidden]
