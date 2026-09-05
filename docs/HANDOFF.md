@@ -4715,3 +4715,43 @@ saving. Any probe that calls a helper which can decline must assert it did not.
 larger than the effect it was deciding. Re-run on `ab_step.py`, four rounds: the
 k-split is **0.57 ms slower** (-0.56, -0.70, -0.56, -0.66). The original call was
 right; it is now right for a reason that can be checked.
+
+### 28.4 Rejected: folding the router score into the SwiGLU kernel
+
+Each expert's slice of the FFN output is scaled by its router score, which costs
+a `[1, 1, k_sel, k_sel*n]` matmul against a constant 0/1 block matrix plus a wide
+multiply -- **12.62 us a call, 0.61 ms a token**, to apply ten numbers.
+
+Folded into `fused_swiglu`, which already reads and writes exactly those tiles,
+it works: the compute kernel takes the score through `mul_tiles_bcast_scalar`,
+which looks only at element (0, 0), so the reader copies two bytes rather than
+spreading the value across a tile. Quality is unchanged (71.7/90.1, NLL 1.225
+against 72.3/90.6, NLL 1.238 -- the NLL is better) and the step is deterministic.
+
+`ab_step.py`: **+0.16 ms**, three of four rounds inside a hundredth of zero. The
+0.61 ms was another isolated measurement that did not transfer, and the change
+adds a second code path to a kernel three call sites depend on. Reverted.
+
+The pattern is now consistent enough to state: **an isolated trace over-prices a
+small op chain by roughly 2-4x**, because thirty copies of one op cannot overlap
+and the model's neighbours can. Use `chain_price.py` to rank candidates, never to
+predict a saving.
+
+### 28.5 What is left, in order
+
+1. **Multicast the activation in `gather_gemv`** -- worth ~1.1 ms. Of the 6.9 MB
+   the gate|up GEMV moves, 2.1 is the activation row read once per core. One core
+   reading it and multicasting would cut that to 160 KB and let the core count
+   rise past where duplication currently caps it. Needs semaphores in the
+   `ProgramDescriptor`, and a deadlock costs a device reset -- which is why it
+   was not attempted at the end of a long session rather than because it is
+   unattractive.
+2. **Store the expert weights transposed** -- `[E, N, K]` instead of `[E, K, N]`
+   makes a column's whole reduction contiguous, one 46 KB read instead of eighty
+   576-byte ones, which is what gate|up's bfloat4 pages are losing to.
+   `matmul_init` already takes a transpose flag, so the kernel side is a line;
+   the layout is a conversion-time change.
+3. **`grouped_rms_norm`** -- 2.83 ms over 100 calls, six launches. Two launches
+   price at ~20 us against 24.6, so about 0.5 ms; the reduce-then-broadcast
+   pattern from 27.9 applies, with `mul_tiles_bcast_scalar` for the per-group
+   scale.
