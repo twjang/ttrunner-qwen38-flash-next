@@ -4814,3 +4814,28 @@ Their optima differ -- 0.3 for gate|up, 0.5 for down -- and the whole spread is
 resolve. Left at 0.5 for both rather than carrying a second per-call constant.
 Column count is flat from 4 to 8 for gate|up and 4 to 6 for down; both call sites
 ask for 4.
+
+### 29.3 Rejected: the gate's slice and silu as one launch
+
+`ew_slice_silu` does both in one right-sized launch -- 7.80 us to 3.51, nearer
+float64 than the pair (2.01e-03 against 2.37e-03), 0.42 ms over 97 calls.
+
+`ab_step.py`: **+0.02 ms**. Four rounds inside a tenth of zero.
+
+Set beside what did pay, this is the shape of the rule:
+
+    delta scalars    8 launches a layer removed   +1.16 ms   (4.0 us each)
+    causal conv     10 launches a layer removed   +1.58      (4.4 us each)
+    qkv heads        9 launches a layer removed   +0.77      (2.4 us each)
+    delta tail       5 launches a layer removed   +0.74      (4.1 us each)
+    slice + silu     1 launch  a call  removed    +0.02      (0.2 us each)
+
+INVARIANT 91: removing **one** launch from a chain is nearly free -- its cost
+overlaps with the neighbours that remain. A chain costs about
+`max(bytes, launches x floor)`, so only a deep cut moves it. Fuse eight ops or do
+not bother; the arithmetic that says "this op is 5 us, 97 calls, therefore
+0.5 ms" is wrong by an order of magnitude at the shallow end.
+
+That also retires the last of handoff 24.2's question: right-sizing small ops was
+not rejected because the kernels were bad, but because one launch at a time is
+not where the time is.
