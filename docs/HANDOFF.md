@@ -5656,3 +5656,36 @@ whole command with it) and `tt-smi -r` between cases.
 INVARIANT 103: `TT_METAL_WATCHER` is not available here. It attaches, then
 throws out of `poll_watcher_data` and aborts the process. Hangs have to be
 bisected, not inspected.
+
+### 42.2 The k-split wired, and the gate
+
+    ab_step.py, three rounds   +0.74, +0.71, +0.41  ->  **+0.58 ms**
+    32.66 -> 32.08 ms a token,  30.6 -> 31.2 tokens a second
+
+    pytest                     235 passed
+    determinism_check.py       0.000e+00 everywhere, every configuration
+    traced_vs_eager.py         MATCH, token for token
+    device_quality.py 192      top-1 72.8 %, top-5 91.1 %, NLL 1.219
+
+Against the range this rig has produced all along -- top-1 71.7-73.3 %, top-5
+88.5-90.6 %, NLL 1.20-1.24 -- top-1 and NLL are inside it and **top-5 is above
+the best previously recorded**, which is the direction a matmul that is 3.3x
+nearer float64 should move it.
+
+Only `[2560, 352]` is wired. Against the model's tuned `decode_matmul_config`
+the rest are a wash or worse (router [2560,512] bf16 14.85 us against 14.11,
+attn out [2560,1312] 17.47 against 14.77); the two that would gain -- qsa
+[2560,512] bf8 and the indexer [2560,128] -- are 0.07 ms together with the fold
+off, which is under this rig's noise.
+
+INVARIANT 104: `pack_tile` into a **Float32** circular buffer hangs the packer
+here. Four cases, one clean run each: float32 partials hang with and without the
+hardware startup redone before the following SFPU window; activation-dtype
+partials run either way. The "SFPU window after a matmul window" theory that
+this was bisected to test was wrong.
+
+INVARIANT 105: the dev harnesses took ttnn's **default** trace region while
+`TTEngine` always passes 128 MB. A change that adds programs to the capture
+overflows that default and **hangs rather than raising** -- which produced a
+wrong verdict on a kernel that was fine. `open_model` now honours
+TTRUNNER_TRACE_BYTES for every harness. Set it before blaming a kernel.
