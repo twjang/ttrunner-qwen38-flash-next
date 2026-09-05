@@ -45,6 +45,15 @@ KV_BLOCK = 32
 # and therefore the width the traced prefill path will capture.
 DELTANET_CHUNK = 128
 
+# The alpha|beta k-split is **off**. Its original measurement was taken while the
+# split was silently computing zeros (see `ops.output_tiles`), so it had never
+# actually been timed. Re-measured once it worked: 59.81/59.05 ms against
+# 59.67/58.92 for `linear_rows` -- no gain either way, and `ssm_alpha` and
+# `ssm_beta` are float32 on purpose ("a wrong expert is not a small
+# perturbation", plan.py) while the split accumulates its partials in the
+# activation's bfloat16. No speed to pay for that, so it stays on the op.
+_NO_AB_KSPLIT = os.environ.get("TT_AB_KSPLIT", "0") != "1"
+
 
 # Largest MoE row-group that still computes a per-token MoE.
 #
@@ -754,7 +763,7 @@ class TTModel:
         ab = self._fused_pair(layer, "ssm_alpha.weight", "ssm_beta.weight")
         # Three output tiles, the narrowest in the model after the fusion above,
         # so the grid affords more reduction groups here than anywhere else.
-        both_ab = ksplit_linear(mixed, ab)
+        both_ab = None if _NO_AB_KSPLIT else ksplit_linear(mixed, ab)
         if both_ab is None:
             both_ab = linear_rows(mixed, ab, compute_kernel_config=HIFI4)
         half = both_ab.shape[-1] // 2

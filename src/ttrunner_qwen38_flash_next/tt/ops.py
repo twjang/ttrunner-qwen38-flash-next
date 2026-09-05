@@ -315,6 +315,25 @@ def _ksplit_build(a, w, out, groups: int, kt: int, nt: int):
         semaphores=[], cbs=cbs)
 
 
+_TILE = 32
+
+
+def output_tiles(width: int) -> int:
+    """Tiles needed to cover `width` columns -- rounded **up**, never floored.
+
+    This existed as `width // 32` inline and cost the model a silent
+    correctness bug: the fused `ssm_alpha|ssm_beta` weight is 24 columns, so the
+    count was zero, `_ksplit_build`'s plan loop produced no work items, and the
+    untouched output buffer came back as zeros through `ttnn.sum`. Every
+    DeltaNet layer then ran with `a = b = 0` -- `beta = sigmoid(0) = 0.5`,
+    constant -- and nothing raised, because the `groups >= 2` guard is computed
+    from `max(nt, 1)` and stayed well above the threshold.
+
+    It is a function so that a test can hold it rather than a source line.
+    """
+    return max(1, (width + _TILE - 1) // _TILE)
+
+
 def ksplit_linear(x, w):
     """`x @ w` with the reduction split across cores, or None if it would not pay.
 
@@ -324,12 +343,8 @@ def ksplit_linear(x, w):
     than falling back itself, so the caller keeps its own kwargs.
     """
     dev = x.device()
-    # Round the output tiles up: an N of 1 -- the shared expert's sigmoid gate,
-    # the narrowest matmul in the model -- floored to zero tiles and produced a
-    # plan with no work items at all, so the split silently declined exactly the
-    # shape it exists for.
     kt = w.shape[-2] // 32
-    nt = max(1, (w.shape[-1] + 31) // 32)
+    nt = output_tiles(w.shape[-1])
     grid = dev.compute_with_storage_grid_size()
     n_cores = grid.x * grid.y
     groups = max(1, min(kt, n_cores // nt))

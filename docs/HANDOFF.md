@@ -3818,3 +3818,78 @@ the model.
 For the 32.6 ms target: ~10 ms of fusion and ~13 ms of matmul efficiency lands at
 about 35. Neither half is speculative -- both have a measured mechanism and a
 worked example -- but neither is one insight either.
+
+## 18. The k-split was returning zeros, and had been since it shipped
+
+`ksplit_linear` computed its output-tile count as `w.shape[-1] // 32`. The fused
+`ssm_alpha|ssm_beta` weight is **24 columns wide**, so that is zero, and
+`_ksplit_build`'s plan --
+
+    for g in range(groups):
+        for n in range(nt):          # nt == 0
+            plan.append(...)
+
+-- produced no work items at all. Every core was padded to the idle entry, the
+`generic_op` ran and wrote nothing, and the untouched zero output buffer went
+through `ttnn.sum` and came back as zeros.
+
+Nothing raised. The guard is `groups = max(1, min(kt, n_cores // max(nt, 1)))`,
+which is 80 here -- comfortably past `groups >= 2` -- so `ksplit_linear` returned
+a tensor rather than None and the caller's `linear_rows` fallback never ran.
+
+So from "perf: apply the k-split to the router and alpha|beta" until this was
+found, **all 36 DeltaNet layers ran with `a = b = 0`**: the decay was
+`a_decay * softplus(dt)`, a constant per head, and `beta` was `sigmoid(0) = 0.5`.
+The gate did not depend on the token.
+
+Repairing it (192 tokens, everything else equal):
+
+    top-1   70.2 % -> 72.3 %       top-5   89.0 % -> 92.1 %
+    NLL     1.223  -> 1.202        median NLL 0.415 -> 0.236
+
+The other two call sites were unaffected -- the router is `[2560, 512]` and the
+fused down|inject is padded to 352, both whole tiles -- which is why only the
+DeltaNet showed it, and it showed as *quality*, which nothing was watching
+per-layer.
+
+INVARIANT 67: a kernel that can be handed an empty work plan must refuse it. The
+guard here tested whether the split was *worth* doing and never whether it would
+*do* anything, and the two are not the same question. `ops.output_tiles` is now a
+function precisely so a test can hold the property instead of a source line
+(`tests/test_ksplit_plan.py`).
+
+INVARIANT 68: a speedup measured on a path that was computing the wrong thing is
+not a speedup. Re-timed once it worked, the alpha|beta split is **59.81/59.05 ms
+against 59.67/58.92** for the `linear_rows` it replaced -- no gain either way --
+and `ssm_alpha`/`ssm_beta` are float32 on purpose while the split accumulates in
+the activation's bfloat16. It is off by default now; `TT_AB_KSPLIT=1` restores it.
+
+### 18.1 Where the linears' 27 ms sits, by shape
+
+`scripts/dev/linear_shape_census.py` records every `(K, N, dtype)` a decode step
+issues and times each once, ranked by `calls x measured`:
+
+| ms/token | calls | us | roofline | eff | shape |
+|---:|---:|---:|---:|---:|---|
+| 2.97 | 48 | 61.93 | 11.88 | 19 % | [2560, 3200] bf4 — MoE gate\|up gather |
+| 1.96 | 48 | 40.79 | 8.97 | 22 % | [2560, 1280] bf8 — shared expert gate\|up |
+| 1.87 | 36 | 51.88 | 32.30 | 62 % | [2560, 4608] bf8 |
+| 1.67 | 48 | 34.80 | 11.22 | 32 % | [1600, 2560] bf8 — MoE down gather |
+| 1.56 | 36 | 43.21 | 10.77 | 25 % | [2560, 1536] bf8 — attn_gate |
+| 1.50 | 97 | 15.46 | 8.97 | 58 % | [320, 10240] bf8 — hc_\*_up |
+| 1.49 | 12 | 124.18 | 43.07 | 35 % | [6144, 2560] bf8 — attn_output |
+| 1.11 | 12 | 92.33 | 86.14 | **93 %** | [2560, 12288] bf8 — attn_q\|gate |
+| 1.06 | 48 | 22.13 | 0.03 | **0.1 %** | [2560, 1] f32 — shared expert gate |
+
+The shape at 93 % is the proof that nothing structural is in the way: a wide
+enough output *does* saturate. The one at 0.1 % is the opposite extreme and was
+the reason the tile-count bug was found at all.
+
+That gate column is worth noting as a **negative** result: routed through the
+k-split -- which the tile-count fix finally lets it reach -- it is worth nothing
+measurable, 59.79 ms against 59.60 over two pairs. One output tile becomes 80
+partials plus a `ttnn.sum`, and the sum is another op at the same 5.8 us floor.
+Below about 20 us a call there is nothing left for a split to win.
+
+The two that matter are the first and second: 4.9 ms between them at ~20 % of
+bandwidth, both of them the MoE's own matmuls, and both fed by a gather.
