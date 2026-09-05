@@ -31,7 +31,7 @@ import ttnn
 
 from ..reference.config import Qwen4ExpConfig
 from ..reference.weights import WeightStore
-from . import linear_attn, moe
+from . import linear_attn, moe, ops
 from .ops import (linear_rows, HIFI4, fast_linear, fused_rope, ksplit_linear,
                   gated_residual_mix, grouped_rms_norm, reinject, rms_norm)
 from .weights import TTWeights
@@ -42,6 +42,12 @@ from .weights import TTWeights
 _MISSING = object()
 
 KV_BLOCK = 32
+
+# The decode conv on [1, B, 1, C] rather than [1, B, C, 1]. Both are the same
+# 144 tiles at batch 1, but the row form is the shape `attn_qkv` already
+# produces, so the permute+transpose either side of the conv -- four wide
+# ops a layer, 144 a token -- simply do not happen.
+_NO_ROW_CONV = bool(os.environ.get("TT_NO_ROW_CONV"))
 
 # Rows in a tile. The rope tables are bound row-expanded to this for the fused
 # kernel; on device it is the same two tiles either way.
@@ -661,14 +667,22 @@ class TTModel:
         mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, spec)
         return ttnn.to_memory_config(t, mem)
 
-    def conv_taps(self, key: tuple, weight: ttnn.Tensor, channels: int, k: int) -> list:
-        """The kernel's `k` per-tap columns, sliced once and reused."""
-        hit = self._conv_taps.get(key)
+    def conv_taps(self, key: tuple, weight: ttnn.Tensor, channels: int, k: int,
+                  rows: bool = False) -> list:
+        """The kernel's `k` per-tap columns, sliced once and reused.
+
+        `rows` gives them as [1, 1, 1, C] instead of [1, 1, C, 1], for the decode
+        conv that keeps its channels on the last axis. The transpose runs once
+        per layer at first use and is then cached like the columns are.
+        """
+        hit = self._conv_taps.get((key, rows))
         if hit is None:
             hit = [
                 ttnn.slice(weight, (0, 0, 0, tap), (1, 1, channels, tap + 1)) for tap in range(k)
             ]
-            self._conv_taps[key] = hit
+            if rows:
+                hit = [ttnn.transpose(t, -2, -1) for t in hit]
+            self._conv_taps[(key, rows)] = hit
         return hit
 
     def _causal_conv_step(
@@ -689,9 +703,15 @@ class TTModel:
         """
         k = self.cfg.conv_kernel
         depth = k - 1
+        # Channels on the last axis ([1, B, 1, C]) or on rows ([1, B, C, 1]).
+        # Both are the same 144 tiles at batch 1 -- a one-row tensor and a
+        # one-column one both pad to a full tile -- but the row form is the shape
+        # the projection already produces, so it needs no permute either side.
+        rows = x_col.shape[-1] != 1
+        shape = (1, batch, 1, channels) if rows else (1, batch, channels, 1)
         if state is None:
             state = [
-                ttnn.zeros((1, batch, channels, 1), dtype=ttnn.bfloat16,
+                ttnn.zeros(shape, dtype=ttnn.bfloat16,
                            layout=ttnn.TILE_LAYOUT, device=self.mesh)
                 for _ in range(depth)
             ]
@@ -702,7 +722,7 @@ class TTModel:
         # diverging from eager at the very first one. `trace_safe_rings` instead
         # keeps the read indices fixed and shifts the contents with device copies,
         # so the graph is the same every step and can be captured.
-        taps = self.conv_taps(("ssm", layer), weight, channels, k)
+        taps = self.conv_taps(("ssm", layer), weight, channels, k, rows)
         if self.trace_safe_rings:
             # Four multiplies and three adds, deliberately, and *not* the
             # obvious "concat the pieces and the taps, one multiply and one
@@ -775,14 +795,21 @@ class TTModel:
                         compute_kernel_config=HIFI4)
 
         # [1,1,B,conv_dim] -> [1,B,conv_dim,1] so each sequence owns a window
-        qkv_col = ttnn.transpose(ttnn.permute(qkv, (0, 2, 1, 3)), -2, -1)
         conv_w = self.w.blk(layer, "ssm_conv1d.weight")
+        if _NO_ROW_CONV:
+            conv_in = ttnn.transpose(ttnn.permute(qkv, (0, 2, 1, 3)), -2, -1)
+        else:
+            # [1,1,B,C] -> [1,B,1,C]. At batch 1 that is the shape it already
+            # has, so `reshape_to` issues nothing at all.
+            conv_in = ops.reshape_to(qkv, (1, batch, 1, self.conv_dim_local))
         conv_out, st.conv = self._causal_conv_step(
-            qkv_col, conv_w, st.conv, self.conv_dim_local, batch, st.conv_step, layer
+            conv_in, conv_w, st.conv, self.conv_dim_local, batch, st.conv_step, layer
         )
         st.conv_step += 1
-        # [1,B,conv_dim,1] -> [1,1,B,conv_dim]
-        qkv = ttnn.permute(ttnn.transpose(conv_out, -2, -1), (0, 2, 1, 3))
+        if _NO_ROW_CONV:
+            qkv = ttnn.permute(ttnn.transpose(conv_out, -2, -1), (0, 2, 1, 3))
+        else:
+            qkv = ops.reshape_to(conv_out, (1, 1, batch, self.conv_dim_local))
 
         kd = self.key_dim_local
         q = self._slice_last(qkv, 0, kd)
@@ -1437,11 +1464,15 @@ class TTModel:
                 # `_causal_conv_step` would make this on its first call, but the
                 # history has to be captured *before* the loop touches it.
                 st.conv = [
-                    ttnn.zeros((1, 1, self.conv_dim_local, 1), dtype=ttnn.bfloat16,
+                    ttnn.zeros((1, 1, 1, self.conv_dim_local) if not _NO_ROW_CONV
+                               else (1, 1, self.conv_dim_local, 1),
+                               dtype=ttnn.bfloat16,
                                layout=ttnn.TILE_LAYOUT, device=self.mesh)
                     for _ in range(depth)
                 ]
             prior = [
+                ops.reshape_to(st.conv[d], (1, 1, 1, self.conv_dim_local))
+                if not _NO_ROW_CONV else
                 ttnn.reshape(ttnn.transpose(st.conv[d], -2, -1),
                              (1, 1, 1, self.conv_dim_local))
                 for d in range(depth - 1, -1, -1)          # oldest first
@@ -1453,9 +1484,13 @@ class TTModel:
         cols = []
         for i in range(k):
             col = ttnn.slice(qkv_col, (0, i, 0, 0), (1, i + 1, self.conv_dim_local, 1))
+            if not _NO_ROW_CONV:
+                col = ttnn.transpose(col, -2, -1)          # [1,1,1,C], the ring's form
             out_i, st.conv = self._causal_conv_step(
                 col, conv_w, st.conv, self.conv_dim_local, 1, st.conv_step, layer
             )
+            if not _NO_ROW_CONV:
+                out_i = ttnn.transpose(out_i, -2, -1)
             st.conv_step += 1
             cols.append(out_i)
         conv_out = cols[0] if k == 1 else ttnn.concat(cols, dim=1)

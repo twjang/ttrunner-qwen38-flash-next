@@ -55,9 +55,16 @@ def measure(off: bool) -> float:
     return best
 
 
+ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+
 print(f"RESULT flipping {MODULE}.{FLAG} (its default is {original})", flush=True)
+# The first capture in a process is reliably the slowest -- caches, first-touch
+# allocation, the program cache filling -- and whichever side runs first wears
+# that cost. One discarded measurement makes the two sides comparable; without
+# it a change was credited or blamed for up to 1.8 ms of warm-up.
+measure(False)
 on, off = [], []
-for i in range(2):
+for i in range(ROUNDS):
     a = measure(False)      # flag False = the feature is ON
     b = measure(True)       # flag True  = the feature is OFF
     on.append(a)

@@ -154,10 +154,14 @@ for key, n in calls.most_common(26):
 print("RESULT the widest calls (65+ tiles), where only fusion helps:", flush=True)
 wide = [((site, key, t), n) for (site, key, t), n in sites.items() if t > 64]
 wide.sort(key=lambda kv: -kv[1] * kv[0][2] ** 0)
-for (site, key, t), n in sorted(wide, key=lambda kv: -kv[1])[:20]:
+for (site, key, t), n in sorted(wide, key=lambda kv: -kv[1])[:200]:
     print(f"RESULT   {site:34s} {key:20s} {t:5d}t {n:4d}x "
           f"{n * 5.33 / 1000:5.2f}ms", flush=True)
 
+import json as _json
+with open("/tmp/site_dump.json", "w") as _f:
+    _json.dump([[site, key, t, n] for (site, key, t), n in sites.items()], _f)
+print("RESULT wrote /tmp/site_dump.json", flush=True)
 print("RESULT ---", flush=True)
 print(f"RESULT {'largest operand, tiles':26s} {'calls':>7s} {'now':>9s} "
       f"{'own cores':>10s} {'saving':>8s}", flush=True)

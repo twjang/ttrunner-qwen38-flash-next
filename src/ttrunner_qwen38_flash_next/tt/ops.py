@@ -109,12 +109,22 @@ def _sharded_rms_norm(x, eps: float):
                                       ttnn.ShardOrientation.ROW_MAJOR)
                 mc = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED,
                                        ttnn.BufferType.L1, spec)
+                # `block_h` is the shard's row-tile count, so it comes from the
+                # *physical* height -- the same number `rows` is built from. Taken
+                # from `x.shape[-2]` it is 1 for any stream whose shard is more
+                # than one tile tall, and every candidate is then rejected.
                 pc = ttnn.LayerNormShardedMultiCoreProgramConfig(
                     compute_with_storage_grid_size=grid, subblock_w=sub,
-                    block_h=max(1, (x.shape[-2] + _TILE - 1) // _TILE),
-                    block_w=bw, inplace=False)
-                xs = ttnn.to_memory_config(x, mc)
-                ttnn.rms_norm(xs, epsilon=eps, program_config=pc, memory_config=mc)
+                    block_h=rows // _TILE, block_w=bw, inplace=False)
+                try:
+                    xs = ttnn.to_memory_config(x, mc)
+                    ttnn.rms_norm(xs, epsilon=eps, program_config=pc,
+                                  memory_config=mc)
+                except Exception:                                   # noqa: BLE001
+                    # Per candidate, not per shape: the op rejects some core
+                    # counts outright, and one rejection used to abandon the
+                    # whole search -- including the counts that do build.
+                    continue
                 plan = (mc, pc)
                 break
             _RMSN_CFG[key] = plan
