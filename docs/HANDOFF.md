@@ -5375,3 +5375,51 @@ What is left, all measured, none over half a millisecond:
     Ring topology                          ~0.2   changes the numerics
 
 Against the ~16.5 ms floor this decomposition allows (32), the model is at **48 %**.
+
+## 38. The transposed expert weights are dead, and the number that kills them
+
+Storing each expert's weights as `[E, N, K]` would make a column's whole
+reduction contiguous -- one 46 KB read instead of eighty 576-byte ones -- and was
+the largest item left, priced at 0.3-0.6 ms. `matmul_init` already takes a
+transpose flag, so the kernel side is a line, and the only question was whether
+the weights could be turned round on device rather than at conversion.
+
+They can. `ttnn.transpose(w, -2, -1)` accepts both block formats. And it is
+useless, because a block format shares one exponent across sixteen values along a
+row, and transposing regroups them:
+
+    gate|up  bfloat4_b   transpose vs torch   **1.750e-01**
+    down     bfloat8_b   transpose vs torch    6.098e-03
+
+Seventeen per cent on the projection that would gain the most. The round trip
+loses exactly the same, so it is re-quantisation and not an addressing bug.
+
+INVARIANT 98: a block float cannot be transposed. The 16-value group that shares
+an exponent runs along one axis, and swapping axes re-quantises -- 1.75e-01 for
+bfloat4. Any layout change to a bfloat4 or bfloat8 tensor has to happen where the
+float32 original still exists, which is conversion time.
+
+The `down` projection's 6e-03 is survivable, but it is the one already reading at
+217 GB/s against gate|up's 170, so it is also the one with least to gain.
+
+### 38.1 What that leaves
+
+Nothing measured above 0.3 ms:
+
+    `normed` not materialised   ~0.24   `fused_gated_mean` would do the norm
+                                        itself; pass 3 would write only `local`
+    Ring topology               ~0.2    not bit-identical (36.1)
+    norm pass 1 into reinject   ~0.05   one launch, and invariant 91 says those
+                                        are free
+
+The session took the step from **47.87 to 34.7 ms**, 20.9 to 28.8 tokens a
+second, over sixteen changes and nine kernels, with 235 tests, determinism
+0.0e+00 and traced == eager holding throughout -- the last of which was not true
+when it started.
+
+Against the ~16.5 ms this decomposition allows, 48 %. Against the 127 tok/s the
+byte roofline suggests, 23 % -- and section 32 is where that number is taken
+apart: it omits 4.4 ms of collectives whose cost does not scale with size and a
+launch floor of ~1.8 ms for the matmuls alone. **Reaching it is a decomposition
+problem, and the three sharding choices that would change it were each re-run at
+the collective's real price this session and each survived.**
