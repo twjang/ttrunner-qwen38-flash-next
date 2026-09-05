@@ -4839,3 +4839,84 @@ not bother; the arithmetic that says "this op is 5 us, 97 calls, therefore
 That also retires the last of handoff 24.2's question: right-sizing small ops was
 not rejected because the kernels were bad, but because one launch at a time is
 not where the time is.
+
+## 30. The second half of the session: 38.3 -> 36.6 ms, and a stale decision worth 1.8
+
+    47.87 -> 36.6 ms a token, median of three; 35.23 ms best
+    20.9  -> 27.3 tokens a second, 28.4 at the best step
+
+    5640 -> 2825 ttnn calls a step;  3.06 -> 2.95 GB moved
+
+Three more changes after section 29:
+
+| | `ab_step.py` |
+|---|---:|
+| hyper-connection norm + partition, 7 launches -> 3 | +0.88 |
+| the k-split turned off | +1.82 |
+| GEMV weight fetch across both NOCs | ~+0.1 |
+
+### 30.1 The k-split had been overtaken and nobody re-measured
+
+`ksplit_linear` splits a narrow matmul's reduction across cores. It won by 2.12x
+when written -- against `ttnn.linear` running its **default** program config.
+`fast_linear` picking `in0_block_w` then took the model's matmuls from 18.30 ms
+to 9.45, and took the k-split's advantage with it.
+
+    router       30.59 us / 1.37e-02      linear_rows 19.50 / 2.79e-03
+    shexp gate   24.00   / 9.12e-04                    9.73 / 9.12e-04
+    down|inject  17.24   / 1.03e-02                   12.21 / 2.74e-03
+
+Slower at every site and four times less accurate at two -- the opposite of both
+claims that put it there. Turning it off is **+1.82 ms**, the second largest
+change of the day, and it is a deletion.
+
+INVARIANT 92: when a change improves the thing an old decision was measured
+against, that decision is now unmeasured. `fast_linear`'s program config
+invalidated the k-split's entire justification and the k-split kept running for
+months. Keep a list of what each rejection was measured *against*, not just what
+it measured.
+
+### 30.2 Why the narrow matmuls are where they are
+
+`decode_matmul_config` already sets `mcast_in0=True`, so the activation is
+broadcast to the grid rather than re-read per core. At `[2560, 352]` the weights
+are 850 KB over eleven output tiles: **eleven cores doing eighty tile-matmuls
+each**, compute-bound on too few cores. That is exactly what the k-split was for,
+and batching its reads (the same barrier-per-tile bug its reduction kernel had)
+brings it to 14.91 us against `linear_rows`' 12.52 -- still losing.
+
+`linear_shape_census.py` now reads **10.42 ms against a 6.11 ms roofline, 59 %**.
+The 2.5 ms of that which sits in narrow-output shapes is not a configuration
+problem; it is M = 1 with a weight that eleven cores have to chew through.
+
+### 30.3 The hyper-connection norm, and what SFPU-bound looks like
+
+The first attempt at fusing it was **slower than the ops** -- 39.3 us against
+26.7 -- and the reason is worth keeping: four cores each reducing a whole 80-tile
+group is 240 SFPU tile operations, and the SFPU does about 130 cycles a tile.
+The group's 640 KB should take ten microseconds and the pass took thirty-one.
+
+Splitting the reduction sixteen ways and folding the partials in a second pass
+made it 21.45. **A reduction over many tiles is SFPU-bound long before it is
+bandwidth-bound**, and the fix is more cores, not fewer barriers.
+
+### 30.4 What is left
+
+    matmuls          10.42 ms   (roofline 6.11)  compute-bound at M=1, config tuned
+    deltanet          8.9       four matmuls, decode_step, four kernels
+    moe               6.0       gather_gemv ~3.2 near its own floor
+    qsa               4.0
+    reinject          2.8
+    shared            1.85
+
+2825 launches against the ~700 a 10 ms step would allow. The remaining items, in
+order:
+
+1. **Multicast in `gather_gemv`** (~1.1 ms). Of the 6.9 MB the gate|up GEMV
+   moves, 2.1 is the activation read once per core -- unlike `ttnn.linear`, this
+   kernel does not multicast. Needs semaphores; `ttnn.SemaphoreDescriptor` and
+   the NOC multicast API are both available.
+2. **Transposed expert weights** (~0.8 ms). Makes a column's reduction
+   contiguous; `matmul_init` already takes a transpose flag.
+3. **`all_reduce`**, 181 calls, ~2 ms. 13.29 us to reduce 22 KB across four
+   devices is latency, not bandwidth, and nothing was tried here this session.
