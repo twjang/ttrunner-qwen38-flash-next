@@ -45,12 +45,24 @@ for name in ORDER:
     STUBS[name]()
 
 from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder
+
+# The capture wedges on ~40% of runs (handoff 44.5), always with the log ending
+# at the same byte, so there is nothing to read. These say which call it stopped
+# in. They are all before the timed section and cost nothing.
+def mark(what):
+    print(f"STAGE {what}", flush=True)
+
 state = m.new_state(batch=1)
+mark("state")
 dec = TracedDecoder(m, state)
+mark("captured")
 dec.reset()
-for _ in range(3):
+mark("reset")
+for i in range(3):
     dec.step([1000])
+    mark(f"warm{i}")
 ttnn.synchronize_device(mesh)
+mark("synced")
 ts = []
 for _ in range(21):
     t0 = time.perf_counter(); dec.step([1000]); ttnn.synchronize_device(mesh)

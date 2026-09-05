@@ -5899,7 +5899,7 @@ projections, the recurrence, the tail, or its 36 all-reduces -- not here.
 INVARIANT 111: this ablation rig resolves ~0.5 ms. A result inside that is not a
 small effect, it is no effect; do not report it as a saving or a regression.
 
-### 44.5 The trace capture wedges on two runs in five
+### 44.5 The traced *replay* wedges on two runs in five (corrected in 45.4)
 
 Independently of any change, `TracedDecoder`'s capture hangs on roughly 40 % of
 runs, always at exactly the same point -- the log stops after
@@ -6010,3 +6010,33 @@ so this is structural. `TT_STRICT_KERNELS` turns a decline into a raise.
 INVARIANT 115: after touching any fused kernel's guard, run once with
 `TT_STRICT_KERNELS=1`. A guard that declines by accident is invisible, costs
 milliseconds, and is indistinguishable from the rig's noise.
+
+### 45.4 The hang is in replay, not capture
+
+44.5 called it a capture hang, on the evidence that every hung log ended at the
+same byte -- right after `Allocating device buffers is unsafe`. That was reading
+the absence of output as a location. Five `STAGE` prints in
+`deltanet_cumulative.py` settle it: a hung run prints
+
+    STAGE state / captured / reset / warm0 / warm1 / warm2 / synced
+
+and then stops. So the capture succeeded, `reset` succeeded, **three traced
+steps succeeded**, the device synchronised -- and it wedges somewhere in the
+next twenty-one replays of a graph that has already run four times.
+
+That is roughly a 2 % chance per replay, and it is the same shape as the
+`_KSG_FOLD` failure this document already records: "the 48-layer step hangs with
+no device program event after the first", fast in isolation and at ninety-six
+reps, cause never found. Whatever that is, it is not confined to the in-kernel
+fold -- this is the plain shipped configuration.
+
+INVARIANT 116: the absence of further output localises nothing. A device harness
+that can hang needs stage markers *before* it needs a theory; two sessions have
+now spent cycles on hypotheses about a capture that was never where it stopped.
+
+Practical consequence for the rigs: a harness's hang probability scales with how
+many replays it does, which is why `ab_step.py` -- four captures and four timed
+runs in one process -- almost never finishes, while a one-capture harness
+finishes three times in five. Prefer one capture per process and retry, and take
+a flag's A/B from repeated single-capture processes rather than from one
+in-process alternation.
