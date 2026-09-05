@@ -6422,29 +6422,32 @@ Each was closed by a measurement that cost well under an hour, and two of them
 would have cost a day of weight re-conversion to find out the hard way. That is
 the shape of the remaining work: **the cheap measurement first, every time.**
 
-### 46.1 The order
+### 46.1 The order, rewritten after 45.14
 
-1. **The replay hang.** ~2 % a replay, so `device_quality.py`'s 192 eager steps
-   are fine but any traced harness with more than a handful of replays is not,
-   and `ab_step.py` -- the one rig without the 0.5 ms drift -- cannot finish at
-   all. It is a 1.7x tax on every measurement in this file and it gates two of
-   the items below. Same signature as `_KSG_FOLD` and as the shared expert's
-   k-split: fine in isolation, fine at ninety-six reps, dead inside the 48-layer
-   traced step, no device program event. `TT_METAL_WATCHER` aborts here
-   (invariant 103), so it can only be bisected, and each cycle is ~25 minutes.
-   Everything else on this list is worth less than making the list measurable.
+The first version of this list put the replay hang at the top, priced as a 1.7x
+tax on every measurement. 45.14 retires that: on healthy cards the plain step
+finishes **8 times out of 8**. Measurement is cheap; it was the cards.
 
-2. **The k-split on the four sites that run.** Isolated, 1.65 ms of the 2.39;
-   in-model, 0.4-0.8 after invariant 89. Already wired behind
-   `TT_KSG_WIDE=router,ab,qkv,indexer`.
+What is left, with what each is actually worth:
 
-3. **The shared expert's k-split**, 0.74 ms isolated, once 1 is understood --
-   its plan is the only one giving a group four grid rows, which is the first
-   thing to vary.
+1. **`TT_GG_COLS=1`**, still unmeasured and the only untried item with a real
+   mechanism. `gather_gemv` passes `cols_per_core=2` and 1 was never swept, only
+   2 against the pre-multicast cap. It halves `n`, so cols = 1 doubles the cores
+   on both wide expert GEMVs -- 50 -> 100 and 44 -> 80 of 110. The MoE is 5.17 ms
+   and these are its two largest kernels.
+2. **The `ksgemv` program-count instability**, as a *correctness* item rather
+   than a performance one. Adding call sites destabilises the traced step in
+   proportion to the programs added (45.14's table) and nobody knows why. It
+   caps how far any future generic_op work can go, and the idle-core defect of
+   45.10 is a real bug sitting inside the same kernel whether or not it is this.
+3. **The fabric all-reduce**, 0.6-1.3 ms and a hard build -- but 45.5 already
+   took the cheap half of the same idea for -0.45 ms with no kernel, so what is
+   left is the 4x gather the composite path pays and nothing else.
+4. **`decode_step` as one kernel**, ~0.45 ms corrected, in the largest component.
 
-4. **`TT_GG_COLS=1`**, unmeasured: `gather_gemv` passes cols_per_core=2 and 1 was
-   never swept, only 2 against the pre-multicast cap. It halves `n`, so cols = 1
-   doubles the cores on both wide expert GEMVs.
+And what is closed, so nobody re-opens it: byte reduction (45.7), the `attn_qkv`
+regroup (45.7), sharding the shared expert (45.7), extending the k-split (45.14),
+merging collectives (the audit's §1), and replicating `hc_down` (the audit).
 
 ### 46.2 What the target needs, honestly
 
