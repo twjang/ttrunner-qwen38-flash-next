@@ -36,28 +36,35 @@ void kernel_main() {
             cb_wait_front(cb_sin, 1);
             // c == 0:  x0 * cos - x1 * sin
             // c == 1:  x1 * cos + x0 * sin
+            //
+            // Three destination registers, not seven. With fp32_dest_acc_en the
+            // register file holds **four** tiles, not eight, and writing past
+            // that is silent: it worked at one and eight sequences and gave
+            // 1.08 relative error at thirty-two, where more tiles are in flight
+            // (`rope_kernel_check.py`, and `batch_equivalence_check.py` went
+            // 32/32 -> 16/32).
+            copy_tile(cb_cos, 0, 2);
             copy_tile(cb_a, 0, c == 0 ? 0 : 1);
             copy_tile(cb_b, 0, c == 0 ? 1 : 0);
-            copy_tile(cb_cos, 0, 2);
-            copy_tile(cb_sin, 0, 3);
             mul_binary_tile_init();
-            mul_binary_tile(0, 2, 4);          // (c==0 ? x0 : x1) * cos
-            mul_binary_tile(1, 3, 5);          // (c==0 ? x1 : x0) * sin
+            mul_binary_tile(0, 2, 0);          // (c==0 ? x0 : x1) * cos
+            copy_tile(cb_sin, 0, 2);
+            mul_binary_tile(1, 2, 1);          // (c==0 ? x1 : x0) * sin
             if (c == 0) {
                 sub_binary_tile_init();
-                sub_binary_tile(4, 5, 6);
+                sub_binary_tile(0, 1, 0);
             } else {
                 add_binary_tile_init();
-                add_binary_tile(4, 5, 6);
+                add_binary_tile(0, 1, 0);
             }
         } else {
-            copy_tile(cb_a, 0, 6);
+            copy_tile(cb_a, 0, 0);
         }
         tile_regs_commit();
 
         tile_regs_wait();
         cb_reserve_back(cb_out, 1);
-        pack_tile(6, cb_out);
+        pack_tile(0, cb_out);
         cb_push_back(cb_out, 1);
         tile_regs_release();
 

@@ -23,6 +23,7 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from _device_model import open_model                                 # noqa: E402
 
 mesh, cfg, m = open_model(max_seq_len=4096)
+from ttrunner_qwen38_flash_next.tt.ops import fast_linear, HIFI4      # noqa: E402
 m.selection_active = False
 
 shapes = Counter()
@@ -79,7 +80,7 @@ for (ash, bsh, adt, bdt), n in shapes.items():
                             layout=ttnn.TILE_LAYOUT, device=mesh, mesh_mapper=rep)
         b = ttnn.from_torch(torch.randn(*bsh) * 0.02, dtype=DT[bdt],
                             layout=ttnn.TILE_LAYOUT, device=mesh, mesh_mapper=rep)
-        us = timed(lambda a=a, b=b: ttnn.linear(a, b))
+        us = timed(lambda a=a, b=b: fast_linear(a, b, compute_kernel_config=HIFI4))
         ttnn.deallocate(a)
         ttnn.deallocate(b)
     except Exception as exc:                                          # noqa: BLE001
@@ -103,6 +104,10 @@ for ms, n, us, roof, ash, bsh, bdt in rows:
           f"[{ash[-2]},{ash[-1]}] x [{bsh[-2]},{bsh[-1]}] {bdt.split('.')[-1]}",
           flush=True)
 print(f"RESULT ---", flush=True)
-print(f"RESULT {total:.2f} ms a token in ttnn.linear", flush=True)
+print(f"RESULT {total:.2f} ms a token in ttnn.linear "
+      f"(through `fast_linear`, i.e. what the model pays)", flush=True)
+roof = sum(r[3] * r[1] for r in rows) / 1000.0
+print(f"RESULT roofline for the same weights: {roof:.2f} ms "
+      f"-> {roof / max(total, 1e-9) * 100:.0f}% of bandwidth", flush=True)
 
 ttnn.close_mesh_device(mesh)

@@ -31,6 +31,9 @@ void kernel_main() {
         cb_wait_front(cb_bcast, 1);
         cb_wait_front(cb_hyper, 1);
 
+        // Three destination registers: with fp32_dest_acc_en the file holds
+        // **four** tiles, not eight, and writing past it fails silently and
+        // only at larger batches (see rope_compute.cpp).
         tile_regs_acquire();
         copy_tile(cb_branch, 0, 0);
         copy_tile(cb_bcast, 0, 1);
@@ -41,15 +44,15 @@ void kernel_main() {
             mul_unary_tile(1, TWO_BITS);
         }
         mul_binary_tile_init();
-        mul_binary_tile(0, 1, 2);
-        copy_tile(cb_hyper, 0, 3);
+        mul_binary_tile(0, 1, 0);
+        copy_tile(cb_hyper, 0, 1);
         add_binary_tile_init();
-        add_binary_tile(2, 3, 4);
+        add_binary_tile(0, 1, 0);
         tile_regs_commit();
 
         tile_regs_wait();
         cb_reserve_back(cb_out, 1);
-        pack_tile(4, cb_out);
+        pack_tile(0, cb_out);
         cb_push_back(cb_out, 1);
         tile_regs_release();
 

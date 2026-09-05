@@ -28,10 +28,13 @@ ROT = cfg.rope_dim
 HD = cfg.head_dim
 print(f"RESULT head_dim {HD}, rope_dim {ROT}, half {ROT // 2}", flush=True)
 
-for heads in (2, 24):
-    x_h = torch.randn(1, 1, heads, HD) * 0.5
-    cos_h = torch.cos(torch.randn(1, 1, 1, ROT))
-    sin_h = torch.sin(torch.randn(1, 1, 1, ROT))
+# Batch matters: the tables are per sequence, so at B > 1 the kernel has to pick
+# the right row-tile of cos for each row-tile of x. Batch 32 is where the
+# equivalence check caught this.
+for batch, heads in ((1, 2), (1, 24), (8, 24), (32, 24), (32, 2)):
+    x_h = torch.randn(1, batch, heads, HD) * 0.5
+    cos_h = torch.cos(torch.randn(1, batch, 1, ROT))
+    sin_h = torch.sin(torch.randn(1, batch, 1, ROT))
 
     x = ttnn.from_torch(x_h, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                         device=mesh, mesh_mapper=rep)
@@ -41,7 +44,7 @@ for heads in (2, 24):
                           device=mesh, mesh_mapper=rep)
 
     def full(t, dtype):
-        return ttnn.from_torch(t.expand(1, 1, 32, ROT).contiguous(), dtype=dtype,
+        return ttnn.from_torch(t.expand(1, batch, 32, ROT).contiguous(), dtype=dtype,
                                layout=ttnn.TILE_LAYOUT, device=mesh, mesh_mapper=rep)
 
     ops._NO_FUSED_ROPE = True
@@ -58,10 +61,10 @@ for heads in (2, 24):
     truth = torch.cat([xr * c64 + rot * s64, x64[..., ROT:]], dim=-1)
     scale = truth.abs().max().item()
 
-    for dt_name, dt in (("float32", ttnn.float32), ("bfloat16", ttnn.bfloat16)):
+    for dt_name, dt in (("bfloat16", ttnn.bfloat16),):
         got_t = ops.fused_rope(x, full(cos_h, dt), full(sin_h, dt), ROT)
         if got_t is None:
-            print(f"RESULT heads {heads:2d} {dt_name}: kernel declined", flush=True)
+            print(f"RESULT B{batch:<3d} heads {heads:2d} {dt_name}: declined", flush=True)
             continue
         ttnn.synchronize_device(mesh)
         got = ttnn.to_torch(got_t, mesh_composer=comp)[:1]
@@ -75,7 +78,7 @@ for heads in (2, 24):
             e = (got[..., sl].to(torch.float64) - truth[..., sl]).abs().max().item() / scale
             if e > max(r_t * 2, 1e-6):
                 bad.append(f"{c}:{e:.1e}")
-        print(f"RESULT heads {heads:2d} {dt_name:8s}: vs ops {d_ops:.2e}; "
+        print(f"RESULT B{batch:<3d} heads {heads:2d} {dt_name:8s}: vs ops {d_ops:.2e}; "
               f"vs float64 kernel {d_t:.2e} ops {r_t:.2e}; bad tiles "
               f"[{', '.join(bad) if bad else 'none'}]", flush=True)
 

@@ -93,7 +93,7 @@ def wrap(mod, name):
             if big <= _hi:
                 per_call[_name] += 1
                 per_call_name[(key, _name)] += 1
-                if _hi <= 16:
+                if True:
                     import traceback as _tb
                     for fr in reversed(_tb.extract_stack()[:-1]):
                         if "/tt/" in fr.filename and "census" not in fr.filename:
@@ -151,10 +151,12 @@ for key, n in calls.most_common(26):
 # ten. `ttnn.multiply` is 5.78 whatever the tensor -- one tile or three hundred
 # and twenty -- so ttnn takes the whole grid regardless, and an op on a handful
 # of tiles pays a full-grid launch for nothing.
-print("RESULT small-call sites (<=16 tiles), by cost if right-sized:", flush=True)
-for (site, key, t), n in sites.most_common(24):
-    print(f"RESULT   {site:34s} {key:20s} {t:4d}t {n:4d}x "
-          f"{n * 3.7 / 1000:5.2f}ms", flush=True)
+print("RESULT the widest calls (65+ tiles), where only fusion helps:", flush=True)
+wide = [((site, key, t), n) for (site, key, t), n in sites.items() if t > 64]
+wide.sort(key=lambda kv: -kv[1] * kv[0][2] ** 0)
+for (site, key, t), n in sorted(wide, key=lambda kv: -kv[1])[:20]:
+    print(f"RESULT   {site:34s} {key:20s} {t:5d}t {n:4d}x "
+          f"{n * 5.33 / 1000:5.2f}ms", flush=True)
 
 print("RESULT ---", flush=True)
 print(f"RESULT {'largest operand, tiles':26s} {'calls':>7s} {'now':>9s} "

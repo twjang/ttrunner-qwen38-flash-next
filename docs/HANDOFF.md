@@ -4196,6 +4196,15 @@ slightly ahead -- 140/191 top-1 against 137, NLL 1.216 against 1.218 -- because
 the kernel keeps the pair of products in fp32 registers instead of rounding
 between them. Against float64 it is 1.73e-03 where the ops are 2.08e-03.
 
+INVARIANT 81: with `fp32_dest_acc_en` the destination register file holds
+**four** tiles, not eight. Writing past it is silent, and silent in the worst
+way: the fused rope used indices up to six, matched the ops exactly at one and
+eight sequences, and gave 1.08 relative error at thirty-two, where enough tiles
+are in flight for the overrun to land on something live.
+`batch_equivalence_check.py` caught it as 32/32 -> 16/32 while `device_quality`
+(which runs at batch 1) said nothing at all. **Every compute kernel here now
+stays within dst 0-3.**
+
 INVARIANT 76: a kernel's circular buffers must share the activation's dtype. The
 compute kernel configures its unpacker once, from `cb_a`, so a float32 table read
 through it comes back as garbage -- and only in the tiles that actually use it.
@@ -4292,3 +4301,77 @@ their caller's line.
 INVARIANT 80: a persistent output buffer keyed by call site is keyed by the
 *wrapper's* line, not the caller's, and that is silent. Any helper that can be
 wrapped needs the caller's identity passed in.
+
+## 25. Batch 1 against the roofline: what is left, and what it would take
+
+The goal is batch-1 throughput at the hardware's limit. The limit is measurable:
+the census says **3.05 GB a device a token** and 388 GB/s is measured, so
+**7.9 ms, 127 tokens a second**. The step is 49.1 ms, or 20.4 tok/s -- sixteen
+per cent of it.
+
+What that 49 ms is made of, from measurements rather than models:
+
+| | ms | how it was measured |
+|---|---:|---|
+| 496 `ttnn.linear` calls | **9.45** | `linear_shape_census.py`, through `fast_linear` |
+| their own roofline | 6.33 | weight bytes at 388 GB/s -- so **67 % of bandwidth** |
+| everything else | ~39.6 | the remainder |
+
+The matmuls are close to done. Before the program config they were 18.30 ms at
+about 30 % of bandwidth; they are now 9.45 at 67 %, and the two widest shapes run
+at 86-93 %. Squeezing the rest would be worth at most 3 ms.
+
+**The other 39.6 ms is op count.** The marginal price of one more op, measured by
+inserting them into the model's own trace (`marginal_op_cost.py`):
+
+    a wide op (320 tiles)        5.33 us   <- and that is 360 GB/s, i.e. bandwidth
+    a small op (1 tile)          3.00 us   <- launch
+    a right-sized 1-core kernel  0.83 us
+
+The step issues about 4600 non-linear ops. At three to five microseconds each
+that is 20-25 ms, and their *bytes* are most of the rest.
+
+Note what the wide figure means: a 320-tile `ttnn.multiply` moves 1.9 MB of
+physical tiles in 5.33 us, which is 360 GB/s -- **near peak**. Those ops are not
+wasting time, they are moving padding. A `[1, 1, 1, 10240]` activation is 320
+tiles of which one row in thirty-two is real, so the wide ops move 32x the data
+they carry, at full speed.
+
+### 25.1 What would actually reach it
+
+For the step to be ~10 ms, the non-linear work has to be ~3 ms. At 4 us an op
+that is **700 ops, against the 4600 the model issues** -- about fifteen a layer
+where it currently spends ninety-six.
+
+That is not a fusion backlog, it is a different implementation: one kernel per
+sub-block (the hyper-connection mix, the DeltaNet step, the MoE tail) rather than
+one per arithmetic step. Each of the six kernels this session added removed four
+to eleven ops and bought one to two milliseconds; there are not thirty more of
+those to find.
+
+The two things that would move it, in order of size:
+
+1. **A packed activation layout.** Everything at M=1 is padded from one row to
+   thirty-two, so every wide op moves 32x its payload -- at full bandwidth, which
+   is why it looks like it is working. Carrying activations as `[1, 1, 32, X/32]`
+   between matmuls would make the wide ops small ops (5.33 -> 3.0 us) and cut
+   their bytes 32-fold. The cost is a reshape either side of every matmul, and
+   `elementwise_shape_cost.py` prices a re-tiling reshape at 4.7-19.8 us, so it
+   only pays where several ops sit between two matmuls. Worth roughly 6 ms if the
+   reshapes can be kept to one per matmul.
+
+2. **Sub-block kernels.** The DeltaNet's own chain is ~7.6 ms of the step after
+   its linears and recurrence are accounted for; the hyper-connection mix is
+   ~11.2 ms across 96 calls. Both are dominated by ops that exist only to move
+   between the ops around them.
+
+### 25.2 What this session did to the batch-1 step
+
+    146.18 -> 49.1 ms a token      (2.98x, 6.8 -> 20.4 tok/s)
+
+and, along the way, three silent correctness bugs -- the wide MoE path wrong at
+M > 1, the k-split returning zeros for a sub-tile output, and idle k-split cores
+racing garbage into tile (0,0), which was the model's entire run-to-run
+nondeterminism. The last one matters most for whoever continues: **the rig is now
+bit-reproducible and batch-exact to 32 slots**, so a change can be decided
+instead of argued about.
