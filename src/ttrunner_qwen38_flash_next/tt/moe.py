@@ -378,6 +378,9 @@ def apply_experts(x, weights, keep, gate_w, up_w, down_w, num_experts: int,
 # intermediate living in circular buffers and never reaching DRAM.
 _KDIR = Path(__file__).resolve().parents[3] / "scripts" / "kernels"
 _SWIGLU_OUT: dict = {}
+_SWIGLU_FELL_BACK = False
+# The shared expert had its own unfused copy of the SwiGLU chain.
+_NO_SHEXP_SWIGLU = bool(os.environ.get("TT_NO_SHEXP_SWIGLU"))
 
 
 def _swiglu_output(src, n_out: int):
@@ -458,7 +461,13 @@ def fused_swiglu(both, n_out: int):
         out = _swiglu_output(both, n_out)
         ttnn.generic_op([both, out], _swiglu_program(both, out))
         return out
-    except Exception:                                               # noqa: BLE001
+    except Exception as exc:                                        # noqa: BLE001
+        global _SWIGLU_FELL_BACK
+        if not _SWIGLU_FELL_BACK:
+            _SWIGLU_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused swiglu unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
         e, m = both.shape[1], both.shape[2]
         gate = ttnn.slice(both, (0, 0, 0, 0), (1, e, m, n_out))
         up = ttnn.slice(both, (0, 0, 0, n_out), (1, e, m, 2 * n_out))
@@ -806,10 +815,16 @@ def shared_expert(
     both = fast_linear(x, fused, compute_kernel_config=HIFI4)
     n = gate_w.shape[-1]
     e, mrows = both.shape[1], both.shape[2]
-    hidden = ttnn.multiply(
-        ttnn.silu(ttnn.slice(both, (0, 0, 0, 0), (1, e, mrows, n))),
-        ttnn.slice(both, (0, 0, 0, n), (1, e, mrows, 2 * n)),
-    )
+    # The same fusion `expert_ffn` has used since stage 3, which this path never
+    # picked up: two slices, a silu and a multiply, 48 times a token, where the
+    # kernel keeps the halves in circular buffers and never writes them out.
+    if _NO_SHEXP_SWIGLU:
+        hidden = ttnn.multiply(
+            ttnn.silu(ttnn.slice(both, (0, 0, 0, 0), (1, e, mrows, n))),
+            ttnn.slice(both, (0, 0, 0, n), (1, e, mrows, 2 * n)),
+        )
+    else:
+        hidden = fused_swiglu(both, n)
     out = fast_linear(hidden, down_w, compute_kernel_config=HIFI4)
     # The sigmoid gate is a single output column, and a single column is one
     # output tile on one core of a hundred and ten: measured 22.13 us a call for
