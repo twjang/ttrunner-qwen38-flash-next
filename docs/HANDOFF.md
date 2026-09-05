@@ -5487,3 +5487,56 @@ the fused rope on and with `TT_NO_FUSED_ROPE=1`, so whatever the buffer
 comparison is showing, it is not reaching the output. It is recorded here because
 `_fill_inputs` mirroring `_input` by hand is exactly the kind of pairing that
 drifts, and the next person to add a bound input should check both.
+
+## 40. The host half, acted on
+
+    47.87 -> 33.3 ms a token, median of three; 32.68 best
+    20.9  -> 30.0 tokens a second, 30.6 at the best step
+
+Section 39 found that a tenth of the step was preparing inputs rather than
+running the model. Acting on the largest part of it:
+
+**The embedding and the PLE's n-gram rows now upload row-major and are tilized by
+a `to_layout` in the graph.** `ttnn.from_torch` with `TILE_LAYOUT` is a fixed
+~146 us against 19 row-major, and the tile layout pads one row to thirty-two, so
+5 KB of embedding was 160 KB to build and to copy.
+
+    _fill_inputs  0.809 -> 0.479 ms
+    ab_step.py, five rounds: **+0.76 ms** (+0.65, +1.01, +0.86, +0.87, +0.76)
+
+The `to_layout` allocates at capture like every other intermediate; the rule that
+a trace forbids allocation applies to `generic_op`'s outputs, which the graph
+does not manage, not to ordinary ops.
+
+Input preparation is now 0.52 ms of host work and about 2.1 ms all told, from
+3.5.
+
+### 40.1 Rejected: merging the copies
+
+The obvious next step is fewer, larger copies -- `rope_cos|rope_sin` into one
+tensor, `embed|ngram` into another, three writes instead of five. The premise was
+that the five copies cost ~1.3 ms of replay delay between them. They do not:
+
+    replay alone            30.908 ms
+    1 copy  + replay        +0.933
+    2 copies + replay       +1.393
+    3 copies + replay       +1.701
+    5 copies + replay       +0.908
+
+Five copies cheaper than three is not a scaling law, it is a bare replay that
+benefits from running back to back and is perturbed by anything at all. The
+"interaction" term computed by subtraction is mostly that artifact.
+
+INVARIANT 100: a cost derived by subtracting two separately-measured pieces from
+a whole is a hypothesis, not a measurement. Vary the thing directly -- one copy,
+two, three -- and if the line is not monotone, the term was never there.
+
+### 40.2 Where the step stands
+
+    matmuls                ~10.4 ms   roofline 6.11; compute-bound at M = 1
+    collectives             ~3.4      fixed cost, 181 calls
+    input preparation       ~2.1      0.52 host + the rest in replay perturbation
+    everything else        ~17.4      2600 launches and the kernels
+
+Eighteen changes, nine kernels. 235 tests, determinism 0.0e+00 and traced ==
+eager throughout. Against the ~16.5 ms this decomposition allows, **50 %**.
