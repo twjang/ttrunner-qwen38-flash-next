@@ -4755,3 +4755,62 @@ predict a saving.
    price at ~20 us against 24.6, so about 0.5 ms; the reduce-then-broadcast
    pattern from 27.9 applies, with `mul_tiles_bcast_scalar` for the per-group
    scale.
+
+## 29. Where this session ended
+
+    47.87 -> 38.3 ms a token, median of three runs; 36.93 ms best
+    20.9  -> 26.1 tokens a second, 27.1 at the best step
+
+Eleven changes landed. Not one of them made an operation faster: every
+millisecond came from issuing fewer launches, or from not moving bytes twice.
+
+| | `ab_step.py` | what it was |
+|---|---:|---|
+| multiply through the expert index | +2.71 | a copy the matmul then re-read |
+| fused causal conv | +1.58 | 11 wide ops a layer |
+| fused DeltaNet decay/beta | +1.16 | 9 one-tile ops a layer |
+| fused q/k/v head split + l2 norms | +0.77 | 10 ops, all identity mappings |
+| fused DeltaNet tail | +0.74 | 6 ops, reshapes only `rms_norm` needed |
+| decode conv on rows | +0.69 | a permute/transpose round trip |
+| shared expert uses `fused_swiglu` | +0.57 | a kernel that already existed |
+| reinject broadcast CB | +0.58 | one page instead of two |
+| `decode_step` op choice | +0.56 | a matmul with K = 1, and a concat |
+| k-split partials on their own cores | +0.38 | a full-grid launch to reduce 110 tiles |
+| GEMV weight fetch across both NOCs | ~+0.1 | one NOC idle |
+
+Held throughout: 235 tests, top-1 71-73 %, top-5 89-91 %, NLL 1.20-1.24,
+determinism 0.0e+00 across every configuration, and the traced decoder emitting
+the same tokens as the eager one -- which it did **not** do at the start of the
+session (27.4).
+
+Six new kernels, all of them nearer float64 than the ops they replaced.
+
+### 29.1 The two rules that decided most of it
+
+INVARIANT 89: an isolated trace over-prices a small op chain by roughly 2-4x,
+because thirty copies of one op cannot overlap and the model's neighbours can.
+`chain_price.py` ranks candidates; it never predicts a saving. Every change here
+was decided on `ab_step.py` in one process, and three were reverted after it
+disagreed with the isolated number.
+
+INVARIANT 90: a guard that returns `None` must say so. Three separate times this
+session a silent decline made a measurement compare a path with itself -- the
+fused conv read +0.12 ms instead of +1.58 because a float32 weight met a
+bfloat16 stream, and a config sweep reported a 5.7x win from timing a helper that
+had declined. Every fused entry point now warns once, with the reason.
+
+### 29.2 The `gather_gemv` reader/writer balance, for whoever tunes it
+
+The split between the two dataflow cores is not symmetric, because the reader
+also carries the activation row. Swept at four columns a core:
+
+    gate|up (KT=80, bfloat4)  0.05: 42.16  0.15: 36.77  0.25: 33.25
+                              0.30: 32.83  0.50: 34.79
+    down    (KT=50, bfloat8)  0.05: 37.40  0.15: 34.15  0.25: 32.22
+                              0.30: 31.38  0.50: 25.59
+
+Their optima differ -- 0.3 for gate|up, 0.5 for down -- and the whole spread is
+2 us on gate|up, which is 0.09 ms a token and below what `ab_step.py` can
+resolve. Left at 0.5 for both rather than carrying a second per-call constant.
+Column count is flat from 4 to 8 for gate|up and 4 to 6 for down; both call sites
+ask for 4.
