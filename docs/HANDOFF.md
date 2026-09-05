@@ -6283,6 +6283,22 @@ reset, and the rate climbs. A clean `tt-smi -r` afterwards -- with every process
 killed first and nothing holding `/dev/tenstorrent/*` -- returned
 "Re-initializing boards after reset" and exit 0.
 
+**And 45.11's diagnosis was wrong.** Those five baseline hangs were not the
+machine. `TT_NO_KSGEMV=1` runs clean at **32.61 ms** on the same cards minutes
+later: the cause was the per-group `CoreRangeSet` from 45.10's fix, which is in
+the default path because `hc_down` uses `ksgemv`. tt-metal allocates circular
+buffers and semaphores **per core range**, so one range a group breaks the
+uniform L1 offsets the head's multicast writes to. Reverted; the plan now
+declines any layout that would leave a core idle, and `hc_down` is back at 32.40.
+
+The bus errors were real and the reset check below is still worth having. They
+were not this. Two invariants stand, one correction rides on top:
+
+INVARIANT 126: when a "degraded machine" and a change you just made are both
+candidates, **turn the change off** before blaming the hardware. One run of
+`TT_NO_KSGEMV=1` settled what a card reset, a health check and a host-load check
+could not.
+
 INVARIANT 124: check the reset's exit status. A harness that pipes `tt-smi -r`
 to /dev/null and carries on cannot tell a recovered card from a wedged one, and
 the failure compounds: every subsequent hang is then partly its own fault.
