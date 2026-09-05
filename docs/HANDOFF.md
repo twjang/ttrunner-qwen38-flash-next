@@ -6217,3 +6217,59 @@ harness on random tensors refuted. It needs no weights, no model and no trace.
 INVARIANT 117: a paired, alternating A/B is the only reading this rig supports.
 Its absolute number drifted 1 ms over one sweep -- more than any change measured
 this session -- so an unpaired before/after is noise with a sign.
+
+## 46. Where this leaves the goal, and the order to work in
+
+The step began this session at 32.08 ms (31.2 tok/s) and the composite
+all-reduce is the only thing that moved it, by -0.45. That is a small number for
+a long session, and the reason is worth stating plainly: **most of the session's
+work went into closing directions rather than opening them**, and three of the
+closed ones were mine.
+
+    retracted  "0.5-0.9 ms of kernel headroom remains"       (44.3, invariant 110)
+    retracted  "the hang is in trace capture"                (45.4, invariant 116)
+    retracted  "the remaining road is byte reduction"        (45.7, invariant 118)
+    dead       the attn_qkv v-head regroup, 0.079 ms         (45.7)
+    dead       sharding the shared expert, +0.24 ms          (45.7)
+
+Each was closed by a measurement that cost well under an hour, and two of them
+would have cost a day of weight re-conversion to find out the hard way. That is
+the shape of the remaining work: **the cheap measurement first, every time.**
+
+### 46.1 The order
+
+1. **The replay hang.** ~2 % a replay, so `device_quality.py`'s 192 eager steps
+   are fine but any traced harness with more than a handful of replays is not,
+   and `ab_step.py` -- the one rig without the 0.5 ms drift -- cannot finish at
+   all. It is a 1.7x tax on every measurement in this file and it gates two of
+   the items below. Same signature as `_KSG_FOLD` and as the shared expert's
+   k-split: fine in isolation, fine at ninety-six reps, dead inside the 48-layer
+   traced step, no device program event. `TT_METAL_WATCHER` aborts here
+   (invariant 103), so it can only be bisected, and each cycle is ~25 minutes.
+   Everything else on this list is worth less than making the list measurable.
+
+2. **The k-split on the four sites that run.** Isolated, 1.65 ms of the 2.39;
+   in-model, 0.4-0.8 after invariant 89. Already wired behind
+   `TT_KSG_WIDE=router,ab,qkv,indexer`.
+
+3. **The shared expert's k-split**, 0.74 ms isolated, once 1 is understood --
+   its plan is the only one giving a group four grid rows, which is the first
+   thing to vary.
+
+4. **`TT_GG_COLS=1`**, unmeasured: `gather_gemv` passes cols_per_core=2 and 1 was
+   never swept, only 2 against the pre-multicast cap. It halves `n`, so cols = 1
+   doubles the cores on both wide expert GEMVs.
+
+### 46.2 What the target needs, honestly
+
+44.1 puts the weight read at 8.2 ms and 45.7 shows that number is a floor rather
+than a lever -- the ops are not bandwidth-bound at M = 1, so cutting bytes does
+not buy time. What is left is per-call cost, at ~200 linear calls a token and
+~30 us each before a k-split.
+
+So the arithmetic for 7.9 ms is: every one of those calls on a k-split (which
+roughly halves it), *and* the collectives near zero, *and* the per-op floor of
+2686 launches, and it still does not obviously close. 12-16 ms (60-80 tok/s) is
+what the identified work supports. **Getting past that needs an idea this file
+does not currently contain**, and saying so is more useful than another estimate
+built by adding up leads.
