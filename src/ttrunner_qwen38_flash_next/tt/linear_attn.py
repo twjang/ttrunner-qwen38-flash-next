@@ -121,11 +121,17 @@ def decode_step(
     # 9.37 for the same numbers as a broadcast multiply, which is what an outer
     # product is. Both round to bfloat16 at the end and agree to 3.9e-03.
     kt = ttnn.transpose(k, -2, -1)
-    update = (ttnn.matmul(kt, delta, compute_kernel_config=HIFI4) if _NO_BCAST_OUTER
-              else ttnn.multiply(kt, delta))
-    # write straight into the state buffer: `copy(add(...), state)` made two full
-    # passes over it (1.23 ms vs 0.75 ms at B=32)
-    ttnn.add(decayed, update, output_tensor=state)
+    # `update` is a full state-sized tensor -- 786 KB at batch 1 -- written once
+    # and read once by the add below, and nothing else ever looks at it. One
+    # kernel writing `state = decayed + kt (x) delta` removes 1.57 MB a layer,
+    # 57 MB a token. No semaphores in it, so it cannot hang the way the k-split's
+    # fold does.
+    if not (not _NO_BCAST_OUTER and ops.fused_outer_add(decayed, kt, delta, state)):
+        update = (ttnn.matmul(kt, delta, compute_kernel_config=HIFI4) if _NO_BCAST_OUTER
+                  else ttnn.multiply(kt, delta))
+        # write straight into the state buffer: `copy(add(...), state)` made two
+        # full passes over it (1.23 ms vs 0.75 ms at B=32)
+        ttnn.add(decayed, update, output_tensor=state)
 
     if fused_out is not None:
         return fused_out

@@ -5711,3 +5711,77 @@ INVARIANT 105: the dev harnesses took ttnn's **default** trace region while
 overflows that default and **hangs rather than raising** -- which produced a
 wrong verdict on a kernel that was fine. `open_model` now honours
 TTRUNNER_TRACE_BYTES for every harness. Set it before blaming a kernel.
+
+## 43. The decomposition, re-measured, and a rule about compute kernels
+
+    baseline                                32.64 ms
+      - moe                    5.17  ->     27.47
+      - shared                 1.66  ->     25.81
+      - grm                    7.08  ->     18.73
+      - deltanet               9.47  ->      9.26
+      - qsa                    3.01  ->      6.25
+      - reinject              -0.24  ->      6.49
+      - ple                    0.38  ->      6.11
+                              -----
+                              26.53  + 6.11 floor = 32.64
+
+Against section 33's decomposition at 35.90 ms every component has shrunk and
+the floor has **grown**, 5.93 -> 6.11. The floor is what the stubs leave behind
+-- 48 un-stubbed all_reduce calls, 48 adds, the 97 stub slices, the embedding --
+so 26.5 ms is what is addressable and **DeltaNet, at 9.47, is the largest piece**.
+
+This measurement looked broken for an hour: its first run hung, and the cause
+was a leftover process from the run before it holding all four cards (invariant
+102 again, third time in one session). Re-run clean, it works.
+
+### 43.1 Two broadcast types in one compute kernel hang
+
+The DeltaNet state update materialises `update = kt (x) delta`, a full
+state-sized tensor -- 786 KB at batch 1 -- that the following add reads once and
+nothing else looks at. Thirty-six layers a token is 57 MB of DRAM whose only job
+is to carry a value between two launches, about 0.15 ms. Exactly what invariant
+101 says is still worth fusing.
+
+`outer_add_{reader,compute,writer}.cpp` does it in one launch and has **no
+semaphores at all**, so it cannot hang the way the k-split's fold does. It hangs
+anyway, and bisecting it produced the rule:
+
+    STAGE 1  column broadcast alone            OK
+    STAGE 4  row broadcast alone               OK
+    STAGE 2  column then row, in one kernel    HUNG
+    STAGE 3  both, plus the SFPU add           HUNG
+
+Each broadcast works; using both in one kernel does not, and giving each window
+its own full `init_bcast` (rather than `..._init_short`) does not help. Every
+working broadcast kernel in this project uses exactly one type: `gnorm1` and
+`group_scale` are SCALAR only, and they mix that with SFPU windows happily.
+
+An outer product needs both axes, so this fusion has no single-broadcast form
+and is off behind `TT_FUSED_OUTER_ADD`. A formulation that hands the kernel one
+operand already expanded to a full tile would need only one broadcast type --
+but expanding it costs an op a layer, which is the saving.
+
+This also retro-explains the k-split's fold (42.1): matmul in one window, SFPU in
+the next, and it hangs while the same kernel with the matmul alone runs. Worth
+testing that framing before anyone spends another cycle on it.
+
+INVARIANT 108: one compute kernel, one broadcast type. Two hang, whatever the
+init.
+
+### 43.2 Four wrong hypotheses, retired by measurement
+
+Every explanation offered for these hangs this session was wrong, and each cost
+a device cycle. Recorded so nobody re-derives them:
+
+| hypothesis | verdict |
+|---|---|
+| an SFPU window after a matmul window hangs | refuted -- but see 43.1 |
+| packing into a Float32 CB hangs | refuted, `f32probe.py` (fp32 in, fp32 out, both acc modes) |
+| a **widening** bf16 -> fp32 pack hangs | refuted, 0.000e+00 both acc modes |
+| a broadcast type switch needs a full init | refuted, STAGE 2 hangs with full inits |
+
+INVARIANT 109: `TT_METAL_WATCHER` aborts here (invariant 103), so a hang can only
+be bisected. Bisect the **kernel**, one construct at a time, against a control
+that is known to run -- not the surrounding code. Four hypotheses about the
+surroundings cost four cycles; one bisection of the kernel itself gave the rule
+in three.

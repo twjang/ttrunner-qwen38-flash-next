@@ -2199,6 +2199,141 @@ def down_inject_weight(down_w, inject_w, hidden_span: int):
         _DOWNINJ[key] = got
     return got
 
+_OUTER_OUT: dict = {}
+_OUTER_FELL_BACK = False
+# Off: the outer product needs a column broadcast and a row broadcast, and a
+# kernel that uses both hangs even with a full `init_bcast` before each --
+# each alone runs (TT_OUTER_STAGE 1 and 4). Set TT_FUSED_OUTER_ADD=1 to try
+# it again if a single-broadcast formulation is found.
+_NO_FUSED_OUTER_ADD = os.environ.get("TT_FUSED_OUTER_ADD", "0") != "1"
+# Bisection handle: 1 stops after the column broadcast, 2 after the row one.
+_OUTER_STAGE = int(os.environ.get("TT_OUTER_STAGE", "3"))
+
+
+def _outer_ones(dev, dtype):
+    """A tile of ones, once per (device, dtype).
+
+    The outer product needs kt broadcast down the columns and delta across the
+    rows, and the FPU does one broadcast at a time, so kt's single column is
+    turned into a full tile against this first.
+    """
+    key = ("ones", id(dev), str(dtype))
+    got = _OUTER_OUT.get(key)
+    if got is None:
+        got = ttnn.from_torch(torch.ones(1, 1, _TILE, _TILE), dtype=dtype,
+                              layout=ttnn.TILE_LAYOUT, device=dev,
+                              mesh_mapper=ttnn.ReplicateTensorToMesh(dev))
+        _OUTER_OUT[key] = got
+    return got
+
+
+def _outer_add_program(decayed, kt, delta, ones, state, dkt, dvt):
+    dev = decayed.device()
+    grid = dev.compute_with_storage_grid_size()
+    acc = {}
+    for tag, t in (("d", decayed), ("k", kt), ("v", delta), ("n", ones), ("s", state)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"fused outer add: {tag} must be interleaved")
+        acc[tag] = ct
+    if acc["k"][1] != acc["n"][1] or acc["k"][1] != acc["v"][1]:
+        raise RuntimeError("fused outer add: kt, delta and the ones tile share a page")
+    if acc["d"][1] != acc["s"][1]:
+        raise RuntimeError("fused outer add: decayed and state share a page")
+
+    total = int(state.shape[0]) * dkt * dvt
+    n = max(1, min(total, grid.x * grid.y))
+    cols = min(n, grid.x)
+    rows = (n + grid.x - 1) // grid.x
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+    cores = [ttnn.CoreCoord(cx, cy) for cy in range(rows) for cx in range(cols)]
+    work = [((total * i) // len(cores), (total * (i + 1)) // len(cores))
+            for i in range(len(cores))]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    small, big = acc["k"][1], acc["d"][1]
+    cbs = [ttnn.CBDescriptor(
+        total_size=sz * pg, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=dt, page_size=pg)])
+        for i, sz, pg, dt in ((0, 2, big, decayed.dtype), (1, 2, small, kt.dtype),
+                              (2, 2, small, delta.dtype), (3, 1, small, ones.dtype),
+                              (4, 2, small, kt.dtype), (5, 2, big, decayed.dtype),
+                              (16, 2, big, state.dtype))]
+
+    r_args = [[decayed.buffer_address(), kt.buffer_address(), delta.buffer_address(),
+               ones.buffer_address(), lo, hi - lo] for lo, hi in work]
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("outer_add_reader.cpp",
+             [big, dkt, dvt] + acc["d"] + acc["k"] + acc["v"] + acc["n"], r_args,
+             ttnn.ReaderConfigDescriptor()),
+        kern("outer_add_compute.cpp", [_OUTER_STAGE], [[hi - lo] for lo, hi in work],
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("outer_add_writer.cpp", [big] + acc["s"],
+             [[state.buffer_address(), lo, hi - lo] for lo, hi in work],
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def fused_outer_add(decayed, kt, delta, state, key=None):
+    """`state = decayed + kt (x) delta` in one launch. True, or False if declined.
+
+    Today `ttnn.multiply(kt, delta)` materialises a full state-sized tensor --
+    786 KB at batch 1 -- that the following `add` reads once and nothing else
+    ever looks at. Thirty-six layers a token is 57 MB of DRAM whose only job is
+    to carry a value between two launches. This is invariant 101's own
+    prescription: fuse to stop moving the same bytes twice.
+
+    No semaphores and no cross-core anything, so unlike the k-split's fold this
+    cannot hang the card.
+    """
+    global _OUTER_FELL_BACK
+    if _NO_FUSED_OUTER_ADD:
+        return False
+    try:
+        why = None
+        ds, ks, vs = list(decayed.shape), list(kt.shape), list(delta.shape)
+        if ds != list(state.shape):
+            why = f"state is {list(state.shape)}, decayed {ds}"
+        elif len(ds) != 4 or ds[1] != 1:
+            why = f"decayed is {ds}; this path is [BH, 1, Dk, Dv]"
+        elif ks[:2] != ds[:2] or ks[2] != ds[2] or ks[3] != 1:
+            why = f"kt is {ks}, expected {ds[:3] + [1]}"
+        elif vs[:2] != ds[:2] or vs[2] != 1 or vs[3] != ds[3]:
+            why = f"delta is {vs}, expected {ds[:2] + [1, ds[3]]}"
+        elif kt.dtype != delta.dtype:
+            why = f"kt is {kt.dtype} and delta {delta.dtype}; one broadcast format"
+        elif ds[2] % _TILE or ds[3] % _TILE:
+            why = f"state is {ds}; Dk and Dv must be whole tiles"
+        if why is not None:
+            if not _OUTER_FELL_BACK:
+                _OUTER_FELL_BACK = True
+                import warnings
+                warnings.warn(f"fused outer add declined, using the ops: {why}",
+                              RuntimeWarning, stacklevel=2)
+            return False
+        dev = decayed.device()
+        ttnn.generic_op(
+            [decayed, kt, delta, _outer_ones(dev, kt.dtype), state],
+            _outer_add_program(decayed, kt, delta, _outer_ones(dev, kt.dtype),
+                               state, ds[2] // _TILE, ds[3] // _TILE))
+        return True
+    except Exception as exc:                                        # noqa: BLE001
+        if not _OUTER_FELL_BACK:
+            _OUTER_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused outer add unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return False
+
+
 def gated_residual_mix(
     hyper: ttnn.Tensor,
     norm_w: ttnn.Tensor,

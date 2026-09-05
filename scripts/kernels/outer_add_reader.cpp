@@ -39,7 +39,7 @@ void kernel_main() {
     const uint32_t d_addr = get_arg_val<uint32_t>(0);
     const uint32_t k_addr = get_arg_val<uint32_t>(1);
     const uint32_t v_addr = get_arg_val<uint32_t>(2);
-    const uint32_t o_addr = get_arg_val<uint32_t>(3);
+    const uint32_t n_addr = get_arg_val<uint32_t>(3);   // the tile of ones
     const uint32_t lo = get_arg_val<uint32_t>(4);
     const uint32_t len = get_arg_val<uint32_t>(5);
 
@@ -49,15 +49,15 @@ void kernel_main() {
     const auto k_acc = TensorAccessor(k_ta, k_addr);
     constexpr auto v_ta = TensorAccessorArgs<k_ta.next_compile_time_args_offset()>();
     const auto v_acc = TensorAccessor(v_ta, v_addr);
-    constexpr auto o_ta = TensorAccessorArgs<v_ta.next_compile_time_args_offset()>();
-    const auto o_acc = TensorAccessor(o_ta, o_addr);
+    constexpr auto n_ta = TensorAccessorArgs<v_ta.next_compile_time_args_offset()>();
+    const auto n_acc = TensorAccessor(n_ta, n_addr);
 
     if (len == 0) {
         return;
     }
     // The ones tile, once, and it stays: every output tile multiplies by it.
     cb_reserve_back(cb_1, 1);
-    noc_async_read_page(0, o_acc, get_write_ptr(cb_1));
+    noc_async_read_page(0, n_acc, get_write_ptr(cb_1));
     noc_async_read_barrier();
     cb_push_back(cb_1, 1);
 
