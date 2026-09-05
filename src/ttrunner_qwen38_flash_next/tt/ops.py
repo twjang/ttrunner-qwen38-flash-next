@@ -35,6 +35,28 @@ HIFI4 = ttnn.WormholeComputeKernelConfig(
 )
 
 
+# `num_links` on the collective, which nothing had ever swept. On a 1x4 mesh the
+# default picks one link; three is measurably better once the tensor is wide, and
+# bit-identical (the reduction order is the same):
+#
+#   [1,1,1,2560]  default 38.88 us   2 links 34.60   **3 links 32.77**   4 links 38.91
+#   [1,1,1,352]   default 12.79      2 links 13.37     3 links 12.87     4 links 12.76
+#
+# Below the grid it is already at its floor -- a 352-wide reduce is 12.8 us of
+# fixed cost for 0.7 KB -- so the extra links only add setup.
+_AR_LINKS = int(os.environ.get("TT_AR_LINKS", "3"))
+_NO_AR_LINKS = bool(os.environ.get("TT_NO_AR_LINKS"))
+_AR_MIN_TILES = 16
+
+
+def all_reduce(t):
+    """`ttnn.all_reduce` over the mesh's one axis, with the link count that wins."""
+    if _NO_AR_LINKS or _tile_count(t) < _AR_MIN_TILES:
+        return ttnn.all_reduce(t, cluster_axis=1, topology=ttnn.Topology.Linear)
+    return ttnn.all_reduce(t, cluster_axis=1, topology=ttnn.Topology.Linear,
+                           num_links=_AR_LINKS)
+
+
 def grouped_rms_norm(
     x: ttnn.Tensor,
     weight: ttnn.Tensor,
@@ -1776,7 +1798,7 @@ def gated_residual_mix(
         part = ksplit_linear(local, fused_w)
         if part is None:
             part = linear_rows(local, fused_w, compute_kernel_config=HIFI4)
-    whole = ttnn.all_reduce(part, cluster_axis=1, topology=ttnn.Topology.Linear)
+    whole = all_reduce(part)
     mix = ttnn.silu(
         whole if inject_w is None
         else ttnn.slice(whole, (0, 0, 0, 0),

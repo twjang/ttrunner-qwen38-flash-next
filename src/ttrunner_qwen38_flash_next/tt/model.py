@@ -412,7 +412,9 @@ class TTModel:
         return ttnn.to_torch(t, mesh_composer=self.compose)[0:1]
 
     def all_reduce(self, t: ttnn.Tensor) -> ttnn.Tensor:
-        return ttnn.all_reduce(t, cluster_axis=1, topology=ttnn.Topology.Linear)
+        # `ops.all_reduce` picks the link count: three beats the default by 6 us
+        # on a 2560-wide reduce and is bit-identical. See the table there.
+        return ops.all_reduce(t)
 
     # -- rope -------------------------------------------------------------
 
