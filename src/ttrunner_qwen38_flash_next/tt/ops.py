@@ -1461,6 +1461,17 @@ def fused_gated_mean(mix, normed, hc_count: int, hidden_size: int,
 # `TT_NO_FUSED_REINJECT=1` turns it off.
 _NO_FUSED_REINJECT = bool(os.environ.get("TT_NO_FUSED_REINJECT"))
 _KSPLIT: dict = {}
+# The k-split is off. It won when `ttnn.linear` ran its default program
+# config; `fast_linear` picking `in0_block_w` took the matmuls from 18.30
+# to 9.45 ms a token and took the k-split's advantage with it. Re-measured
+# at all three sites it is now slower *and* four times less accurate:
+#
+#   router      30.59 us / 1.37e-02   against linear_rows 19.50 / 2.79e-03
+#   shexp gate  24.00 / 9.12e-04                           9.73 / 9.12e-04
+#   down|inject 17.24 / 1.03e-02                          12.21 / 2.74e-03
+#
+# `TT_KSPLIT=1` puts it back.
+_NO_KSPLIT = os.environ.get("TT_KSPLIT", "0") != "1"
 _KS_KDIR = Path(__file__).resolve().parents[3] / "scripts" / "kernels"
 
 
@@ -1647,6 +1658,8 @@ def ksplit_linear(x, w):
     that the split has to buy at least two reduction groups. Returns None rather
     than falling back itself, so the caller keeps its own kwargs.
     """
+    if _NO_KSPLIT:
+        return None
     dev = x.device()
     kt = w.shape[-2] // 32
     nt = output_tiles(w.shape[-1])

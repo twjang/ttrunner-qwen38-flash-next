@@ -24,7 +24,7 @@ from pathlib import Path
 import torch
 import ttnn
 
-from .ops import HIFI4, fast_linear, ksplit_linear
+from .ops import HIFI4, fast_linear, ksplit_linear, output_tiles as ops_output_tiles
 
 TILE = 32
 _MM1D = ttnn._ttnn.operations.matmul.MatmulMultiCoreReuseMultiCast1DProgramConfig
@@ -561,7 +561,13 @@ _GEMV_SPLIT = float(os.environ.get("TT_GEMV_SPLIT", "0.5"))
 def _gather_gemv_program(x, weights, idx, out, k_sel, mode, idx16, cols_per_core):
     dev = weights.device()
     grid = dev.compute_with_storage_grid_size()
-    ke, ne = weights.shape[-2] // TILE, weights.shape[-1] // TILE
+    # `output_tiles`, not `// TILE`: a width of 1 floors to zero tiles, the plan
+    # loop produces no work, and the kernel returns an untouched buffer in the
+    # time of a bare launch -- which is exactly how `ksplit_linear` once
+    # measured a 5.7x win while computing nothing (handoff 28.2).
+    ke, ne = weights.shape[-2] // TILE, ops_output_tiles(weights.shape[-1])
+    if weights.shape[-2] % TILE:
+        raise RuntimeError(f"gather gemv: K {weights.shape[-2]} is not whole tiles")
     tpe = ke * ne
     if mode == 2:
         kt, kt_e, nt_out = ke, 0, k_sel * ne
