@@ -50,6 +50,8 @@ KV_BLOCK = 32
 _NO_ROW_CONV = bool(os.environ.get("TT_NO_ROW_CONV"))
 # The MoE router weight in bfloat16 rather than the float32 it is stored in.
 _NO_BF16_ROUTER = bool(os.environ.get("TT_NO_BF16_ROUTER"))
+# The two wide per-step inputs uploaded row-major and tilized on device.
+_NO_RM_INPUTS = bool(os.environ.get("TT_NO_RM_INPUTS"))
 
 # Rows in a tile. The rope tables are bound row-expanded to this for the fused
 # kernel; on device it is the same two tiles either way.
@@ -1766,7 +1768,11 @@ class TTModel:
         batch = hidden.shape[-2]
         if histories is None:
             histories = state.histories
-        emb = self._input(ngram_name, self.ngram_embed(histories), ttnn.bfloat16)
+        emb = self._input(ngram_name, self.ngram_embed(histories), ttnn.bfloat16,
+                          layout=ttnn.TILE_LAYOUT if _NO_RM_INPUTS
+                          else ttnn.ROW_MAJOR_LAYOUT)
+        if not _NO_RM_INPUTS:
+            emb = ttnn.to_layout(emb, ttnn.TILE_LAYOUT)
 
         key = grouped_rms_norm(
             fast_linear(emb, self.w.blk(layer, "ple_key.weight"), compute_kernel_config=HIFI4),
@@ -1940,7 +1946,16 @@ class TTModel:
         for seq, tok in enumerate(ids):
             state.histories[seq].append(tok)
 
-        emb = self._input("embed", self.embed(ids), ttnn.bfloat16)
+        # Uploaded row-major and tilized here rather than on the host.
+        # `ttnn.from_torch` with TILE_LAYOUT is a fixed ~146 us against 19 for
+        # the same data row-major -- one row pads to thirty-two, so 5 KB of
+        # embedding becomes 160 KB to build and copy. The `to_layout` allocates
+        # at capture like every other intermediate and the replay reuses it.
+        emb = self._input("embed", self.embed(ids), ttnn.bfloat16,
+                          layout=ttnn.TILE_LAYOUT if _NO_RM_INPUTS
+                          else ttnn.ROW_MAJOR_LAYOUT)
+        if not _NO_RM_INPUTS:
+            emb = ttnn.to_layout(emb, ttnn.TILE_LAYOUT)
         hidden = ttnn.repeat(emb, (1, 1, 1, cfg.hc_count))
 
         positions = list(state.positions)

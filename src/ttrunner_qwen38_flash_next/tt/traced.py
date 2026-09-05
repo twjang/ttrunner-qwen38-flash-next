@@ -31,6 +31,7 @@ from __future__ import annotations
 import torch
 import ttnn
 
+from . import model as mm
 from .model import TTModel, TTState
 
 
@@ -213,9 +214,14 @@ class TracedDecoder:
                 ttnn.from_torch(host, dtype=dtype, layout=layout, mesh_mapper=model.replicate), buf
             )
 
-        write("embed", model.embed(tokens), ttnn.bfloat16)
+        # These two must match the layout `TTModel._input` bound them with --
+        # row-major unless `TT_NO_RM_INPUTS` says otherwise. The host-side tilize
+        # is ~127 us of fixed cost a call and the model does it on device now.
+        wide = (ttnn.TILE_LAYOUT if getattr(mm, "_NO_RM_INPUTS", True)
+                else ttnn.ROW_MAJOR_LAYOUT)
+        write("embed", model.embed(tokens), ttnn.bfloat16, wide)
         if "ngram" in bound:
-            write("ngram", model.ngram_embed(state.histories), ttnn.bfloat16)
+            write("ngram", model.ngram_embed(state.histories), ttnn.bfloat16, wide)
         cos, sin = model.rope(list(state.positions))
         write("rope_cos", cos, ttnn.float32)
         write("rope_sin", sin, ttnn.float32)
