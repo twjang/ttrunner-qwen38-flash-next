@@ -5326,3 +5326,52 @@ and is not worth 0.28 ms.
 
 The whole `ew_*` family stays where handoff 24.2 left it: correct, unused, and
 raw material for kernels that own their buffers.
+
+## 37. The cross-core fold, and what the semaphore work unlocked
+
+    47.87 -> 34.7 ms a token, median; 33.58 best      20.9 -> 28.8 tokens a second
+    ab_step's own baseline: 32.28 ms
+
+The multicast (36) was built for one kernel and paid for itself twice: once
+there, and again here, because after it the semaphore handshake was routine
+rather than a research project.
+
+The hyper-connection norm's reduction was two launches -- sixteen cores a group
+computing partials, then four folding them -- because one core over a whole
+80-tile group is 240 SFPU operations and 31 us. The fold is now a **cross-core
+reduction inside the first launch**: the sixteen cores write their partials
+straight into the gatherer's fold buffer (the same circular buffer at the same L1
+offset on every core) and signal; the gatherer waits for the count and finishes
+the scale in a second compute window.
+
+    two passes 12.93 us -> one 9.67       the norm 21.45 -> 17.96
+    the feature on ab_step: +0.88 -> +1.10 ms
+
+Swept again with the fold merged, and the answer has not moved -- 8: 18.01,
+10: 19.08, **16: 17.76**, 20: 18.23, 26: 18.83 -- and every split gives a
+**bit-identical** result, which is worth knowing before anyone tunes it.
+
+The trap, for the next one of these: the core rectangle can hold more cores than
+there are runs, and the gatherer counts `parts - 1` signals. An extra core that
+signalled would break the count and one that was counted but silent would hang
+it. They are given an empty run and the non-gatherer path.
+
+### 37.1 The session
+
+    47.87 -> 34.7 ms          20.9 -> 28.8 tokens a second
+    5640  -> ~2600 launches   3.06 -> 2.82 GB
+
+Sixteen changes, nine new kernels, every one nearer float64 than what it
+replaced. 235 tests, determinism 0.0e+00 throughout, and traced == eager, which
+was **not** true when the session started.
+
+What is left, all measured, none over half a millisecond:
+
+    the expert weights transposed          ~0.8   conversion-time; transposing on
+                                                  device needs 11 GB it has not got
+    the norm's pass 1 folded into reinject ~0.05  a single launch, and invariant 91
+                                                  says those are free
+    `normed` not materialised              ~0.28
+    Ring topology                          ~0.2   changes the numerics
+
+Against the ~16.5 ms floor this decomposition allows (32), the model is at **48 %**.
