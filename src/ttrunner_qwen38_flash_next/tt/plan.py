@@ -68,16 +68,37 @@ PLAN: tuple[TensorPlan, ...] = (
     ),
     # -- MoE experts: the bulk of the weights ---------------------------------
     # gate/up are the least sensitive (Unsloth spends 3.4 bpw here), down gets more.
+    # Sharded on the *intermediate* axis, not the expert axis. The expert axis
+    # was chosen because `sparse_matmul` zero-fills its whole [1, E, M, N] output
+    # (invariant 27/40), and 512 experts a device made that 84 MB a layer against
+    # 21. The wide gather path retired `sparse_matmul` from decode entirely, and
+    # what the expert axis costs there is a fixed `k_sel` of 10: the top-10 lands
+    # unevenly on four devices, the expected count is 2.5, and three quarters of
+    # every gather and both matmuls is padding that carries zero weight.
+    #
+    # Giving every device all 512 experts at a quarter of the intermediate width
+    # removes the worst case instead of paying for it -- same bytes resident,
+    # same arithmetic, and the gathered part is now all useful.
+    # `scripts/stage8_expert_shard_axis.py` measures 20.70 -> 9.88 ms a token
+    # over the gather and both matmuls, 2.10x, at a *global* k_sel of 16 that
+    # `kept_expert_census.py` shows drops nothing (the tie admission keeps at
+    # most 14 experts over 2256 real routing decisions).
+    #
+    # Prefill still routes through `sparse_matmul`, and there the down
+    # projection's output does grow four times; measured in handoff 15.
     TensorPlan(
-        r"^blk\.\d+\.ffn_gate_exps\.weight$", Residency.DEVICE, "bfloat4_b", Shard.EXPERT,
+        r"^blk\.\d+\.ffn_gate_exps\.weight$", Residency.DEVICE, "bfloat4_b",
+        Shard.EXPERT_COLUMN,
         "IQ3_S upstream -- lowest-sensitivity tensor in the model",
     ),
     TensorPlan(
-        r"^blk\.\d+\.ffn_up_exps\.weight$", Residency.DEVICE, "bfloat4_b", Shard.EXPERT,
+        r"^blk\.\d+\.ffn_up_exps\.weight$", Residency.DEVICE, "bfloat4_b",
+        Shard.EXPERT_COLUMN,
         "IQ3_S upstream",
     ),
     TensorPlan(
-        r"^blk\.\d+\.ffn_down_exps\.weight$", Residency.DEVICE, "bfloat8_b", Shard.EXPERT,
+        r"^blk\.\d+\.ffn_down_exps\.weight$", Residency.DEVICE, "bfloat8_b",
+        Shard.EXPERT_ROW,
         "IQ4_NL upstream and Q8_0 for layers 0-4; down_proj carries more error weight",
     ),
     # -- routers stay in f32: a wrong expert is not a small perturbation -------

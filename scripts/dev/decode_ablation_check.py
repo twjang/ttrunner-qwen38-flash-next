@@ -8,6 +8,8 @@ of the traced step. Prefill is dispatch-bound where the traced step is not
 component" is worth knowing on both, and only op counts were known for prefill.
 
     parts: none select moe shared allreduce attn reinject ple
+           g:<piece>  norm down allreduce up mean inject
+           d:<piece>  recur conv l2norm
            w:<piece>[+<piece>...]  topk gather gather1 gather2 linear1
                                    linear2 swiglu scale
            expertffn combine permute routing topk<N>
@@ -267,6 +269,112 @@ elif PART.startswith("r:"):
         return _rm.wide_expert_ffn(x, gate_w, down_w, w_local, _rm.WIDE_EXPERTS, K)
 
     _rm.moe_block = _route
+elif PART.startswith("g:"):
+    # Inside `gated_residual_mix`, piece by piece. It is 11.99 ms of an 82.11 ms
+    # step across 96 calls a token -- 125 us a call on a stream that is
+    # hc_count * hidden = 10240 wide with one real row in a 32-row tile.
+    import ttrunner_qwen38_flash_next.tt.ops as _om
+    _goff = set(PART[2:].split("+"))
+    _gknown = {"norm", "down", "allreduce", "up", "mean", "inject"}
+    _gbad = _goff - _gknown
+    if _gbad:
+        raise SystemExit(f"unknown g: piece(s) {sorted(_gbad)}; known: {sorted(_gknown)}")
+    _gb = {}
+
+    def _gkeep(key, real):
+        if key not in _gb:
+            _gb[key] = real()
+        return _gb[key]
+
+    def _grm(hyper, norm_w, down_w, up_w, inject_w, eps, hc, hidden):
+        rows = hyper.shape[-2]
+        key = (rows, hidden, hc, inject_w is not None)
+        if "norm" in _goff:
+            normed = _gkeep(("n",) + key, lambda: _om.grouped_rms_norm(
+                hyper, norm_w, eps, hidden, hc))
+        else:
+            normed = _om.grouped_rms_norm(hyper, norm_w, eps, hidden, hc)
+
+        span = down_w.shape[-1]
+        local = ttnn.mesh_partition(normed, dim=-1)
+
+        def _mk_part():
+            if inject_w is None:
+                return _om.linear_rows(local, down_w, compute_kernel_config=_om.HIFI4)
+            fused_w = _om.down_inject_weight(down_w, inject_w, span)
+            got = _om.ksplit_linear(local, fused_w)
+            if got is None:
+                got = _om.linear_rows(local, fused_w, compute_kernel_config=_om.HIFI4)
+            return got
+
+        part = _gkeep(("d",) + key, _mk_part) if "down" in _goff else _mk_part()
+
+        if "allreduce" in _goff:
+            whole = part
+        else:
+            whole = ttnn.all_reduce(part, cluster_axis=1, topology=ttnn.Topology.Linear)
+        mix = ttnn.silu(
+            whole if inject_w is None
+            else ttnn.slice(whole, (0, 0, 0, 0),
+                            (whole.shape[0], whole.shape[1], whole.shape[2], span)))
+        if "up" in _goff:
+            mix = _gkeep(("u",) + key, lambda: ttnn.sigmoid(
+                _om.linear_rows(mix, up_w, compute_kernel_config=_om.HIFI4)))
+        else:
+            mix = ttnn.sigmoid(_om.linear_rows(mix, up_w, compute_kernel_config=_om.HIFI4))
+
+        if "mean" in _goff:
+            mixed = _gkeep(("m",) + key,
+                           lambda: _om.fused_gated_mean(mix, normed, hc, hidden))
+        else:
+            mixed = _om.fused_gated_mean(mix, normed, hc, hidden)
+
+        inject = None
+        if inject_w is not None:
+            if "inject" in _goff:
+                inject = _gkeep(("i",) + key, lambda: _om.gated_residual_mix(
+                    hyper, norm_w, down_w, up_w, inject_w, eps, hc, hidden)[1])
+            else:
+                n_inj = inject_w.shape[-1]
+                inj = ttnn.slice(whole, (0, 0, 0, span),
+                                 (whole.shape[0], whole.shape[1], whole.shape[2],
+                                  span + n_inj))
+                inj = ttnn.multiply(ttnn.sigmoid(inj), 2.0)
+                inject = ttnn.permute(inj, (0, 3, 2, 1))
+        return mixed, inject
+
+    _om.gated_residual_mix = _grm
+    model_mod.gated_residual_mix = _grm
+elif PART.startswith("d:"):
+    # Inside the DeltaNet step, for the pieces that patch cleanly at a function
+    # boundary. 16.23 ms over 36 layers is 451 us a layer.
+    import ttrunner_qwen38_flash_next.tt.linear_attn as _la
+    _doff = set(PART[2:].split("+"))
+    _dknown = {"recur", "conv", "l2norm"}
+    _dbad = _doff - _dknown
+    if _dbad:
+        raise SystemExit(f"unknown d: piece(s) {sorted(_dbad)}; known: {sorted(_dknown)}")
+    _db = {}
+
+    def _shape_keep(real):
+        def wrapper(*a, **kw):
+            key = tuple(tuple(t.shape) for t in a if hasattr(t, "shape"))
+            if key not in _db:
+                _db[key] = real(*a, **kw)
+            return _db[key]
+        return wrapper
+
+    if "recur" in _doff:
+        # The recurrence itself. Its state update must still happen or the next
+        # layer reads a stale one -- but this is a stopwatch, not a check.
+        _la.decode_step = _shape_keep(_la.decode_step)
+        if getattr(model_mod, "linear_attn", None) is not None:
+            model_mod.linear_attn.decode_step = _la.decode_step
+    if "conv" in _doff:
+        model_mod.TTModel._causal_conv_step = _shape_keep(
+            model_mod.TTModel._causal_conv_step)
+    if "l2norm" in _doff:
+        model_mod.TTModel._l2norm = _shape_keep(model_mod.TTModel._l2norm)
 elif PART in ("noselect", "select"):
     # A regime, not a component -- and since the decode path now defaults to
     # the shipping regime (selection off, see below), `noselect` is the same

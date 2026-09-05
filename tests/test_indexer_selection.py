@@ -129,19 +129,54 @@ def test_the_engine_says_when_the_selection_cannot_run() -> None:
 
     src = inspect.getsource(TTEngine.__init__)
     assert "not self.model.use_indexer and seq > self.config.indexer_budget" in src
-    assert "attention is" in src and "dense beyond the budget" in src
+    assert "dense beyond the" in src and "not what the model does" in src
 
 
-def test_the_selection_is_off_where_it_cannot_address_the_cache() -> None:
-    """`ttnn.scatter` takes uint16 indices, so 65536 cache positions is the
-    reach; and below the budget dense is exactly right and cheaper."""
+def _gate(max_seq_len: int, budget: int = 2048, ratio: int = 4, topk: int = 512):
+    """`TTModel.__init__`'s two selection gates, evaluated without a device.
+
+    Kept as arithmetic rather than a source-text match so that a change to the
+    rule has to change the *rule*, not a quoted line.
+    """
+    compact_slots = topk + 32
+    compact_len = compact_slots * 32
+    max_blocks = max_seq_len // ratio
+    compact = max_seq_len > compact_len and max_blocks <= (1 << 16)
+    use = budget < max_seq_len and (compact or max_seq_len <= (1 << 16))
+    return use, compact
+
+
+def test_the_selection_is_off_below_the_budget() -> None:
+    """Below the budget every eligible block fits, so dense is exactly right
+    and cheaper -- and the selection must not claim to be doing anything."""
+    for n in (512, 1024, 2048):
+        use, _ = _gate(n)
+        assert not use, f"selection should be off at {n}"
+
+
+def test_the_dense_mask_runs_between_the_budget_and_the_compact_window() -> None:
+    """The dense row is one column per cache position, so it is the smaller of
+    the two only up to `compact_len`. Above that the compact window takes over;
+    below the budget the selection is off entirely."""
+    from ttrunner_qwen38_flash_next.tt.model import TTModel
     import inspect
 
-    from ttrunner_qwen38_flash_next.tt.model import TTModel
+    assert "self.indexer_max_seq = 1 << 16" in inspect.getsource(TTModel.__init__)
+    for n in (4096, 8192, 16384):
+        use, compact = _gate(n)
+        assert use and not compact, f"{n} should use the dense mask"
 
-    src = inspect.getsource(TTModel.__init__)
-    assert "config.indexer_budget < max_seq_len <= self.indexer_max_seq" in src
-    assert "self.indexer_max_seq = 1 << 16" in src
+
+def test_the_compact_window_carries_the_selection_past_uint16() -> None:
+    """The compact page table addresses a few thousand columns however long the
+    context is, which is what lets the selection run to the model's maximum."""
+    for n in (1 << 17, 1 << 18):
+        use, compact = _gate(n)
+        assert use and compact, f"compact selection should be on at {n}"
+    # One block index per `ratio` positions, and those indices are uint16, so
+    # 262144 is the ceiling -- the model's own maximum, not a coincidence.
+    assert _gate(1 << 18)[1]
+    assert not _gate(1 << 19)[1]
 
 
 # --- why the selection can be skipped below the budget ----------------------

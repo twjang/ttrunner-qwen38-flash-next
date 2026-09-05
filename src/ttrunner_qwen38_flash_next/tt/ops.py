@@ -421,11 +421,13 @@ def gated_residual_mix(
                         (whole.shape[0], whole.shape[1], whole.shape[2], span))
     )
     mix = ttnn.sigmoid(linear_rows(mix, up_w, compute_kernel_config=HIFI4))
-    gated = ttnn.multiply(mix, normed)
-
     # Nine ttnn ops -- the multiply, four slices, three adds and the scale --
     # collapse into one kernel pass. See `fused_gated_mean` for why, and for the
     # fallback if `generic_op` is unavailable.
+    #
+    # (A `gated = ttnn.multiply(mix, normed)` used to sit here, left behind when
+    # the fused kernel took over the work: a 10240-wide multiply on a tile padded
+    # from one row to thirty-two, 96 times a token, whose result nothing read.)
     mixed = fused_gated_mean(mix, normed, hc_count, hidden_size)
 
     inject = None

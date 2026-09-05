@@ -3347,3 +3347,404 @@ summation (invariant 57), and is the reason to keep it rather than the time.
 Everything else in the model is either already wide enough that the split
 declines, or has too few calls a token to matter. The narrow-output work is
 finished at this grid size.
+
+## 15. The component breakdown was wrong, and fixing it found the real targets
+
+Every conclusion in sections 5.4, 10.2 and 11 about "where the step goes" rested
+on `decode_ablation_check.py`, and the harness had a defect that made its numbers
+uninterpretable. It is worth stating plainly because two of those sections drew
+firm conclusions from it.
+
+The decode ablations opened the model at `max_seq_len=4096`, above
+`indexer_budget`, so the QSA sparse selection ran -- **except** in the one part
+called `noselect`, which turned it off. `noselect` was then read as the baseline.
+Every other part was therefore measured in a different regime from the thing it
+was compared against, and the table came out like this:
+
+    noselect   82.84 ms   (used as the baseline)
+    moe        84.03      "delta" -1.19
+    deltanet  101.60             -18.76
+    shared    114.57             -31.73
+    allreduce 116.01             -33.17
+    ple       117.85             -35.01
+
+Five components that cost less than nothing. The same shape had already appeared
+once, recorded in 10.2 as a caution about the `wroute` seam (117.98 against a
+91.09 baseline) and never chased. It was the same defect both times.
+
+The fix is one line: pin the regime to the one the engine ships.
+`engine.py` starts with `model.selection_active = False` and only turns the
+selection on past `indexer_budget`, so a decode ablation with the selection on is
+not measuring the step the engine runs. With that pinned, `none` measures 82.35
+-- the shipping number -- and the deltas are these:
+
+| component | ms a token | share |
+|---|---:|---:|
+| `moe_block` | **33.28** | 40 % |
+| DeltaNet, 36 layers | 16.23 | 20 % |
+| `gated_residual_mix`, 96 calls | 11.99 | 15 % |
+| QSA, 12 layers | 7.28 | 9 % |
+| shared expert | 4.62 | 6 % |
+| PLE | 3.21 | 4 % |
+| all-reduce | 2.31 | 3 % |
+| **sum** | **78.92** | **96 %** |
+| *(the selection, as a regime: +35.91)* | | |
+
+**96 % of the step is attributed to components.** So section 11's headline --
+"the unattributed time was never a component" -- was an artifact. There was no
+unattributed 30 ms; there was a broken baseline. Invariant 54's cost model (a
+per-op floor plus linears at 3-4x their byte time) still describes *why* a
+component costs what it does, but the per-op floor lives inside the components
+and the ablations do show it.
+
+INVARIANT 59: an ablation harness must hold every regime fixed except the one
+part it removes. A component that appears to cost less than nothing is not a
+surprising result, it is a broken control -- and the tell is that *several*
+components show it at once.
+
+### 15.1 Inside the MoE, and what a fusion is actually worth
+
+`moe_block` is 40 % of the step against a roofline of 1.33 ms (top-10 experts,
+0.516 GB a device a token, at 388 GB/s), so it runs at about 4 % of bandwidth.
+Splitting it the same way (`decode_ablation_check.py w:<piece>` and `r:<piece>`,
+each piece replaced by a persistent buffer of the shape it returns, so the timed
+region gains no op and no allocation):
+
+| piece | ms a token |
+|---|---:|
+| the two expert gathers | 13.19 |
+| the router chain | 9.35 |
+| down matmul | 5.53 |
+| gate\|up matmul | 3.45 |
+| local `topk` | 2.00 |
+| router scale | 0.37 |
+| fused SwiGLU | ~0 |
+| **sum** | **33.89** (against 33.28 for the block) |
+
+and inside the router chain:
+
+| piece | ms a token |
+|---|---:|
+| `ttnn.topk(probs, k=10)` over 512 | 5.00 |
+| router GEMV \[2560, 512\], k-split | 2.29 |
+| `softmax` | 1.12 |
+| threshold / ge / multiply / sum / divide | 0.93 |
+| `mesh_partition` | 0.73 |
+
+The measurement that decided what to build: **removing four ops from the router
+moved the step 0.24 ms.** `sparsity` (a `max`, a `typecast`, a `to_layout`) and
+the partition of `keep` were computed on every wide-path layer and never read --
+192 ops a token, genuinely discarded -- and deleting them was worth almost
+nothing. So the chain's 9.35 ms is not op count. It is two sorts.
+
+INVARIANT 60: before fusing a chain, ablate its pieces. A chain of a dozen small
+ops can have eleven of them free and one that is the whole cost, and the fusion
+that removes the eleven buys nothing. Op counts price dispatches; ablation prices
+work.
+
+### 15.2 Deployed: the routing tail in one kernel, 82.11 -> 74.94 ms
+
+`scripts/kernels/router_select.cpp` replaces the global `topk`, the
+threshold/mask/normalise, the `mesh_partition` and the local `topk` -- 8.66 ms of
+the step -- with one launch on one core. Nothing in it needs the FPU: after a
+softmax every probability is positive, and positive IEEE floats order exactly as
+their bit patterns do, so the selection is unsigned integer compares. Only the
+normalisation is arithmetic, about a dozen adds and ten divides a row.
+
+`scripts/stage7_router_select.py` measures **151.59 -> 27.18 us, 5.58x**, and
+checks it three ways, because "differs from the ttnn ops" is not "less accurate"
+(invariant 57):
+
+* against float64: kernel 6.914e-04, chain 6.914e-04 -- **identical**, both
+  dominated by the bfloat16 rounding of the weights they emit;
+* against the chain: 3.05e-05 on the weights, but 2 of 10 carrying slots hold a
+  *different index*;
+* against the chain on the **effective per-expert weight vector** -- sum over
+  slots of weight x one-hot expert, which is the only thing the gather and the
+  matmul downstream can see: 3.05e-05.
+
+That third check is the one that matters. The index differences are ties: bf16
+probabilities collide often, and two experts of equal weight in swapped slots
+produce the same weighted sum. Padding slots differ too, and carry weight zero.
+
+Quality, measured with the kernel switched off and on in the same session
+(`TT_NO_FUSED_ROUTER=1`), on 191 tokens: **top-1 72.3 % against 71.2 %, NLL 1.194
+against 1.221**, top-5 equal. The kernel is ahead. On the 47-token sample it read
+0.674 against 0.663, which is why the longer run was done -- a 47-token NLL moves
+by more than this effect.
+
+INVARIANT 61: when a change alters a *selection*, compare the quantity the
+consumer actually reads, not the intermediate. Two selections that disagree slot
+by slot can be the same input to everything downstream, and a slot-by-slot
+comparison will report a difference that does not exist.
+
+### 15.3 The wide MoE path was exact at one row only
+
+Found while wiring the above, and it is a correctness bug rather than a
+performance note. `wide_expert_ffn` gathers **one** set of experts per call, and
+`expert_gather.cpp` reads that selection from the index tile's first face -- row
+0. At M > 1 every row was therefore routed to row 0's experts.
+
+`scripts/dev/moe_rows_check.py` measures it directly: with the wide path on, row
+groups of 8 got **55 of 64 rows wrong, worst row 96.3 %**, where the file's own
+comment (written against the `sparse_matmul` path) records 1, 8, 16 and 32 as
+exact. The check had been recording the regression since the wide path landed.
+
+Decode at batch 1 runs M=1 and is unaffected, which is why nothing else showed
+it. `step_n` -- the speculative verifier, sections 8 and 9 -- runs M = k and was
+silently taking the wide path. **Any speculation result measured after the wide
+path landed was measured on a wrong verifier.**
+
+Now guarded on `x.shape[-2] == 1`; M > 1 takes `sparse_matmul`, which is per-row
+exact. The check is back to its documented shape, with one residual: group sizes
+8/16/32 now show a worst row of 1.961 % rather than 0.000 %, because the
+single-row *reference* is itself built through the wide path while the groups run
+sparse, so what is left is the wide-vs-sparse numerical difference and not a
+row-grouping error.
+
+INVARIANT 62: a kernel that reads its parameters from row 0 of a tensor is a
+kernel that only works at one row. `generic_op` will not tell you; the shapes are
+all valid. Guard it at the call site, in the code, not in a comment.
+
+### 15.4 Rejected: keeping the gathered weights in L1
+
+The gathers cost 13.19 ms to move weights the matmul then reads again -- 73.8 MB
+a layer where 24.6 MB is the requirement. The cheap fix, if it worked, would be
+to land the gather in L1 instead of DRAM and let `ttnn.linear` read it there, no
+new kernel needed.
+
+`scripts/stage6_l1_weights.py` measures it and the answer is no, twice over. The
+gate|up shape is refused outright -- `MatmulMultiCoreProgramConfig: Input B memory
+layout must be INTERLEAVED, got WIDTH_SHARDED`. The down shape is accepted, gives
+a bit-identical answer, and runs at **exactly the same speed**: 128.94 us with
+the weight in DRAM, 129.34 us with it L1-sharded across 80 cores.
+
+INVARIANT 63: at M=1 these matmuls are not limited by where their weight lives.
+`[6400, 2560]` bfloat8_b is 8.19 MB in 129 us -- 63 GB/s, a sixth of bandwidth --
+and removing the DRAM read entirely changes nothing. Moving weights closer is not
+the lever; issuing less work is.
+
+### 15.5 Deployed: the experts shard on the intermediate axis
+
+`WIDE_EXPERTS` was 10 because the top-10 experts land unevenly on four devices
+and **all ten could arrive on one**. The expected count is 2.5, so three quarters
+of both gathers and both matmuls was padding carrying zero weight -- 22.2 ms of
+the 33.3.
+
+Sharding the other way removes the worst case instead of paying for it. Every
+device holds all 512 experts at a quarter of the intermediate width:
+
+    was     gate|up  [128 experts, 2560, 1280]   gather 10 x 2560 x 1280 = 16.4 MB
+    now     gate|up  [512 experts, 2560,  320]   gather 16 x 2560 x  320 =  6.6 MB
+
+Same bytes resident either way, same arithmetic, and no approximation: the down
+projection is already sharded on its contraction dim and the MoE already
+all-reduces, so this only changes what the partial sum is over -- experts
+becoming columns. `Shard.EXPERT_COLUMN` and `Shard.EXPERT_ROW` already existed
+in `plan.py` and already do exactly this.
+
+The global `k_sel` has to cover the tie admission rather than the mean, because
+all four devices now select the same list. `scripts/dev/kept_expert_census.py`
+measures it over 2256 real routing decisions: 10 experts kept 77 % of the time,
+11 18 %, 12 3 %, and a maximum of **14**. Sixteen is above that tail and is also
+the gather kernel's own limit, since the selection is read from one tile face.
+
+`scripts/stage8_expert_shard_axis.py`, at k_sel 10 on the old axis against 16 on
+the new one:
+
+| | gathers | gate\|up matmul | down matmul | total |
+|---|---:|---:|---:|---:|
+| expert axis (was) | 11.22 | 3.30 | 6.19 | 20.70 ms |
+| intermediate axis | 4.68 | 2.63 | 2.57 | **9.88 ms** |
+
+**2.10x, 10.83 ms a token.**
+
+This reverses `scripts/reshard_experts.py`, whose docstring records why the
+expert axis was chosen: `sparse_matmul` zero-fills its whole `[1, E, M, N]`
+output, and 512 experts a device made that 84 MB a layer against 21 (invariant
+27). That reason is now **stale for decode** -- the wide gather path retired
+`sparse_matmul` from decode entirely -- but it still holds for prefill, which
+routes through `apply_experts`. Only the down projection's output grows, and it
+grows four times.
+
+INVARIANT 64: a sharding decision is a decision about *which op reads the
+weight*, so it expires when that op is replaced. The expert axis was right while
+`sparse_matmul` ran the decode MoE and wrong the moment the gather did, and
+nothing in the code would have said so -- the plan entry outlives the reason
+written next to it.
+
+### 15.6 Landed: 82.35 -> 62.40 ms, and what each piece was worth
+
+| | ms a token |
+|---|---:|
+| before this round | 82.35 |
+| `router_select.cpp` (15.2) | **74.94** |
+| dead `sparsity` ops, dead `gated` multiply | 74.70 |
+| experts on the intermediate axis | **62.40** |
+
+The dead-code half of that is worth saying out loud. Two computations were being
+issued on every layer of every token and read by nothing:
+
+* `sparsity` -- a `max`, a `typecast` and a `to_layout`, plus the partition of
+  `keep` -- built for `sparse_matmul`, which the wide path stopped calling. 192
+  ops a token.
+* `gated = ttnn.multiply(mix, normed)` in `gated_residual_mix`, left behind when
+  `fused_gated_mean` took the work over. A 10240-wide multiply on a tile padded
+  from one row to thirty-two, 96 times a token.
+
+An AST scan for assigned-and-never-read locals across the five hot modules found
+no third one, which is the reason to run it rather than to keep looking by eye.
+
+Quality is unchanged where it counts: **top-1 72.3 % and top-5 89.5 % on 191
+tokens, identical before and after the reshard**; NLL moved 1.194 -> 1.211. The
+reshard changes what each device's partial sum is over -- intermediate columns
+rather than experts -- so a 1.4 % NLL move is summation order, not accuracy.
+`moe_rows_check.py` also improved: worst row 1.961 % -> 1.562 %, and 6 of 64 rows
+over 1 % where it had been 22.
+
+### 15.7 Rejected: fusing attn_qkv with attn_gate
+
+They read the same `mixed` and are both column shards, so `_fused_pair`
+concatenates them into one `[2560, 4096]` matmul. Measured with a switch so both
+ran in the same session: **62.40 ms fused, 62.37 ms unfused**, ranges
+overlapping. It also keeps a third copy of both weights resident, ~376 MB a
+device. Reverted.
+
+That is invariant 62 a second time, and the sharper form of it: 2560 and 1536
+output columns already spread over enough of a 110-core grid that widening to
+4096 buys no bandwidth, and the two slices it costs are not free either. The
+rule that *does* predict these is invariant 38 -- widening helps while the grid
+is starved, and these were not.
+
+### 15.8 The routing rule: the reference is exact top-k, and the threshold beats it
+
+`router_select.cpp` can do either rule, and the switch is worth 4 ms:
+
+| | step | top-1 (191) | top-5 | NLL |
+|---|---:|---:|---:|---:|
+| threshold, `k_sel` 16 | 62.40 ms | **72.3 %** | **89.5 %** | **1.211** |
+| exact top-k, `k_sel` 10 | **58.42 ms** | 70.2 % | 89.0 % | 1.223 |
+
+The reference is `torch.topk(probs, num_experts_per_tok)` then normalise
+(`reference/model.py:401`) -- **exact top-k, no tie admission**. So the faster
+rule is also the faithful one, and this project's threshold form is the
+approximation. It nevertheless scores better here, by 4 tokens in 191, which is
+inside one standard deviation (~6.2) and therefore does not settle anything.
+Default stays on the threshold until a larger sample says otherwise;
+`TT_ROUTER_EXACT_TOPK=1` picks the other.
+
+Worth keeping in view: the tie admission is what forces `k_sel` to 16 rather than
+10, and that 1.6x lands on the gather and both matmuls -- the largest single
+item left in the MoE.
+
+### 15.9 The op census, and what the 62 ms is made of
+
+    one step: 5897 ttnn calls, 3.31 GB moved   (was 6426 calls, 4.72 GB)
+
+| op | calls | GB | us/call |
+|---|---:|---:|---:|
+| multiply | 1044 | 0.077 | 0.2 |
+| slice | 828 | 0.005 | 0.0 |
+| reshape | 708 | 0.015 | 0.1 |
+| **linear** | **484** | **2.745** | **14.6** |
+| add | 473 | 0.081 | 0.4 |
+| sigmoid | 326 | 0.004 | 0.0 |
+| permute | 269 | 0.005 | 0.1 |
+| rms_norm | 256 | 0.005 | 0.1 |
+
+The budget closes, and this is the first time it has:
+
+    5897 ops x 5.5 us (invariant 42's floor)          32.4 ms
+    484 linears, 2.745 GB at 25-33 % of bandwidth     ~21 ms
+    everything else's bytes                            ~9 ms
+                                                      -------
+                                                      ~62 ms   against 62.40 measured
+
+So **62 % of the step is six op names that move almost no data**: multiply,
+slice, reshape, add, sigmoid and permute are 3648 calls between them and 0.187
+GB. They are not work; they are the floor, and only fusion removes them.
+
+For the 32.6 ms target that is now a concrete arithmetic: the op count has to
+reach roughly 2700 and the linears have to run at about 60 % of bandwidth
+instead of 30. Each fused kernel so far has removed 300-800 calls, so the first
+half is six or seven more of them.
+
+### 16. The model's full context runs: a compact page table for QSA
+
+At `max_seq_len` 262144 the decode attention was doing two wrong things at once.
+
+`indexer_max_seq` is 65536 because `ttnn.scatter` takes uint16 indices and a
+dense mask row is one column per cache position, so past 64 k tokens
+`use_indexer` turned itself **off** and the twelve QSA layers ran plain causal
+attention -- not the model. And that read the whole cache every layer: 262144
+positions x 2 kv heads x 256 head_dim x 2 bytes x 2 (K and V) is 537 MB a layer,
+**6.4 GB a token**, 16.6 ms at 388 GB/s before a weight is touched.
+
+Both are the same problem, and the paged cache already had the fix in it. The
+selection names `indexer_topk` = 512 blocks of 4 tokens, and those live in at
+most 512 pages of the 32-token paged cache. Hand SDPA a page table listing
+**only those pages** and:
+
+* it reads `compact_slots * 32` = 17408 positions however long the context is;
+* the mask is 17408 wide, which uint16 addresses with room to spare, so the
+  selection runs to the model's maximum.
+
+Two properties had to hold and neither is documented, so
+`scripts/stage9_compact_page_table.py` checks them against a torch reference: a
+page table **shorter than the cache** is accepted with `cur_pos` bounding the
+compact window, and **repeated entries** are allowed -- two selected 4-token
+blocks often share one 32-token page, and each slot then enables only its own
+four columns, so nothing is counted twice and no de-duplication is needed. Both
+hold; the answer matches torch over the selected positions to 2.7e-02 relative,
+which is bfloat16 attention noise.
+
+INVARIANT 65: a paged SDPA page table is a *selection mechanism*, not just an
+address map. Listing a subset of pages, in any order, with repeats, re-addresses
+the read -- which is how a sparse-attention model gets to read sparsely without
+a gather.
+
+### 16.1 It selects exactly what the dense mask does
+
+`scripts/dev/compact_window_equivalence.py` decodes 3000 tokens at
+`max_seq_len` 32768 -- the one regime where both paths can run, above
+`compact_len` and below the uint16 reach -- and asks the same state for both
+masks, since `_indexer_mask` has no side effects:
+
+    compact: 2049 mask columns of 17408 open, 2049 distinct positions
+    dense:   2049 distinct positions of 32768 columns
+    compact-only 0, dense-only 0          -> IDENTICAL selection
+
+2049 open columns mapping to 2049 *distinct* positions is the check that matters:
+it is what proves the repeated pages are not double counting.
+
+The same run prints the cost honestly. At 3000 tokens of context SDPA reads 11.7
+MiB a layer dense and **68.0 MiB compact** -- compact is 5.8x worse, because the
+window is fixed while the dense read grows with the sequence. Break-even is at
+`compact_len` = 17408 tokens, which is exactly where the gate sits. At 262144 it
+is 1024 MiB against 68, and the twelve QSA layers go from ~31.7 ms a token to
+~2.1.
+
+The gate is on `max_seq_len` and not on the current position, because the mask
+width is a captured trace's shape. A session opened at 262144 therefore pays
+~1.7 ms a token while it is short. It cannot do better with the dense mask
+either -- that row is `max_seq_len` wide whatever the position, so at 262144 it
+cannot be scattered at all.
+
+The 8x inside the window is the last slack: a slot is a 32-token page and only 4
+of its rows carry a selected block. Matching `KV_BLOCK` to the compression ratio
+would make the window 2048 wide instead of 17408, and is the obvious next thing
+to try if long-context decode matters more than it does today.
+
+### 16.2 Deployed: the indexer scores all four heads in one matmul
+
+The block scores were four matmuls of `[n_blocks, 128] x [128, 1]`, a relu each
+and three adds -- nineteen ops a layer, and **four reads of the block cache**.
+relu is elementwise and the sum is over heads, so relu-then-sum is the same
+function with the heads on the output axis: one `[n_blocks, 128] x [128, 4]`,
+one relu, and a matmul against a constant `[4, 1]` of ones (rather than
+`ttnn.sum`, whose reduction axis would be 4 wide in a 32-wide tile).
+
+Five ops instead of nineteen, 168 fewer a token, and one read of a cache that is
+16.8 MB a layer at the model's maximum instead of four.
+`scripts/dev/indexer_select_check.py` puts it against the reference mask at
+position 2599: **2048 of 2048 tokens, 100 % overlap, no block missing or extra.**

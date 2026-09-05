@@ -45,7 +45,10 @@
 //   7: PROBS_TILE_BYTES
 //   8: VALS_TILE_BYTES
 //   9: IDX_TILE_BYTES
-//  10..: TensorAccessorArgs for probs, dev_id, vals, idx
+//  10: EXACT_TOPK      (1: emit the TOP_K largest by rank, which is what the
+//                        reference does; 0: threshold at the TOP_K-th value,
+//                        which admits ties and is what the ttnn chain did)
+//  11..: TensorAccessorArgs for probs, dev_id, vals, idx
 //
 // Runtime args: probs_addr, devid_addr, vals_addr, idx_addr
 
@@ -62,6 +65,7 @@ constexpr uint32_t VALS_BF16 = get_compile_time_arg_val(6);
 constexpr uint32_t PROBS_TILE_BYTES = get_compile_time_arg_val(7);
 constexpr uint32_t VALS_TILE_BYTES = get_compile_time_arg_val(8);
 constexpr uint32_t IDX_TILE_BYTES = get_compile_time_arg_val(9);
+constexpr uint32_t EXACT_TOPK = get_compile_time_arg_val(10);
 
 constexpr uint32_t NT_PROBS = E_TOTAL / 32;      // tiles across the probs row
 
@@ -105,7 +109,7 @@ void kernel_main() {
     const uint32_t vals_addr = get_arg_val<uint32_t>(2);
     const uint32_t idx_addr = get_arg_val<uint32_t>(3);
 
-    constexpr auto p_ta = TensorAccessorArgs<10>();
+    constexpr auto p_ta = TensorAccessorArgs<11>();
     const auto p_acc = TensorAccessor(p_ta, probs_addr);
     constexpr auto d_ta = TensorAccessorArgs<p_ta.next_compile_time_args_offset()>();
     const auto d_acc = TensorAccessor(d_ta, devid_addr);
@@ -153,12 +157,16 @@ void kernel_main() {
     }
 
     for (uint32_t row = 0; row < M_ROWS; ++row) {
-        // -- pass 1: the TOP_K-th largest probability, as a bit pattern -------
+        // -- pass 1: the TOP_K largest probabilities, with their expert ids ----
         // Insertion into a tiny sorted buffer, guarded by a compare against its
         // current tail, so the common case is one unsigned compare per expert.
+        // Ties keep the lower expert id, because a strict `<` never displaces an
+        // equal value -- deterministic, and the same rule on every device.
         uint32_t best[TOP_K];
+        uint16_t best_id[TOP_K];
         for (uint32_t i = 0; i < TOP_K; ++i) {
             best[i] = 0;
+            best_id[i] = 0;
         }
         for (uint32_t e = 0; e < E_TOTAL; ++e) {
             const uint32_t t = e >> 5, c = e & 31u;
@@ -171,51 +179,81 @@ void kernel_main() {
             uint32_t j = TOP_K - 1;
             while (j > 0 && best[j - 1] < bits) {
                 best[j] = best[j - 1];
+                best_id[j] = best_id[j - 1];
                 --j;
             }
             best[j] = bits;
+            best_id[j] = (uint16_t)e;
         }
         const uint32_t threshold = best[TOP_K - 1];
 
-        // -- pass 2: the normalising sum over everything at or above it -------
-        // `>=` and not `>`: the chain this replaces thresholds inclusively and
-        // therefore admits ties, and the model's output depends on that.
-        float total = 0.0f;
-        for (uint32_t e = 0; e < E_TOTAL; ++e) {
-            const uint32_t t = e >> 5, c = e & 31u;
-            const uint32_t off = t * (PROBS_TILE_BYTES / (PROBS_BF16 ? 2 : 4))
-                                 + tile_off(row, c);
-            const uint32_t bits = PROBS_BF16 ? bf16_to_f32_bits(p16[off]) : p32[off];
-            if (bits >= threshold) {
-                total += bits_to_f32(bits);
-            }
-        }
-        const float inv = total > 0.0f ? 1.0f / total : 0.0f;
-
-        // -- pass 3: this device's K_SEL largest kept experts ------------------
         uint32_t sel_bits[K_SEL];
         uint16_t sel_id[K_SEL];
         for (uint32_t i = 0; i < K_SEL; ++i) {
             sel_bits[i] = 0;
             sel_id[i] = 0;
         }
-        for (uint32_t e = e_lo; e < e_hi; ++e) {
-            const uint32_t t = e >> 5, c = e & 31u;
-            const uint32_t off = t * (PROBS_TILE_BYTES / (PROBS_BF16 ? 2 : 4))
-                                 + tile_off(row, c);
-            const uint32_t bits = PROBS_BF16 ? bf16_to_f32_bits(p16[off]) : p32[off];
-            if (bits < threshold || bits <= sel_bits[K_SEL - 1]) {
-                continue;
+        float total = 0.0f;
+
+        if (EXACT_TOPK) {
+            // Pass 1 already *is* the answer: the reference takes the TOP_K
+            // largest, so there is nothing to threshold. K_SEL can then be TOP_K
+            // exactly, because there is no tie tail to leave room for.
+            //
+            // The window filter still has to run. Where the experts are sharded
+            // on the expert axis a device holds only [e_lo, e_hi) of them and
+            // most of the global top-K is somebody else's; where they are
+            // sharded on the intermediate axis the window is all of them and
+            // every entry passes. Dropping the filter would emit ids past the
+            // end of this device's stack, which the gather clamps to expert 0 --
+            // wrong, and silently so.
+            for (uint32_t i = 0; i < TOP_K; ++i) {
+                total += bits_to_f32(best[i]);
             }
-            uint32_t j = K_SEL - 1;
-            while (j > 0 && sel_bits[j - 1] < bits) {
-                sel_bits[j] = sel_bits[j - 1];
-                sel_id[j] = sel_id[j - 1];
-                --j;
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < TOP_K && n < K_SEL; ++i) {
+                const uint32_t id = (uint32_t)best_id[i];
+                if (id < e_lo || id >= e_hi) {
+                    continue;
+                }
+                sel_bits[n] = best[i];
+                sel_id[n] = (uint16_t)(id - e_lo);
+                ++n;
             }
-            sel_bits[j] = bits;
-            sel_id[j] = (uint16_t)(e - e_lo);
+        } else {
+            // -- pass 2: the normalising sum over everything at or above the
+            // threshold. `>=` and not `>`, so ties are admitted: that is what
+            // the ttnn chain did, and the model's output depends on it.
+            for (uint32_t e = 0; e < E_TOTAL; ++e) {
+                const uint32_t t = e >> 5, c = e & 31u;
+                const uint32_t off = t * (PROBS_TILE_BYTES / (PROBS_BF16 ? 2 : 4))
+                                     + tile_off(row, c);
+                const uint32_t bits = PROBS_BF16 ? bf16_to_f32_bits(p16[off]) : p32[off];
+                if (bits >= threshold) {
+                    total += bits_to_f32(bits);
+                }
+            }
+
+            // -- pass 3: this device's K_SEL largest kept experts --------------
+            for (uint32_t e = e_lo; e < e_hi; ++e) {
+                const uint32_t t = e >> 5, c = e & 31u;
+                const uint32_t off = t * (PROBS_TILE_BYTES / (PROBS_BF16 ? 2 : 4))
+                                     + tile_off(row, c);
+                const uint32_t bits = PROBS_BF16 ? bf16_to_f32_bits(p16[off]) : p32[off];
+                if (bits < threshold || bits <= sel_bits[K_SEL - 1]) {
+                    continue;
+                }
+                uint32_t j = K_SEL - 1;
+                while (j > 0 && sel_bits[j - 1] < bits) {
+                    sel_bits[j] = sel_bits[j - 1];
+                    sel_id[j] = sel_id[j - 1];
+                    --j;
+                }
+                sel_bits[j] = bits;
+                sel_id[j] = (uint16_t)(e - e_lo);
+            }
         }
+        const float inv = total > 0.0f ? 1.0f / total : 0.0f;
 
         for (uint32_t i = 0; i < K_SEL; ++i) {
             const float w = sel_bits[i] == 0 ? 0.0f : bits_to_f32(sel_bits[i]) * inv;

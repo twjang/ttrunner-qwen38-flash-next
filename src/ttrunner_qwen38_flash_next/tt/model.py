@@ -199,17 +199,50 @@ class TTModel:
         self.sdpa_k_chunk = sdpa_k_chunk
         self.indexer_window = config.indexer_budget + sdpa_k_chunk
         # `ttnn.scatter` takes uint16 indices -- int32 and uint32 both assert --
-        # so the selection can only address 65536 cache positions. Past that the
-        # path falls back to dense attention, which is *not* the model beyond the
-        # budget; TTEngine says so at construction.
+        # so a *dense* mask row can only address 65536 cache positions.
         self.indexer_max_seq = 1 << 16
+
+        # -- the compact attention window ------------------------------------
+        #
+        # The dense mask is one column per cache position, so at the model's
+        # 262144 it is both unaddressable by uint16 and beside the point: SDPA
+        # reads every one of those positions, 537 MB a layer and 6.4 GB a token
+        # over twelve QSA layers, to attend to 2048 of them.
+        #
+        # The selection already names `indexer_topk` blocks of `ratio` tokens,
+        # and those live in at most that many pages of the 32-token paged cache.
+        # Handing SDPA a page table listing only *those* pages makes the window
+        # a constant `compact_len` however long the context is -- and small
+        # enough that uint16 addresses it, which is what lets the selection run
+        # past 65536 at all.
+        #
+        # A page may appear twice (two selected blocks can share one 32-token
+        # page); each slot then enables only its own block's tokens, so nothing
+        # is counted twice. The extra 32 slots are the trailing partial block
+        # plus padding, kept a whole tile wide so the concat and the mask stay
+        # tile-aligned and the width stays a multiple of `sdpa_k_chunk`.
+        self.compact_slots = self.indexer_topk + 32
+        self.compact_len = self.compact_slots * KV_BLOCK
         self._mask_base = None
         # What each bound input's contents were last derived from; see `_input`.
+        #
+        # Compact mode is worth it only where the dense row is the larger of the
+        # two, which is every context past `compact_len` and no shorter one.
+        # `topk` returns uint16 block ids, so the block count itself caps the
+        # model at ratio << 16 = 262144 positions -- exactly the model's maximum.
+        self.compact_attention = (
+            traceable_kv
+            and max_seq_len > self.compact_len
+            and self.max_blocks <= (1 << 16)
+        )
         self.use_indexer = (
             traceable_kv
-            and config.indexer_budget < max_seq_len <= self.indexer_max_seq
+            and config.indexer_budget < max_seq_len
+            and (self.compact_attention or max_seq_len <= self.indexer_max_seq)
         )
         self._block_offsets = None
+        self._compact_slot_base = None
+        self._head_sum = None
 
         # **No program config for the decode attention, deliberately.**
         #
@@ -674,8 +707,18 @@ class TTModel:
         # `mixed` is [1, 1, B, hidden]; B sequences decode together.
         batch = mixed.shape[-2]
 
-        qkv = linear_rows(mixed, self.w.blk(layer, "attn_qkv.weight"), compute_kernel_config=HIFI4)
-        z = linear_rows(mixed, self.w.blk(layer, "attn_gate.weight"), compute_kernel_config=HIFI4)
+        # Two matmuls, not one. attn_qkv and attn_gate read the same `mixed` and
+        # are both column shards, so `_fused_pair` concatenates them into a
+        # [2560, 4096] and one call -- and it is worth **nothing**: 62.40 ms a
+        # token fused against 62.37 unfused, with the ranges overlapping. It
+        # also keeps a third copy of both weights resident, ~376 MB a device.
+        # Invariant 62 again: fewer calls is not automatically less work, and
+        # 2560 or 1536 output columns already spread over enough of the grid
+        # that widening to 4096 buys no bandwidth.
+        qkv = linear_rows(mixed, self.w.blk(layer, "attn_qkv.weight"),
+                          compute_kernel_config=HIFI4)
+        z = linear_rows(mixed, self.w.blk(layer, "attn_gate.weight"),
+                        compute_kernel_config=HIFI4)
 
         # [1,1,B,conv_dim] -> [1,B,conv_dim,1] so each sequence owns a window
         qkv_col = ttnn.transpose(ttnn.permute(qkv, (0, 2, 1, 3)), -2, -1)
@@ -757,8 +800,14 @@ class TTModel:
     def _indexer_select(
         self, mixed: ttnn.Tensor, layer: int, st: LayerState, positions: list[int],
         q_cos: ttnn.Tensor, q_sin: ttnn.Tensor,
-    ) -> ttnn.Tensor:
-        """Maintain the block cache, then select from it. See the two halves."""
+    ) -> tuple:
+        """Maintain the block cache, then select from it. See the two halves.
+
+        Returns `(mask, page_table, cur_pos)`. The last two are None unless
+        `compact_attention` is on, in which case they replace the identity page
+        table and the real position for the SDPA call -- the selection is then
+        addressed against a `compact_len` window rather than the whole cache.
+        """
         self._indexer_update(mixed, layer, st, positions)
         return self._indexer_mask(mixed, layer, st, positions, q_cos, q_sin)
 
@@ -869,13 +918,20 @@ class TTModel:
         q_idx = rms_norm(q_idx, self.w.blk(layer, "indexer.q_norm.weight"), cfg.rms_norm_eps)
         # the caller has already bound rope at p for the attention heads
         q_idx = self._apply_rope_dev(q_idx, q_cos, q_sin)
-        scores = None
-        for h in range(cfg.indexer_heads):
-            qh = ttnn.reshape(
-                ttnn.slice(q_idx, (0, 0, h, 0), (1, batch, h + 1, d)), (batch, 1, d, 1)
-            )
-            part = ttnn.relu(ttnn.matmul(st.indexer_blocks, qh, compute_kernel_config=HIFI4))
-            scores = part if scores is None else ttnn.add(scores, part)
+        # All `indexer_heads` in one matmul. relu is elementwise and the sum is
+        # over heads, so relu-then-sum is the same function either way -- but the
+        # per-head loop read the whole block cache once per head. At the model's
+        # maximum context that cache is 16.8 MB a layer and four reads of it are
+        # 67; it also cost nineteen ops a layer against five, 168 a token.
+        qt = ttnn.reshape(ttnn.transpose(q_idx, -2, -1), (batch, 1, d, cfg.indexer_heads))
+        parts = ttnn.relu(ttnn.matmul(st.indexer_blocks, qt, compute_kernel_config=HIFI4))
+        # Summed with a constant rather than `ttnn.sum`: the head axis is four
+        # wide in a 32-wide tile, and a matmul against a [heads, 1] of ones
+        # contracts exactly the logical four whatever the padding holds.
+        if self._head_sum is None:
+            self._head_sum = self.to_dev(
+                torch.ones(1, 1, cfg.indexer_heads, 1, dtype=torch.float32), ttnn.bfloat16)
+        scores = ttnn.matmul(parts, self._head_sum, compute_kernel_config=HIFI4)
         scores = ttnn.multiply(ttnn.transpose(scores, -2, -1), d**-0.5)   # [B,1,1,nb]
         scores = ttnn.add(scores, self._input("idx_bias", self._block_bias(positions), ttnn.float32, key=tuple(positions)))
 
@@ -885,9 +941,9 @@ class TTModel:
             self._block_offsets = self.to_dev(
                 torch.arange(ratio, dtype=torch.float32).reshape(1, 1, 1, ratio), ttnn.float32
             )
+        blocks_f = ttnn.typecast(blocks, ttnn.float32)             # [B,1,1,k]
         tokens = ttnn.add(
-            ttnn.reshape(ttnn.multiply(ttnn.typecast(blocks, ttnn.float32), float(ratio)),
-                         (batch, 1, k, 1)),
+            ttnn.reshape(ttnn.multiply(blocks_f, float(ratio)), (batch, 1, k, 1)),
             self._block_offsets,
         )                                                          # [B,1,k,ratio]
         tokens = ttnn.reshape(tokens, (batch, 1, 1, k * ratio))
@@ -906,6 +962,9 @@ class TTModel:
         # entirely beyond p (which is what the -inf fills are, when fewer than
         # `topk` blocks are eligible) has all its tokens beyond p, and an
         # eligible block has none.
+        if self.compact_attention:
+            return self._compact_mask(blocks_f, visible, positions, batch, k, cfg)
+
         tail_idx, tail_vis = self._tail_block(positions)
         tokens = ttnn.concat(
             [tokens, self._input("idx_tail", tail_idx, ttnn.float32, key=tuple(positions))], dim=-1
@@ -937,7 +996,134 @@ class TTModel:
             ttnn.typecast(visible, ttnn.bfloat16),
         )
         mask = ttnn.multiply(ttnn.subtract(row, 1.0), 1e9)
-        return ttnn.repeat(mask, (1, 1, cfg.num_attention_heads, 1))
+        return ttnn.repeat(mask, (1, 1, cfg.num_attention_heads, 1)), None, None
+
+    def _compact_mask(self, blocks_f, visible, positions, batch: int, k: int, cfg):
+        """The same selection, addressed against a compact page table.
+
+        Returns `(mask, page_table, cur_pos)`, where the page table lists the
+        pages the selection actually touches and the mask is `compact_len` wide
+        instead of `max_seq_len`. Slot j of the table is block j's page, so a
+        block that shares a page with another still gets its own slot and its own
+        four mask columns -- repeated physical pages are read twice and enable
+        disjoint tokens, which is why no de-duplication is needed.
+
+        `visible` comes in already computed against the *absolute* positions,
+        because visibility is a fact about the sequence and not about the layout.
+        """
+        ratio = self.indexer_ratio
+        per_page = KV_BLOCK // ratio                  # blocks inside one page
+        slots, width = self.compact_slots, self.compact_len
+
+        # page = block // per_page, and the block's offset inside that page.
+        # `floor_div` on floats: these are small exact integers in float32.
+        pages = ttnn.floor(ttnn.multiply(blocks_f, 1.0 / per_page))
+        intra = ttnn.subtract(blocks_f, ttnn.multiply(pages, float(per_page)))
+
+        if self._compact_slot_base is None:
+            self._compact_slot_base = self.to_dev(
+                (torch.arange(k, dtype=torch.float32) * KV_BLOCK).reshape(1, 1, 1, k),
+                ttnn.float32,
+            )
+        ctok = ttnn.add(
+            ttnn.reshape(
+                ttnn.add(ttnn.multiply(intra, float(ratio)), self._compact_slot_base),
+                (batch, 1, k, 1)),
+            self._block_offsets,
+        )                                                          # [B,1,k,ratio]
+        ctok = ttnn.reshape(ctok, (batch, 1, 1, k * ratio))
+
+        # The trailing partial block, in the extra tile of slots. One whole tile
+        # so both concats stay tile-aligned; only the first slot of it carries a
+        # page, the rest are padding that the mask never marks.
+        tail_ctok, tail_vis, tail_pages = self._compact_tail(positions)
+        key = tuple(positions)
+        ctok = ttnn.concat(
+            [ctok, self._input("cidx_tail", tail_ctok, ttnn.float32, key=key)], dim=-1)
+        visible = ttnn.concat(
+            [visible, self._input("cidx_tail_vis", tail_vis, ttnn.float32, key=key)], dim=-1)
+
+        if self._mask_base is None:
+            self._mask_base = ttnn.zeros(
+                (batch, 1, 1, width), dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, device=self.mesh,
+            )
+        row = ttnn.scatter(
+            ttnn.multiply(self._mask_base, 0.0), -1,
+            ttnn.typecast(ctok, ttnn.uint16),
+            ttnn.typecast(visible, ttnn.bfloat16),
+        )
+        mask = ttnn.multiply(ttnn.subtract(row, 1.0), 1e9)
+        mask = ttnn.repeat(mask, (1, 1, cfg.num_attention_heads, 1))
+
+        # `_kv_page_table` numbers pages b * n_pages + p, so a compact table for
+        # batch b carries the same offset.
+        table = ttnn.concat(
+            [pages, self._input("cidx_tail_pages", tail_pages, ttnn.float32, key=key)],
+            dim=-1)                                                # [B,1,1,slots]
+        if batch > 1:
+            table = ttnn.add(table, self._compact_batch_offset(batch, slots))
+        table = ttnn.reshape(
+            ttnn.to_layout(ttnn.typecast(table, ttnn.int32), ttnn.ROW_MAJOR_LAYOUT),
+            (batch, slots))
+        cur = self._input(
+            "cidx_cur", torch.full((batch,), width - 1, dtype=torch.int32),
+            ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, key=("compact", width))
+        return mask, table, cur
+
+    def _compact_batch_offset(self, batch: int, slots: int):
+        hit = self._host_memo.get("_compact_batch_offset")
+        if hit is None or hit[0] != (batch, slots):
+            n_pages = self.max_seq_len // KV_BLOCK
+            host = (torch.arange(batch, dtype=torch.float32) * n_pages).reshape(
+                batch, 1, 1, 1).expand(batch, 1, 1, slots).contiguous()
+            hit = ((batch, slots), self.to_dev(host, ttnn.float32))
+            self._host_memo["_compact_batch_offset"] = hit
+        return hit[1]
+
+    def _compact_tail(self, positions: list[int]):
+        k = tuple(positions)
+        hit = self._host_memo.get("_compact_tail")
+        if hit is not None and hit[0] == k:
+            return hit[1]
+        out = self._compact_tail_uncached(positions)
+        self._host_memo["_compact_tail"] = (k, out)
+        return out
+
+    def _compact_tail_uncached(self, positions: list[int]):
+        """The trailing partial block, addressed inside its own compact slot.
+
+        The block containing `p` is pushed below every other by `_block_bias`
+        while it is incomplete, so `topk` can never return it and it is appended
+        here instead -- the same rule the dense path uses, only the indices are
+        compact. Its page goes in slot `indexer_topk`; the remaining 31 slots of
+        the tile are padding and point at page 0 with nothing marked visible.
+
+        Only the incomplete block's own tokens are marked, never the whole page,
+        so a selected block sharing that page cannot have its tokens counted a
+        second time.
+        """
+        ratio, b = self.indexer_ratio, len(positions)
+        k, slots = self.indexer_topk, self.compact_slots
+        idx = torch.zeros(b, 1, 1, KV_BLOCK)
+        vis = torch.zeros(b, 1, 1, KV_BLOCK)
+        pages = torch.zeros(b, 1, 1, slots - k)
+        for i, p in enumerate(positions):
+            page = p // KV_BLOCK
+            pages[i, 0, 0, 0] = float(page)
+            # Every column of the tail slot addresses its own position, so a
+            # column the loop below does not mark visible scatters a zero over a
+            # zero. Columns of the *padding* slots are never addressed at all.
+            base = k * KV_BLOCK                        # first column of the tail slot
+            idx[i, 0, 0, :] = torch.arange(KV_BLOCK, dtype=torch.float32) + base
+            if p % ratio == ratio - 1:
+                continue                              # complete: it competes in topk
+            start = ratio * (p // ratio)
+            for t in range(ratio):
+                tok = start + t
+                if tok <= p and tok // KV_BLOCK == page:
+                    vis[i, 0, 0, tok - page * KV_BLOCK] = 1.0
+        return idx, vis, pages
 
     def _block_bias(self, positions: list[int]) -> torch.Tensor:
         k = tuple(positions)
@@ -1081,20 +1267,27 @@ class TTModel:
             # The paged decode op takes the same `attn_mask` shape the flat one
             # does, so the QSA selection passes through unchanged: the indexer
             # masks *logical* positions and never addresses the cache.
-            mask = None
+            mask, sel_table, sel_pos = None, None, None
             if self.use_indexer:
                 if self.selection_active:
-                    mask = self._indexer_select(mixed, layer, st, positions, cos, sin)
+                    mask, sel_table, sel_pos = self._indexer_select(
+                        mixed, layer, st, positions, cos, sin)
                 else:
                     # Below the budget the selection reduces to plain causal
                     # attention (see `_indexer_mask`), so skip it and read
                     # causally -- but keep filling the block cache, because it
                     # has to be right on the step the selection starts mattering.
                     self._indexer_update(mixed, layer, st, positions)
+            # In compact mode the read is re-addressed: a page table listing only
+            # the pages the selection touches, and a position that bounds the
+            # compact window rather than the sequence. The cache itself is
+            # untouched -- `paged_update_cache` above still writes at the real
+            # position through the identity table.
             out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
-                q, st.keys, st.values, page_table_tensor=page_table,
+                q, st.keys, st.values,
+                page_table_tensor=page_table if sel_table is None else sel_table,
                 is_causal=mask is None, attn_mask=mask,
-                cur_pos_tensor=pos_tensor,
+                cur_pos_tensor=pos_tensor if sel_pos is None else sel_pos,
                 scale=hd**-0.5, program_config=self.sdpa_program_config,
                 compute_kernel_config=HIFI4,
             )

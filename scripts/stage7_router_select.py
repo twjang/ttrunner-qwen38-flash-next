@@ -18,6 +18,7 @@ rule, because "differs from the ttnn ops" and "wrong" are not the same claim
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,10 @@ import ttnn
 
 KDIR = Path(__file__).resolve().parent / "kernels"
 E_TOTAL, TOP_K, K_SEL = 512, 10, 10
+# 1: emit the TOP_K largest by rank, which is what the reference does and what
+# lets `k_sel` be `top_k` exactly. 0: threshold at the TOP_K-th value, admitting
+# ties, which is what the ttnn chain did.
+EXACT = int(os.environ.get("TT_ROUTER_EXACT_TOPK", "0"))
 ROWS = 32          # the tile's height; only row 0 is real at decode
 
 
@@ -58,7 +63,7 @@ def build(probs, devid, vals, idx, m_rows: int, e_local: int):
                 buffer_index=1, data_format=ttnn.uint32, page_size=64)]),
     ]
     ct = [E_TOTAL, e_local, TOP_K, K_SEL, m_rows, p_bf16, v_bf16,
-          acc["p"][1], acc["v"][1], acc["i"][1]]
+          acc["p"][1], acc["v"][1], acc["i"][1], EXACT]
     ct += acc["p"] + acc["d"] + acc["v"] + acc["i"]
     kernel = ttnn.KernelDescriptor(
         kernel_source=str(KDIR / "router_select.cpp"),
@@ -71,8 +76,29 @@ def build(probs, devid, vals, idx, m_rows: int, e_local: int):
 
 
 def golden(probs_host: torch.Tensor, dev: int, e_local: int):
-    """The rule the chain implements, in float64: threshold, admit ties, normalise."""
+    """The rule in float64: top-k (exact, or thresholded with ties), normalised."""
     p = probs_host.to(torch.float64)
+    if EXACT:
+        # The TOP_K largest, normalised over exactly those, then restricted to
+        # this device's window in rank order and padded with zero-weight slots --
+        # which is what the kernel emits.
+        v, i = torch.topk(p, TOP_K, dim=-1, largest=True, sorted=True)
+        w = v / v.sum(dim=-1, keepdim=True)
+        lo, hi = dev * e_local, (dev + 1) * e_local
+        rows = w.reshape(-1, TOP_K)
+        ids = i.reshape(-1, TOP_K)
+        ov = torch.zeros(rows.shape[0], K_SEL, dtype=w.dtype)
+        oi = torch.zeros(rows.shape[0], K_SEL, dtype=torch.int64)
+        for r in range(rows.shape[0]):
+            n = 0
+            for t in range(TOP_K):
+                e = int(ids[r, t])
+                if lo <= e < hi and n < K_SEL:
+                    ov[r, n] = rows[r, t]
+                    oi[r, n] = e - lo
+                    n += 1
+        shape = tuple(w.shape[:-1])
+        return ov.reshape(*shape, K_SEL), oi.reshape(*shape, K_SEL)
     vals_top = torch.topk(p, TOP_K, dim=-1, largest=True, sorted=True).values
     thr = vals_top[..., TOP_K - 1: TOP_K]
     keep = (p >= thr).to(torch.float64)

@@ -220,16 +220,19 @@ class TTEngine(Engine):
         # QSA attends to `indexer_budget` selected tokens, not to everything.
         # Below the budget every complete block is retained, so dense causal
         # attention is exactly right and cheaper; above it, dense is a different
-        # model. The selection addresses the cache with uint16 indices (the only
-        # dtype `ttnn.scatter` takes), so past 65536 tokens it cannot run and
-        # this is a fidelity caveat the caller should know about rather than
-        # discover.
+        # model. The selection addresses the mask with uint16 indices (the only
+        # dtype `ttnn.scatter` takes), so a *dense* mask row stops at 65536 --
+        # but `compact_attention` re-addresses the read against a page table of
+        # only the pages the selection touches, whose window is a few thousand
+        # columns whatever the context, and that runs to the model's full
+        # 262144. This warning is left for the case that falls through both.
         if not self.model.use_indexer and seq > self.config.indexer_budget:
             print(
                 f"[tt] context {seq} exceeds the QSA budget "
                 f"({self.config.indexer_budget}) and the sparse selection cannot "
-                f"address it (limit {self.model.indexer_max_seq}); attention is "
-                "dense beyond the budget, which is not what the model does."
+                f"address it (dense-mask limit {self.model.indexer_max_seq}, and "
+                "the compact window is off); attention is dense beyond the "
+                "budget, which is not what the model does."
             )
         # Above one row tile a sequence's output stops matching what it would
         # be decoded alone -- ops tile differently past 32 rows, so the same row
@@ -384,7 +387,7 @@ class TTEngine(Engine):
             if self.model.use_indexer:
                 raise NotImplementedError(
                     "step_n does not carry the QSA selection yet, so speculation "
-                    "and a context in (2048, 65536] cannot both be on"
+                    "and a context past the indexer budget cannot both be on"
                 )
         # Chunked prefill no longer forces this off. The two really do corrupt
         # each other -- a prefill that allocates while a trace is *live* makes the

@@ -461,10 +461,29 @@ _GATHER_KERNEL = str(Path(__file__).resolve().parents[3] / "scripts" / "kernels"
 _GATHER_BUF: dict = {}
 _IDX_LEN = 128            # index page width in uint32 -> 512 B
 _READ_BATCH = 8
-# Selection width for the wide path, or 0 to keep `sparse_matmul`. Ten is
-# the worst case for top-10 over four devices and therefore the exact one;
-# smaller values would drop a routed expert when the routing clusters.
-WIDE_EXPERTS = 10
+# Selection width for the wide path, or 0 to keep `sparse_matmul`.
+#
+# With the experts sharded on the *intermediate* axis every device holds all of
+# them, so this is a global count rather than a per-device worst case: the same
+# k_sel experts run on all four devices, each over a quarter of their columns.
+# `kept_expert_census.py` measures what it has to cover -- the router admits
+# ties, so a row keeps 10 experts 77 % of the time and up to 14 over 2256 real
+# routing decisions -- and 16 is both above that tail and the gather kernel's own
+# limit, since the selection is read from one tile face.
+#
+# Sixteen slots at a quarter width is 2.5x less work than the ten full-width
+# slots the expert-axis layout needed, and unlike those ten it wastes nothing:
+# every slot but the tie tail carries a real expert.
+#
+# Unless the tie tail is not wanted. The reference takes the `top_k` largest;
+# this project's threshold form (`probs >= the top_k-th value`) admits ties as an
+# artifact of comparing in bfloat16, and the expert-axis shard absorbed that for
+# free because an extra landed on whichever device already owned it. With every
+# device holding every expert it has to be paid for in slots -- 16 rather than
+# 10, which is 1.6x the gather and both matmuls. `router_select.cpp` can do
+# either; this switch says which, and it changes `k_sel` with it.
+ROUTER_EXACT_TOPK = os.environ.get("TT_ROUTER_EXACT_TOPK", "0") == "1"
+WIDE_EXPERTS = 10 if ROUTER_EXACT_TOPK else 16
 _WIDE_FELL_BACK = False
 
 
@@ -549,20 +568,26 @@ _ROUTER_BUF: dict = {}
 _ROUTER_FELL_BACK = False
 
 
-def _router_devid(device, n_dev: int):
-    """A per-device constant holding this device's index.
+def _router_devid(device, partitioned: bool):
+    """Which expert window this device should select from, as a tensor.
 
     `generic_op` broadcasts one program to the whole mesh, so runtime args are
     identical everywhere and cannot say which device is running. A tensor can:
     sharded on dim 0, each device gets its own page. Sixteen uint32 rather than
     one, so the page clears DRAM's 64 B alignment.
+
+    `partitioned` is False when every device holds every expert -- which is what
+    the intermediate-axis shard gives -- and then all four select the same global
+    list, so the window index is zero everywhere.
     """
-    key = ("devid", id(device))
+    key = ("devid", id(device), partitioned)
     got = _ROUTER_BUF.get(key)
     if got is None:
+        n = device.get_num_devices()
+        ids = (torch.arange(n, dtype=torch.int32) if partitioned
+               else torch.zeros(n, dtype=torch.int32))
         got = ttnn.from_torch(
-            torch.arange(n_dev, dtype=torch.int32).reshape(n_dev, 1, 1, 1)
-            .expand(n_dev, 1, 1, 16).contiguous(),
+            ids.reshape(n, 1, 1, 1).expand(n, 1, 1, 16).contiguous(),
             dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
             mesh_mapper=ttnn.ShardTensorToMesh(device, dim=0))
         _ROUTER_BUF[key] = got
@@ -601,7 +626,7 @@ def _router_program(probs, devid, vals, idx, m_rows, e_total, e_local, top_k, k_
                 buffer_index=1, data_format=ttnn.uint32, page_size=64)]),
     ]
     ct = [e_total, e_local, top_k, k_sel, m_rows, p_bf16, v_bf16,
-          acc["p"][1], acc["v"][1], acc["i"][1]]
+          acc["p"][1], acc["v"][1], acc["i"][1], int(ROUTER_EXACT_TOPK)]
     ct += acc["p"] + acc["d"] + acc["v"] + acc["i"]
     kernel = ttnn.KernelDescriptor(
         kernel_source=_ROUTER_KERNEL,
@@ -623,7 +648,6 @@ def fused_router_select(probs, e_total: int, e_local: int, top_k: int, k_sel: in
     """
     global _ROUTER_FELL_BACK
     dev = probs.device()
-    n_dev = e_total // e_local
     m_rows = probs.shape[-2]
     try:
         # An off switch, so the kernel and the chain it replaces can be compared
@@ -647,7 +671,7 @@ def fused_router_select(probs, e_total: int, e_local: int, top_k: int, k_sel: in
             )
             _ROUTER_BUF[key] = got
         vals, idx = got
-        devid = _router_devid(dev, n_dev)
+        devid = _router_devid(dev, e_local != e_total)
         ttnn.generic_op(
             [probs, devid, vals, idx],
             _router_program(probs, devid, vals, idx, m_rows, e_total, e_local,

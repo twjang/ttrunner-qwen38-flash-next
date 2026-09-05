@@ -51,7 +51,10 @@ for t in range(T):
     # `_attention_step` has already built cos/sin for the position and the
     # indexer reuses them. Same tables, same layout as the call site.
     q_cos, q_sin = m.rope([t])
-    mask = m._indexer_select(
+    # `_indexer_select` returns (mask, page_table, cur_pos); the last two are
+    # None unless compact attention is on, and this check opens the model well
+    # below the length that turns it on.
+    mask, _sel_table, _sel_pos = m._indexer_select(
         row, LAYER, st, [t], m.to_dev(q_cos, ttnn.float32), m.to_dev(q_sin, ttnn.float32)
     )
     if t % 500 == 0:

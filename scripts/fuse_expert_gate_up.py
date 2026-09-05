@@ -15,8 +15,11 @@ Writes new files and leaves the originals untouched.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -37,13 +40,19 @@ def main() -> None:
     started = time.time()
     written = 0
 
-    for layer in layers:
+    # Threads, not processes: `import ttnn` takes the device lock for the
+    # process's lifetime, so a second worker process would block on it forever
+    # (see `reshard_experts_parallel.py`). The work is torch dequantise /
+    # concatenate / requantise, which releases the GIL.
+    lock = threading.Lock()
+
+    def fuse_layer(layer: int):
         name = f"blk.{layer}.ffn_gateup_exps.weight"
         gate_rec = tensors[f"blk.{layer}.ffn_gate_exps.weight"]
         up_rec = tensors[f"blk.{layer}.ffn_up_exps.weight"]
         paths = [CACHE / f"{name}.dev{i}.tensorbin" for i in range(n_dev)]
         if all(p.exists() for p in paths) and name in tensors:
-            continue
+            return 0
 
         for i, (gf, uf, path) in enumerate(zip(gate_rec["files"], up_rec["files"], paths)):
             # load one device's shard at a time: the full stack is 3.35 GB in fp32
@@ -55,24 +64,32 @@ def main() -> None:
             ttnn.dump_tensor(str(path), host)
             del fused, host
 
-        tensors[name] = {
+        rec = {
             "files": [p.name for p in paths],
             "dtype": "bfloat4_b",
             "shard": gate_rec["shard"],
             "shard_dim": gate_rec["shard_dim"],
             "all_reduce": gate_rec["all_reduce"],
-            "shape": [gate_rec["shape"][0], gate_rec["shape"][1], gate_rec["shape"][2] * 2]
+            # Source order is (E, out, in) and the concatenation is on `out`,
+            # whichever axis the shard splits. (Informational only -- nothing
+            # reads `shape` back; `files` and `shard_dim` are what load the
+            # tensor -- but it was doubling `in`, which was never right.)
+            "shape": [gate_rec["shape"][0], gate_rec["shape"][1] * 2, gate_rec["shape"][2]]
             if len(gate_rec["shape"]) == 3
             else gate_rec["shape"],
             "bytes": sum(p.stat().st_size for p in paths),
         }
-        written += 1
-        elapsed = time.time() - started
-        print(
-            f"  blk.{layer}: {tensors[name]['bytes']/1e9:.2f} GB  "
-            f"[{written}/{len(layers)}] {elapsed:.0f}s",
-            flush=True,
-        )
+        with lock:
+            tensors[name] = rec
+        return 1
+
+    workers = int(os.environ.get("TTRUNNER_FUSE_WORKERS", "8"))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for layer, did in zip(layers, pool.map(fuse_layer, layers)):
+            written += did
+            if did:
+                print(f"  blk.{layer}: [{written}/{len(layers)}] "
+                      f"{time.time() - started:.0f}s", flush=True)
         MANIFEST.write_text(json.dumps(manifest))
 
     print(f"done: {written} layers in {time.time()-started:.0f}s", flush=True)
