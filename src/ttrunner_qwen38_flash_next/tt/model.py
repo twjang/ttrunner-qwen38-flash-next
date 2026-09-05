@@ -693,6 +693,23 @@ class TTModel:
             self._conv_taps[(key, rows, dtype)] = hit
         return hit
 
+    _CAST_CACHE: dict = {}
+
+    def _as_dtype(self, t: ttnn.Tensor, dtype, key: tuple) -> ttnn.Tensor:
+        """`t` in `dtype`, converted once and kept.
+
+        A compute kernel configures its unpacker from one circular buffer, so a
+        float32 tile read through a bfloat16 one is garbage (invariant 76) --
+        every fused kernel that mixes a weight with an activation needs this.
+        """
+        if t.dtype == dtype:
+            return t
+        hit = self._CAST_CACHE.get((key, dtype))
+        if hit is None:
+            hit = ttnn.typecast(t, dtype)
+            self._CAST_CACHE[(key, dtype)] = hit
+        return hit
+
     def _causal_conv_step(
         self, x_col: ttnn.Tensor, weight: ttnn.Tensor, state: list | None,
         channels: int, batch: int = 1, step: int = 0, layer: int = 0
@@ -857,14 +874,28 @@ class TTModel:
         if both_ab is None:
             both_ab = linear_rows(mixed, ab, compute_kernel_config=HIFI4)
         half = both_ab.shape[-1] // 2
-        a = self._slice_last(both_ab, 0, half)
-        b = self._slice_last(both_ab, half, 2 * half)
         dt = self.w.blk(layer, "ssm_dt.bias")
         a_decay = self.w.blk(layer, "ssm_a")
-        # g = A * softplus(a + dt_bias); A is stored already negated (= -exp(A_log))
-        g = ttnn.multiply(a_decay, ttnn.softplus(ttnn.add(a, dt)))
-        g_exp = ttnn.reshape(ttnn.exp(g), (batch * n_v, 1, 1, 1))
-        beta = ttnn.reshape(ttnn.sigmoid(b), (batch * n_v, 1, 1, 1))
+        # Nine launches -- two slices, an add, a softplus, a multiply, an exp, a
+        # sigmoid and two reshapes -- to turn 2*half numbers into 2*half numbers,
+        # each paying a full-grid dispatch. One core reading three pages does the
+        # same work; `decode_step`'s broadcasts read only element (0, 0) of each
+        # output tile, which is what the reshapes were producing.
+        pair = ops.fused_delta_scalars(
+            both_ab,
+            self._as_dtype(dt, both_ab.dtype, ("dt", layer)),
+            self._as_dtype(a_decay, both_ab.dtype, ("a", layer)),
+            half, key=("ssm", layer)) if batch == 1 else None
+        if pair is not None:
+            g_exp, beta = pair
+        else:
+            a = self._slice_last(both_ab, 0, half)
+            b = self._slice_last(both_ab, half, 2 * half)
+            # g = A * softplus(a + dt_bias); A is stored already negated
+            # (= -exp(A_log))
+            g = ttnn.multiply(a_decay, ttnn.softplus(ttnn.add(a, dt)))
+            g_exp = ttnn.reshape(ttnn.exp(g), (batch * n_v, 1, 1, 1))
+            beta = ttnn.reshape(ttnn.sigmoid(b), (batch * n_v, 1, 1, 1))
 
         if st.recurrent is None:
             st.recurrent = ttnn.zeros(

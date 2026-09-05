@@ -332,6 +332,125 @@ def _rope_program(x, cos, sin, out, nt, nt_rope):
     ], semaphores=[], cbs=cbs)
 
 
+_DSCAL_OUT: dict = {}
+_DSCAL_FELL_BACK = False
+_NO_FUSED_DELTA_SCALARS = bool(os.environ.get("TT_NO_FUSED_DELTA_SCALARS"))
+
+# ttnn.softplus's own defaults, as float bits: softplus(x) = log(1 + exp(x)),
+# with anything above the threshold passed through unchanged.
+_SP_BETA = struct.unpack("<I", struct.pack("<f", 1.0))[0]
+_SP_THRESH = struct.unpack("<I", struct.pack("<f", 20.0))[0]
+
+
+def _delta_scalars_program(ab, dt, a_decay, g_out, b_out, heads):
+    dev = ab.device()
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+    cores = [ttnn.CoreCoord(0, 0)]
+
+    acc = []
+    for t in (ab, dt, a_decay, g_out, b_out):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError("fused delta scalars: every operand must be interleaved")
+        acc.append(ct)
+    page = acc[0][1]
+    if acc[1][1] != page or acc[2][1] != page:
+        raise RuntimeError("fused delta scalars: the three inputs must share a page size")
+
+    elem = {ttnn.bfloat16: 2, ttnn.float32: 4}.get(ab.dtype)
+    if elem is None:
+        raise RuntimeError(f"fused delta scalars: no element size for {ab.dtype}")
+    face = 16 * 16 * elem
+
+    cbs = [ttnn.CBDescriptor(
+        total_size=page, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=ab.dtype, page_size=page)])
+        for i in range(3)]
+    cbs.append(ttnn.CBDescriptor(
+        total_size=2 * page, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=3, data_format=ab.dtype, page_size=page)]))
+    # 64 bytes a value, both outputs, plus a 64-byte alignment slack.
+    cbs.append(ttnn.CBDescriptor(
+        total_size=2 * heads * 64 + 64, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=4, data_format=ttnn.uint32, page_size=64)]))
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("delta_scalars_reader.cpp", acc[0] + acc[1] + acc[2],
+             [[ab.buffer_address(), dt.buffer_address(), a_decay.buffer_address()]],
+             ttnn.ReaderConfigDescriptor()),
+        kern("delta_scalars_compute.cpp", [_SP_BETA, _SP_BETA, _SP_THRESH], [[]],
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("delta_scalars_writer.cpp",
+             [heads, elem, face, page] + acc[3] + acc[4],
+             [[g_out.buffer_address(), b_out.buffer_address()]],
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def fused_delta_scalars(both_ab, dt, a_decay, heads: int, key=None):
+    """`(exp(A * softplus(a + dt)), sigmoid(b))` as [heads, 1, 1, 1], or None.
+
+    Replaces two slices, an add, a softplus, a multiply, an exp, a sigmoid and
+    two reshapes -- nine launches a layer to turn 24 numbers into 24 numbers.
+    Both halves live in one tile, so the whole thing is one core reading three
+    pages.
+    """
+    global _DSCAL_FELL_BACK
+    if _NO_FUSED_DELTA_SCALARS:
+        return None
+    try:
+        why = None
+        if list(both_ab.shape) != [1, 1, 1, 2 * heads]:
+            why = f"both_ab is {list(both_ab.shape)}, expected [1, 1, 1, {2 * heads}]"
+        elif 2 * heads > _TILE:
+            why = f"{2 * heads} columns do not fit one tile"
+        elif list(dt.shape) != [1, 1, 1, heads] or list(a_decay.shape) != [1, 1, 1, heads]:
+            why = f"dt {list(dt.shape)} and A {list(a_decay.shape)} must be [1, 1, 1, {heads}]"
+        elif dt.dtype != both_ab.dtype or a_decay.dtype != both_ab.dtype:
+            why = (f"dtypes differ: both_ab {both_ab.dtype}, dt {dt.dtype}, "
+                   f"A {a_decay.dtype}")
+        if why is not None:
+            if not _DSCAL_FELL_BACK:
+                _DSCAL_FELL_BACK = True
+                import warnings
+                warnings.warn(f"fused delta scalars declined, using the ops: {why}",
+                              RuntimeWarning, stacklevel=2)
+            return None
+
+        okey = (key, id(both_ab.device()), str(both_ab.dtype), heads)
+        pair = _DSCAL_OUT.get(okey)
+        if pair is None:
+            pair = tuple(
+                ttnn.from_torch(
+                    torch.zeros(heads, 1, 1, 1), dtype=both_ab.dtype,
+                    layout=ttnn.TILE_LAYOUT, device=both_ab.device(),
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(both_ab.device()))
+                for _ in range(2))
+            _DSCAL_OUT[okey] = pair
+        g_out, b_out = pair
+        ttnn.generic_op(
+            [both_ab, dt, a_decay, g_out, b_out],
+            _delta_scalars_program(both_ab, dt, a_decay, g_out, b_out, heads))
+        return g_out, b_out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _DSCAL_FELL_BACK:
+            _DSCAL_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused delta scalars unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 _CONV_OUT: dict = {}
 _CONV_FELL_BACK = False
 _NO_FUSED_CONV = bool(os.environ.get("TT_NO_FUSED_CONV"))
