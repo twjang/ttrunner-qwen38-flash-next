@@ -5117,3 +5117,59 @@ That measurement is what found the delta rule's tail: 1.99 ms in `decode_step`,
 most of it in six small ops after the matmuls, which is the shape invariant 91
 says is worth cutting. Fusing them is +0.62 ms and moved the model's quality up
 (top-5 88.5 -> 90.6 %).
+
+## 34. Two more from the decomposition, and where the session finished
+
+    47.87 -> 35.6 ms a token, median of three; 34.34 best
+    20.9  -> 28.1 tokens a second, 29.1 at the best step
+
+| | `ab_step.py` |
+|---|---:|
+| the delta rule's tail, one launch a head | +0.62 |
+| the shared expert's scalar gate concatenated | +0.55 |
+
+Both came straight out of section 33's cumulative decomposition rather than from
+looking for something to fuse: the first because `decode_step` was 1.99 ms and
+most of its launches were the six ops after the matmuls, the second because a
+`[2560, 1]` matmul was sitting in the linear census at **0.3 % of bandwidth**,
+9.80 us to produce one number, 48 times a token.
+
+The second is invariant 55 one level out. `_fused_pair` has concatenated
+`ssm_alpha|ssm_beta` for a long time and `shared_expert` has concatenated
+gate|up; nobody had asked which *other* matmuls share an input. Three do -- the
+router, the shared gate|up and its scalar gate all read `mixed` -- and the
+measurements are:
+
+    router bf16 13.90 + gate|up 14.40 + gate_vec 9.80 = 38.10 us
+    gate|up + gate_vec, both bfloat8_b                = 14.67   (+0.46 ms)
+    all three, promoted to bfloat16                   = 25.82   (+0.59 ms)
+
+The three-way version is only 0.13 ms better and needs the router's and the
+shared expert's consumers to take column offsets instead of slices, since three
+slices off the concatenation cost about what the fusion saves. The two-way
+version needs one slice and was taken.
+
+### 34.1 Tried and rejected here
+
+* **Concatenating `attn_qkv | attn_gate | ssm_alpha|beta`.** They share `mixed`
+  too, but a concatenation has one dtype and these are bfloat8, bfloat8 and
+  float32 -- the result is bfloat16 and **slower**: 83.23 us against 62.42 for
+  the three apart. `attn_qkv | attn_gate` alone was already measured at nothing
+  (section 5).
+* **`ssm_alpha|beta` in bfloat16** rather than float32: 8.51 us against 9.80,
+  0.05 ms a token. Not worth the precision question it raises.
+
+### 34.2 The session, in one table
+
+    5640 -> 2825 ttnn calls a step        3.06 -> 2.95 GB moved
+    47.87 -> 35.6 ms                      20.9 -> 28.1 tokens a second
+
+Fourteen changes. Eight new kernels, every one of them nearer float64 than the
+ops it replaced. Nothing made an operation faster; the whole of it was issuing
+fewer launches, not moving bytes twice, and -- twice -- deleting a decision that
+had been overtaken (the k-split, +1.82; the collective's default link count,
++0.75).
+
+Held throughout: 235 tests, determinism 0.0e+00 in every configuration, and the
+traced decoder emitting the same tokens as the eager one, which it did not do at
+the start of the session.
