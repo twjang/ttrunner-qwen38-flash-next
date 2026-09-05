@@ -2037,7 +2037,23 @@ _KSG_FOLD = os.environ.get("TT_KSG_FOLD", "0") == "1"
 # the weight slice they are there to multiply. This flag moves the three
 # remaining `ksplit_linear`/`fast_linear` call sites (the MoE router, the shared
 # expert's gate|up, and ssm_alpha|beta) onto `ksgemv`. Off until measured.
-_KSG_WIDE = os.environ.get("TT_KSG_WIDE", "0") == "1"
+# A comma list of sites rather than a boolean, because `TT_KSG_WIDE=1` hangs in
+# **traced replay** five times out of five while every one of its three shapes
+# runs clean outside a trace (`ksgemv_check.py`, 45.8). That is trace-specific and
+# needs bisecting per site: `TT_KSG_WIDE=router`, `=shexp`, `=ab`, or any comma
+# combination. `1` still means all three.
+_KSG_WIDE_SITES = frozenset(
+    s.strip() for s in os.environ.get("TT_KSG_WIDE", "").split(",") if s.strip())
+if "1" in _KSG_WIDE_SITES:
+    _KSG_WIDE_SITES = frozenset({"router", "shexp", "ab", "qkv", "indexer"})
+
+
+def ksg_wide(site: str) -> bool:
+    """Is the k-split wired at this call site? See `_KSG_WIDE_SITES`."""
+    return site in _KSG_WIDE_SITES
+
+
+_KSG_WIDE = bool(_KSG_WIDE_SITES)
 _KSG_SEM = int(os.environ.get("TT_KSG_SEM", "2"))
 _KSG_ROWS = int(os.environ.get("TT_KSG_ROWS", "0"))
 

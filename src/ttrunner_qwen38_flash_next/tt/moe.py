@@ -196,7 +196,7 @@ def moe_block(
     # reduction groups -- measured 1.49x and more accurate than `ttnn.linear`
     # (invariant 57). Six is about where the split starts paying; the guard in
     # `ksplit_linear` declines anything narrower in groups than that pays for.
-    logits = ksgemv(x, router_w, key=("router", id(router_w))) if _ops._KSG_WIDE else None
+    logits = ksgemv(x, router_w, key=("router", id(router_w))) if _ops.ksg_wide("router") else None
     if logits is None:
         logits = ksplit_linear(x, router_w)
     if logits is None:
@@ -1011,7 +1011,7 @@ def shared_expert(
     # [2560, 1312] is forty-one output tiles, so `fast_linear` runs it on
     # forty-one of a hundred and ten cores. The k-split affords two reduction
     # groups of forty-four, which is the whole grid.
-    both = ksgemv(x, fused, key=("shexp_gu", id(fused))) if _ops._KSG_WIDE else None
+    both = ksgemv(x, fused, key=("shexp_gu", id(fused))) if _ops.ksg_wide("shexp") else None
     if both is None:
         both = fast_linear(x, fused, compute_kernel_config=HIFI4)
     n = gate_w.shape[-1]

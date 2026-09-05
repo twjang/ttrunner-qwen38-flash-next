@@ -807,6 +807,23 @@ class TTModel:
 
     _FUSED_PAIRS: dict = {}
 
+    def _ksg_or_linear(self, site: str, x: ttnn.Tensor, w: ttnn.Tensor,
+                       key) -> ttnn.Tensor:
+        """`ksgemv` at this call site if it is wired, else `fast_linear`.
+
+        `ksgemv_check.py` measures the k-split faster on every shape the model
+        issues at M = 1 -- 1.2x to 3.1x -- and three to eight times nearer
+        float64 than `ttnn.linear`, so this is a precision gain rather than a
+        spend (invariant 120). It is per-site because `TT_KSG_WIDE=1` hangs in
+        traced replay while every one of its shapes runs clean outside a trace,
+        and that has to be bisected one call at a time.
+        """
+        if ops.ksg_wide(site):
+            got = ops.ksgemv(x, w, key=key)
+            if got is not None:
+                return got
+        return fast_linear(x, w, compute_kernel_config=HIFI4)
+
     def _shexp_is_sharded(self, down_shexp: ttnn.Tensor) -> bool:
         """Is the shared expert's `down` split on its contraction axis?
 
@@ -922,7 +939,7 @@ class TTModel:
         # Three output tiles, the narrowest in the model after the fusion above,
         # so the grid affords more reduction groups here than anywhere else.
         both_ab = None
-        if ops._KSG_WIDE:
+        if ops.ksg_wide("ab"):
             both_ab = ops.ksgemv(mixed, ab, key=("ssm_ab", layer))
         if both_ab is None and not _NO_AB_KSPLIT:
             both_ab = ksplit_linear(mixed, ab)
@@ -1037,9 +1054,11 @@ class TTModel:
         nb, k = self.max_blocks, self.indexer_topk
 
         # -- compressed keys ------------------------------------------------
-        k_raw = fast_linear(
-            mixed, self.w.blk(layer, "indexer.k_proj.weight"), compute_kernel_config=HIFI4
-        )                                                        # [1,1,B,d]
+        # [2560, 128] is four output tiles: four cores of a hundred and ten.
+        # 32.10 -> 15.64 us on the k-split, which affords twenty groups here.
+        k_raw = self._ksg_or_linear(
+            "indexer", mixed, self.w.blk(layer, "indexer.k_proj.weight"),
+            ("idx_k", layer))                                    # [1,1,B,d]
         if st.indexer_ring is None:
             st.indexer_ring = [
                 ttnn.zeros((1, 1, batch, d), dtype=ttnn.bfloat16,
@@ -1101,9 +1120,9 @@ class TTModel:
         # Contracting the *block* cache against a single query column keeps the
         # 65536 x 128 cache where it is; scoring the other way round would
         # transpose 16 MB a layer a step.
-        q_idx = fast_linear(
-            mixed, self.w.blk(layer, "indexer.q_proj.weight"), compute_kernel_config=HIFI4
-        )
+        q_idx = self._ksg_or_linear(
+            "indexer", mixed, self.w.blk(layer, "indexer.q_proj.weight"),
+            ("idx_q", layer))
         q_idx = ttnn.reshape(q_idx, (1, batch, cfg.indexer_heads, d))
         q_idx = rms_norm(q_idx, self.w.blk(layer, "indexer.q_norm.weight"), cfg.rms_norm_eps)
         # the caller has already bound rope at p for the attention heads
@@ -1406,12 +1425,17 @@ class TTModel:
         q = self._slice_last(qg, 0, hd)
         gate = self._slice_last(qg, hd, hd * 2)
 
+        # [2560, 512] is sixteen output tiles, so `ttnn.linear` at M = 1 runs it
+        # on sixteen of a hundred and ten cores and leaves 94 idle -- twice.
+        # 36.65 -> 18.61 us on the k-split (`ksgemv_check.py`).
         k = ttnn.reshape(
-            fast_linear(mixed, self.w.blk(layer, "attn_k.weight"), compute_kernel_config=HIFI4),
+            self._ksg_or_linear("qkv", mixed, self.w.blk(layer, "attn_k.weight"),
+                                ("attn_k", layer)),
             (1, batch, n_kv, hd),
         )
         v = ttnn.reshape(
-            fast_linear(mixed, self.w.blk(layer, "attn_v.weight"), compute_kernel_config=HIFI4),
+            self._ksg_or_linear("qkv", mixed, self.w.blk(layer, "attn_v.weight"),
+                                ("attn_v", layer)),
             (1, batch, n_kv, hd),
         )
         q = rms_norm(q, self.w.blk(layer, "attn_q_norm.weight"), cfg.rms_norm_eps)
