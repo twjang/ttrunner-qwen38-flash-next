@@ -2056,6 +2056,7 @@ def ksg_wide(site: str) -> bool:
 _KSG_WIDE = bool(_KSG_WIDE_SITES)
 _KSG_SEM = int(os.environ.get("TT_KSG_SEM", "2"))
 _KSG_ROWS = int(os.environ.get("TT_KSG_ROWS", "0"))
+_KSG_PARTIAL = os.environ.get("TT_KSG_PARTIAL") == "1"
 
 
 def _ksgemv_plan(grid, kt, nt):
@@ -2104,7 +2105,9 @@ def _ksgemv_plan(grid, kt, nt):
     # allocates CBs and semaphores per range and the multicast then writes to
     # offsets the members do not share. That variant hung the shipped hc_down
     # path five runs out of five.
-    if groups * cores_pg != grid.x * grid.y:
+    # `TT_KSG_PARTIAL=1` lifts this. The reader now has an `in_group` guard, so a
+    # partial plan *should* be safe -- this is the flag that tests whether it is.
+    if not _KSG_PARTIAL and groups * cores_pg != grid.x * grid.y:
         return None
     return cores_pg, groups, where
 

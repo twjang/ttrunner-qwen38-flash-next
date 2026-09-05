@@ -6456,6 +6456,34 @@ in one change: the shared expert's k-split, ssm_alpha\|beta's, the stability of
 the other k-split sites, `TT_GG_COLS=1`, and probably `_KSG_FOLD`, which has been
 unexplained since 42.1.
 
+### 45.16 The idle-core guard does not fix shexp, and shexp would not pay anyway
+
+The fix was built and the hypothesis tested directly. `TT_KSG_WIDE=shexp` with
+`TT_KSG_PARTIAL=1` (coverage requirement lifted, reader guarded), four runs:
+
+    shexp run1 HUNG   run2 HUNG   run3 HUNG   run4 OK  median 33.12 ms
+    SHEXP with in_group guard: 1 of 4 finished (was 0 of 4)
+
+**0-of-4 to 1-of-4 is p = 1.0.** No improvement. So invariant 130's synthesis --
+"the recurring hang tracks the cores with no work" -- is **refuted for shexp**,
+the case it was built to explain. What remains true is narrower and still worth
+having: the idle-core signalling is a real defect, read from the source and
+fixed; it is simply not what hangs this configuration.
+
+And the run that did finish closes the other half. **33.12 ms against a ~32.4
+baseline is a loss**, which is 45.14 again: the k-split's isolated 1.60x on this
+shape does not survive contact with the model. So shexp's k-split is dead on both
+counts -- it destabilises the step *and* it would not pay if it did not.
+
+INVARIANT 132: a defect found by reading the source is worth fixing on its own
+terms, but it is not thereby the cause of the failure that led you to it. Test
+the fix against the failure; 45.10 through 45.15 built a four-commit story on a
+mechanism that turned out to explain the code and not the hang.
+
+The `TT_KSG_PARTIAL` flag stays, off, as the way to re-test this cheaply. The
+plan's full-coverage requirement stays on, because nothing has shown partial
+coverage safe.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
@@ -6482,15 +6510,15 @@ finishes **8 times out of 8**. Measurement is cheap; it was the cards.
 
 What is left, with what each is actually worth:
 
-1. **The idle-core defect, fixed properly** -- invariant 130. One whole-grid
-   core range, an explicit "not in any group" runtime flag, an early return in
-   the kernels. It is the single change that unlocks the most: the shared
-   expert's k-split, ssm_alpha|beta's, the stability of the other k-split sites,
-   `TT_GG_COLS=1`, and probably `_KSG_FOLD`. Three independent sightings now
-   (45.10, 45.14, 45.15) and a mechanism read from the source.
-2. **`TT_GG_COLS=1` re-run afterwards.** It is rejected today (hangs 3/3) but it
-   doubles the cores on the MoE's two largest kernels inside a 5.17 ms
-   component, and 1 is only unsafe because of the defect above.
+1. **`TT_GG_COLS=1`**, the only untried item left with a mechanism and a
+   component worth attacking: it doubles the cores on the MoE's two largest
+   kernels inside 5.17 ms. It hangs 3-of-3 today and 45.16 shows the idle-core
+   guard is *not* the reason, so this needs its own bisection.
+2. **The traced-step instability**, as a correctness item. Enabling `generic_op`
+   call sites destabilises the capture in proportion to how many are added
+   (45.14) and the one mechanism found does not explain it (45.16). It caps all
+   future generic_op work. `TT_METAL_WATCHER` aborts here, so it can only be
+   bisected -- and the base rate is ~12 %, so every verdict needs four runs.
 3. **The fabric all-reduce**, 0.6-1.3 ms and a hard build -- but 45.5 already
    took the cheap half of the same idea for -0.45 ms with no kernel, so what is
    left is the 4x gather the composite path pays and nothing else.
