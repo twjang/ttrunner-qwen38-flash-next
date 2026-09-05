@@ -5423,3 +5423,67 @@ apart: it omits 4.4 ms of collectives whose cost does not scale with size and a
 launch floor of ~1.8 ms for the matmuls alone. **Reaching it is a decomposition
 problem, and the three sharding choices that would change it were each re-run at
 the collective's real price this session and each survived.**
+
+## 39. A tenth of the step is not the model
+
+Chasing why one PLE layer cost 1.58 ms led somewhere better. Timing
+`TracedDecoder.step` against its parts:
+
+    _fill_inputs (host)                    0.809 ms
+    trace replay alone                    30.732
+    fill + replay                         33.495     <- 1.96 ms more than the sum
+    dec.step                              34.209     <- 0.71 ms more again
+
+**About 3.5 ms of a 34 ms step -- 10 % -- is preparing inputs, not running the
+model.** And `_fill_inputs`'s own 0.81 ms is almost entirely the *upload*, not
+the arithmetic:
+
+    model.embed                34.3 us      write embed  [2560] bf16   245.3 us
+    model.ngram_embed          24.6         write ngram  [2560] bf16   ~245
+    model.rope                  0.3         write rope_cos [64] f32     65.2
+                              ------        write rope_sin [64] f32    ~65
+                                59 us       write cur_pos  [1]  i32     64.8
+                                                                       ------
+                                                                       ~685 us
+
+`ttnn.from_torch` with `TILE_LAYOUT` is **146 us** for a [1, 1, 1, 2560] tensor
+and **19 us** for the same data as `ROW_MAJOR` -- the tile layout pads one row to
+thirty-two, so 5 KB of embedding becomes 160 KB to build and copy. The M = 1
+padding tax, which invariant 85 describes on the device, is charged on the host
+as well.
+
+INVARIANT 99: measure the decode step's host half. A captured trace makes the
+device side visible and the host side invisible, and the ~700 us of
+`from_torch` + `copy_host_to_device_tensor` for five small tensors does not
+appear in any op census, any ablation, or any kernel timing. It is 2 % of the
+step on its own and 10 % with the replay delay it causes.
+
+### 39.1 What could be done about it
+
+* **Upload row-major and tilize on device.** `from_torch` drops from 146 us to
+  21 and the copy carries 5 KB instead of 160. The obstacle is that
+  `ttnn.to_layout` allocates and a trace capture forbids that, and neither
+  `tilize` nor `to_layout` accepts an `output_tensor`. Done outside the trace it
+  is ~110 us against 245 for the two wide inputs, so about 0.27 ms.
+* **Fewer, larger copies.** Five copies cost 1.96 ms of replay delay between
+  them. Grouping by dtype would make it three. The obstacle is that each bound
+  buffer is read by a different op, and slicing one big buffer costs what the
+  grouping saves -- unless the consumers take a column offset, which the fused
+  kernels can and `ttnn` ops cannot.
+* **Take the rope tables off the host entirely.** They are a deterministic
+  function of the position, which `paged_scaled_dot_product_attention_decode`
+  already receives as a *tensor*. A rope that did the same would remove two of
+  the five writes and `model.rope` with them.
+
+### 39.2 One thing left unresolved
+
+`_fill_inputs` writes `rope_cos` and `rope_sin` but not `rope_cos_f` /
+`rope_sin_f` -- the row-expanded tables the *fused rope kernel* reads, which
+`TTModel._rope_tables` binds separately. Read back after six steps they do not
+agree with the tables that were refreshed.
+
+And yet the traced decoder emits tokens **bit-identical to the eager one**, with
+the fused rope on and with `TT_NO_FUSED_ROPE=1`, so whatever the buffer
+comparison is showing, it is not reaching the output. It is recorded here because
+`_fill_inputs` mirroring `_input` by hand is exactly the kind of pairing that
+drifts, and the next person to add a bound input should check both.
