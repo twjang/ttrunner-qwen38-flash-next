@@ -807,6 +807,15 @@ class TTModel:
 
     _FUSED_PAIRS: dict = {}
 
+    def _shexp_is_sharded(self, down_shexp: ttnn.Tensor) -> bool:
+        """Is the shared expert's `down` split on its contraction axis?
+
+        Read from the weight rather than from a flag, so the code is correct for
+        whichever way the cache was converted and `plan.py` is the only place the
+        decision lives.
+        """
+        return int(down_shexp.shape[-2]) != int(self.cfg.expert_intermediate)
+
     def _fused_pair(self, layer: int, left: str, right: str,
                     pad_to_tile: bool = False) -> ttnn.Tensor:
         """Two same-input projections concatenated on their output axis.
@@ -1955,17 +1964,26 @@ class TTModel:
             self.w.blk(layer, "ffn_down_exps.weight"),
             cfg.num_experts_per_tok, cfg.num_experts, cfg.hidden_size, cfg.expert_intermediate,
         )
-        # down_proj is sharded on its contraction dim, so each device holds a
-        # partial sum -- this is the single collective per layer.
-        routed = self.all_reduce(routed)
+        down_shexp = self.w.blk(layer, "ffn_down_shexp.weight")
         shared = moe.shared_expert(
             mixed,
             self.w.blk(layer, "ffn_gate_shexp.weight"),
             self.w.blk(layer, "ffn_up_shexp.weight"),
-            self.w.blk(layer, "ffn_down_shexp.weight"),
+            down_shexp,
             self.w.blk(layer, "ffn_gate_inp_shexp.weight"),
         )
-        return ttnn.add(routed, shared)
+        # down_proj is sharded on its contraction dim, so each device holds a
+        # partial sum -- this is the single collective per layer.
+        #
+        # When the *shared* expert is sharded too its `down` reduces only its
+        # own quarter of the intermediate, so it is a partial as well, and the
+        # two partials add before the collective rather than after: the sum is
+        # the same either way and the reduce is still one. That is what makes
+        # sharding the shared expert free -- plan.py replicated it to "avoid a
+        # collective per layer", but the layer already has one right here.
+        if self._shexp_is_sharded(down_shexp):
+            return self.all_reduce(ttnn.add(routed, shared))
+        return ttnn.add(self.all_reduce(routed), shared)
 
     # -- public API ------------------------------------------------------------
 
@@ -2801,6 +2819,11 @@ class TTModel:
         shared = (
             sub_pieces[0] if len(sub_pieces) == 1 else ttnn.concat(sub_pieces, dim=-2)
         )
+        # `routed` above is already all-reduced. If the shared expert is sharded
+        # its pieces are partials, so they need their own collective before the
+        # add -- without this the add is silently four times short.
+        if self._shexp_is_sharded(self.w.blk(layer, "ffn_down_shexp.weight")):
+            shared = self.all_reduce(shared)
         ffn = ttnn.add(routed, shared)
         hidden = reinject(hidden, ffn, inject, cfg.hc_count)
         if self.probe is not None:

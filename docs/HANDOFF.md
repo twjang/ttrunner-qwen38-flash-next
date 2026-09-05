@@ -5915,3 +5915,98 @@ run. Reset only after a run that actually failed, and take a configuration's
 result from the first of three tries that produces one. Treating a hang as a
 data point costs a bisection its meaning -- section 43's first DeltaNet sweep
 lost four cumulative configurations to one hang in the middle of it.
+
+## 45. The target is below the byte roofline, so the remaining road is bytes
+
+44.1 put the weight read at ~3.17 GB a device a token, which is **8.2 ms at
+388 GB/s -- 122 tok/s**. The goal is 7.9 ms. So:
+
+INVARIANT 113: at the current residency, 127 tok/s is arithmetically out of
+reach *however fast the kernels get*. A perfect implementation -- every GEMV at
+the full 388 GB/s, zero launch cost, zero collective cost -- still spends 8.2 ms
+reading weights. Kernel work can approach that number and cannot pass it.
+
+This inverts the project's working assumption. Sections 12 through 43 are a
+long, successful grind on **op count and kernel speed**: 146 -> 32 ms, eighteen
+changes, nine fused kernels. That grind has a floor at 8.2 ms and the target is
+under it. What moves the floor is the other half of 44.1's table:
+
+    replicated dense   ~1.69 GB   every device reads the same bytes
+    sharded dense      ~1.05
+    routed experts     ~0.43
+
+**1.69 of the 3.17 GB is read four times over.** Three reductions, in the order
+their evidence supports:
+
+| change | bytes | note |
+|---|--:|---|
+| shard the shared expert into the MoE reduce | -200 MB | no new collective; its partial rides the one at model.py:1960 |
+| regroup the v-heads so `attn_qkv` is [2560, 2560] | -200 MB | q\|k are stored three times over; see 45.1 |
+| head-shard `attn_q` \| `attn_output` | -476 MB | costs 12 collectives a token |
+
+    3.17 -> 2.29 GB  =  5.9 ms at 388 GB/s  =  169 tok/s ceiling
+
+Only after that does 7.9 ms have any room in it -- 2 ms for 2686 launches, 181
+collectives and every kernel. That is still a demanding target, but it is a
+target rather than an impossibility, which is what it was before.
+
+### 45.1 `attn_qkv` stores q and k three times over
+
+`convert.py:99` gives device d the v-heads `[12d, 12d+12)` and then
+`idx = [(12d + i) % 16 for i in range(12)]`. Twelve consecutive v-heads touch
+**twelve distinct k-heads** mod 16, so each device stores q 1536 + k 1536 +
+v 1536 = 4608 columns and the mesh holds 4 x 3072 = 12288 q|k columns where only
+4096 distinct ones exist.
+
+Grouping v-heads by k-head instead -- device d owns the twelve v-heads whose
+k-index lies in `[4d, 4d+4)` -- gives each device 4 distinct k-heads and 2560
+columns. `attn_qkv` drops 12.54 -> 6.96 MB a layer.
+
+The verifier's correction, which is the number to plan against: attn_qkv is
+already at **89 %** of bandwidth (~36 us a call through `fast_linear`'s program
+config, not the census's stale 51.88), so this is a byte saving and not an
+efficiency one -- **~0.45 ms, not 0.75**, and the conv and head-split terms the
+original estimate added are refuted outright by 44.4, which measured both at
+zero. Six tensor families carry the same v-head permutation (`attn_gate`,
+`ssm_alpha|beta`, `ssm_a`, `ssm_dt.bias`, `ssm_out`, `ssm_conv1d`) and
+`ops.py:1016` declines `fused_qkv_heads` unless `key_dim == heads*head_dim`, so
+the guard has to move with the layout or the layer silently gets slower.
+
+### 45.2 The all-reduce width step is an algorithm switch
+
+`ttnn.all_reduce` is a dispatcher. `all_reduce_async` looks for a scatter dim:
+at 352 wide (11 tiles) nothing divides by four, so it takes the **composite**
+path -- one line all_gather and a local `moreh_sum`. At 2560 (80 tiles)
+80 % 4 == 0, so it takes the **native** path: `reduce_scatter_minimal_async`
+*then* `all_gather_async`, **two** fabric collectives.
+
+That is the whole 12.79 -> 32.77 us step in section 31.1's sweep, which this
+document has read as latency for two sessions. It is neither hops nor bytes.
+
+INVARIANT 114: before pricing a collective as a hardware floor, find out which
+algorithm the dispatcher picked. The step in a width sweep can be a branch.
+
+`TT_AR_COMPOSITE` puts the 84 wide reduces back on the one-collective path from
+Python -- all_gather onto the batch axis, `fused_group_sum` to fold -- with no
+kernel. It changes the reduction *order*, so handoff 35.1's gate for
+`Topology.Ring` applies unchanged: `device_quality.py` against the Linear
+control, not a speed measurement.
+
+This also reorders the fabric-kernel question. A hand-rolled line all-reduce is
+fundamentally *one* collective's traversal, so most of its headroom is the same
+headroom the composite path already has for free. Measure the composite first.
+
+### 45.3 A silent decline cost 2.25 ms and looked like noise
+
+Relaxing `fused_delta_scalars`' shape guard, I wrote `list(both_ab.shape[:3])`.
+ttnn's `Shape` does not support slicing, so it raised `TypeError` **inside the
+kernel's own `try`**, the wrapper returned None, and all 36 layers took the
+nine-op fallback. The step went 32.27 -> 34.52 and read as a bad run until the
+log was opened and the RuntimeWarning was there.
+
+Every fused kernel in `ops.py` falls back quietly and warns **once per process**,
+so this is structural. `TT_STRICT_KERNELS` turns a decline into a raise.
+
+INVARIANT 115: after touching any fused kernel's guard, run once with
+`TT_STRICT_KERNELS=1`. A guard that declines by accident is invisible, costs
+milliseconds, and is indistinguishable from the rig's noise.

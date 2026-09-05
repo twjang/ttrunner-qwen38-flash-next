@@ -109,8 +109,17 @@ PLAN: tuple[TensorPlan, ...] = (
     TensorPlan(r"^blk\.\d+\.indexer\..*\.weight$", Residency.DEVICE, "bfloat16", Shard.REPLICATE,
                "BF16 upstream; an error here changes the token set, not just the value"),
     # -- shared expert ---------------------------------------------------------
-    TensorPlan(r"^blk\.\d+\.ffn_(gate|up|down)_shexp\.weight$", Residency.DEVICE, "bfloat8_b",
-               Shard.REPLICATE, "0.9 GB total; replicating avoids a collective per layer"),
+    # Replicated it read 266 MB a device a token and cost no collective -- but
+    # "avoids a collective per layer" was measuring against the wrong baseline:
+    # `_moe_block` **already** all-reduces the routed sum on the very next line,
+    # and a sharded shared expert's partial adds into that one. Same collective
+    # count, a quarter of the bytes. `gate|up` split on their output so each
+    # device owns 160 of the 640 intermediate; `down` split on its contraction
+    # so its output is a partial, which is what rides the reduce.
+    TensorPlan(r"^blk\.\d+\.ffn_(gate|up)_shexp\.weight$", Residency.DEVICE, "bfloat8_b",
+               Shard.COLUMN, "160 of 640 intermediate a device"),
+    TensorPlan(r"^blk\.\d+\.ffn_down_shexp\.weight$", Residency.DEVICE, "bfloat8_b",
+               Shard.ROW, "reduction split; its partial joins the routed one"),
     # -- full attention --------------------------------------------------------
     TensorPlan(r"^blk\.\d+\.attn_(q|k|v|output)\.weight$", Residency.DEVICE, "bfloat8_b",
                Shard.REPLICATE, "0.6 GB over 12 layers; replicated to drop an all-reduce per layer"),
