@@ -484,7 +484,11 @@ _GATHER_KERNEL = str(Path(__file__).resolve().parents[3] / "scripts" / "kernels"
                      / "expert_gather.cpp")
 _GATHER_BUF: dict = {}
 _IDX_LEN = 128            # index page width in uint32 -> 512 B
-_READ_BATCH = 8
+# Tiles in flight between barriers in the expert gather. The gather is a pure
+# copy at 47 % of bandwidth and this is its only knob; swept, and eight is the
+# floor -- 4, 8, 16 and 32 measure 98.8, 97.4, 97.7 and 98.6 us. It is not
+# read-depth-bound, so making it faster means not copying at all.
+_READ_BATCH = int(os.environ.get("TT_GATHER_BATCH", "8"))
 # Selection width for the wide path, or 0 to keep `sparse_matmul`.
 #
 # With the experts sharded on the *intermediate* axis every device holds all of

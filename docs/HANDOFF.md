@@ -4367,7 +4367,7 @@ The two things that would move it, in order of size:
 
 ### 25.2 What this session did to the batch-1 step
 
-    146.18 -> 49.1 ms a token      (2.98x, 6.8 -> 20.4 tok/s)
+    146.18 -> 47.25 ms a token      (3.09x, 6.8 -> 21.2 tok/s)
 
 and, along the way, three silent correctness bugs -- the wide MoE path wrong at
 M > 1, the k-split returning zeros for a sub-tile output, and idle k-split cores
