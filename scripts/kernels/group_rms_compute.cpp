@@ -8,8 +8,12 @@
 //
 // EPS_BITS, not EPS: tt-metal's llk headers define EPS as a macro.
 //
-// Compile-time args: 0 SQUARE, 1 RECIP_H bits, 2 EPS_BITS, 3 SPLIT_NUM, 4 SPLIT_DEN
-// Runtime args: 0 work_lo, 1 work_hi, 2 run_len
+// With FOLD, a gatherer core runs a second window over the PARTS partials its
+// group's cores wrote into its fold buffer, and finishes the scale there.
+//
+// Compile-time args: 0 SQUARE, 1 RECIP_H bits, 2 EPS_BITS, 3 SPLIT_NUM,
+//                    4 SPLIT_DEN, 5 FOLD, 6 PARTS
+// Runtime args: 0 work_lo, 1 work_hi, 2 run_len, 3 part
 
 #include <cstdint>
 #include "api/compute/compute_kernel_api.h"
@@ -26,8 +30,10 @@ void kernel_main() {
     constexpr uint32_t EPS_BITS = get_compile_time_arg_val(2);
     constexpr uint32_t SPLIT_NUM = get_compile_time_arg_val(3);
     constexpr uint32_t SPLIT_DEN = get_compile_time_arg_val(4);
+    constexpr uint32_t FOLD = get_compile_time_arg_val(5);
+    constexpr uint32_t PARTS = get_compile_time_arg_val(6);
 
-    constexpr uint32_t cb_x = 0, cb_x2 = 1, cb_out = 2;
+    constexpr uint32_t cb_x = 0, cb_x2 = 1, cb_out = 2, cb_fold = 3;
 
     const uint32_t work_lo = get_arg_val<uint32_t>(0);
     const uint32_t work_hi = get_arg_val<uint32_t>(1);
@@ -108,5 +114,36 @@ void kernel_main() {
     cb_pop_front(cb_x, h0);
     if (h1 > 0) {
         cb_pop_front(cb_x2, h1);
+    }
+
+    if constexpr (FOLD) {
+        if (get_arg_val<uint32_t>(3) != 0) {
+            return;                     // only the gatherer folds
+        }
+        cb_wait_front(cb_fold, PARTS);
+        tile_regs_acquire();
+        for (uint32_t j = 0; j < PARTS; ++j) {
+            if (j == 0) {
+                copy_tile(cb_fold, 0, 2);
+                continue;
+            }
+            copy_tile(cb_fold, j, 1);
+            add_binary_tile_init();
+            add_binary_tile(2, 1, 2);
+        }
+        sfpu_reduce_init<PoolType::SUM, DataFormat::Float32>();
+        sfpu_reduce<PoolType::SUM, DataFormat::Float32, ReduceDim::REDUCE_ROW>(2, 1, 1);
+        binop_with_scalar_tile_init();
+        mul_unary_tile(2, RECIP_H);
+        add_unary_tile(2, EPS_BITS);
+        rsqrt_tile_init();
+        rsqrt_tile(2);
+        tile_regs_commit();
+        tile_regs_wait();
+        cb_reserve_back(cb_out, 1);
+        pack_tile(2, cb_out);
+        cb_push_back(cb_out, 1);
+        tile_regs_release();
+        cb_pop_front(cb_fold, PARTS);
     }
 }

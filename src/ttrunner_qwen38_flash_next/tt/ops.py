@@ -688,7 +688,12 @@ def _gnorm_programs(x, w, part, scale, out, local, devid, nt_g, groups, recip, e
                  ttnn.WriterConfigDescriptor(), crs, cores),
         ], semaphores=[], cbs=cbs)
 
-    # --- pass 1: partial sums of squares -------------------------------------
+    # --- the reduction, in one launch ----------------------------------------
+    #
+    # Each group's `parts` cores compute a partial and the one at part 0 gathers:
+    # the others write their tile straight into its fold buffer -- the same
+    # circular buffer at the same L1 offset on every core -- and signal. Two
+    # launches until the multicast work made the handshake routine.
     runs_a, cap_a = [], 0
     for g in range(groups):
         for j in range(parts):
@@ -696,11 +701,39 @@ def _gnorm_programs(x, w, part, scale, out, local, devid, nt_g, groups, recip, e
             hi = g * nt_g + (nt_g * (j + 1)) // parts
             runs_a.append((g * parts + j, lo, hi - lo))
             cap_a = max(cap_a, hi - lo)
-    prog_a = reduction(runs_a, x, acc["x"], part, acc["p"], 1, cap_a)
 
-    # --- pass 2: fold each group's partials into its scale --------------------
-    runs_b = [(g, g * parts, parts) for g in range(groups)]
-    prog_a2 = reduction(runs_b, part, acc["p"], scale, acc["s"], 0, parts)
+    crs_a, cores_a = core_set(len(runs_a))
+    d0 = dev.get_devices()[0] if hasattr(dev, "get_devices") else dev
+    half = max(1, (cap_a * SN + SD - 1) // SD)
+    cbs_a = [ttnn.CBDescriptor(
+        total_size=n_ * page, core_ranges=crs_a,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=x.dtype, page_size=page)])
+        for i, n_ in ((0, half), (1, max(1, cap_a - half + 1)), (2, 2), (3, parts))]
+
+    r_args, c_args, w_args = [], [], []
+    for i, c in enumerate(cores_a):
+        if i < len(runs_a):
+            o, lo, ln = runs_a[i]
+            g, j = divmod(i, parts)
+            gp = d0.worker_core_from_logical_core(cores_a[g * parts])
+            r_args.append([x.buffer_address(), o, o + 1, lo, ln])
+            c_args.append([o, o + 1, ln, j])
+            w_args.append([scale.buffer_address(), x.buffer_address(), o, o + 1,
+                           lo, ln, j, gp.x, gp.y, g])
+        else:
+            r_args.append([0, 0, 0, 0, 0])
+            c_args.append([0, 0, 0, 1])
+            w_args.append([0, 0, 0, 0, 0, 0, 1, 0, 0, 0])
+    prog_a = ttnn.ProgramDescriptor(kernels=[
+        kern("group_rms_reader.cpp", [page, SN, SD] + acc["x"], r_args,
+             ttnn.ReaderConfigDescriptor(), crs_a, cores_a),
+        kern("group_rms_compute.cpp", [1, recip, eps, SN, SD, 1, parts], c_args,
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True), crs_a, cores_a),
+        kern("group_rms_writer.cpp", [page, SN, SD, 1, parts] + acc["s"] + acc["x"],
+             w_args, ttnn.WriterConfigDescriptor(), crs_a, cores_a),
+    ], semaphores=[ttnn.SemaphoreDescriptor(id=0, core_ranges=crs_a,
+                                            initial_value=0)], cbs=cbs_a)
 
     # --- pass 3: scale, weight, and this device's own group -------------------
     total = groups * nt_g
@@ -728,7 +761,7 @@ def _gnorm_programs(x, w, part, scale, out, local, devid, nt_g, groups, recip, e
                lo, hi] for lo, hi in work_b],
              ttnn.WriterConfigDescriptor(), crs_b, cores_b),
     ], semaphores=[], cbs=cbs_b)
-    return prog_a, prog_a2, prog_b
+    return prog_a, prog_b
 
 
 def fused_group_norm(x, weight, eps: float, group_size: int, groups: int, key=None):
@@ -780,12 +813,10 @@ def fused_group_norm(x, weight, eps: float, group_size: int, groups: int, key=No
         part, scale, out, local = bufs
         devid = _gnorm_devid(dev)
         bits = lambda f: struct.unpack("<I", struct.pack("<f", float(f)))[0]  # noqa: E731
-        pa, pa2, pb = _gnorm_programs(x, weight, part, scale, out, local, devid,
-                                      group_size // _TILE, groups,
-                                      bits(1.0 / group_size), bits(eps),
-                                      _GNORM_PARTS)
-        ttnn.generic_op([x, part], pa)
-        ttnn.generic_op([part, scale], pa2)
+        pa, pb = _gnorm_programs(x, weight, part, scale, out, local, devid,
+                                 group_size // _TILE, groups,
+                                 bits(1.0 / group_size), bits(eps), _GNORM_PARTS)
+        ttnn.generic_op([x, scale], pa)
         ttnn.generic_op([x, weight, scale, out, local, devid], pb)
         return out, local
     except Exception as exc:                                        # noqa: BLE001

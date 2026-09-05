@@ -54,10 +54,9 @@ try:
     devid = ops._gnorm_devid(mesh)
     import struct
     bits = lambda f: struct.unpack("<I", struct.pack("<f", float(f)))[0]
-    pa, pa2, pb = ops._gnorm_programs(x, wt, part, scale, out, local, devid, H // 32,
-                                      HC, bits(1.0 / H), bits(eps), ops._GNORM_PARTS)
-    timed(lambda: ttnn.generic_op([x, part], pa), "  pass 1 (partial squares)")
-    timed(lambda: ttnn.generic_op([part, scale], pa2), "  pass 2 (fold)")
+    pa, pb = ops._gnorm_programs(x, wt, part, scale, out, local, devid, H // 32,
+                                 HC, bits(1.0 / H), bits(eps), ops._GNORM_PARTS)
+    timed(lambda: ttnn.generic_op([x, scale], pa), "  pass 1 (reduce, cross-core fold)")
     timed(lambda: ttnn.generic_op([x, wt, scale, out, local, devid], pb),
           "  pass 3 (scale + weight + local)")
     # local against the kernel's own normed
