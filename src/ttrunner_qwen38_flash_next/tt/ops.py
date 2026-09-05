@@ -2067,13 +2067,12 @@ def _ksgemv_plan(grid, kt, nt):
     output gets one group a core and eleven groups a row -- and otherwise whole
     rows, with the cores past `nt` in the rectangle for the handshake only.
     """
-    if _KSG_ROWS == 0 and nt <= grid.x:
-        # `grid.x % nt == 0` used to be required here, and the grid is **eleven**
-        # wide -- a prime -- so every nt from 2 to 10 fell through to whole-row
-        # groups, where only nt of each row's eleven cores do anything. Packing
-        # `per_row = grid.x // nt` groups into a row instead leaves the remainder
-        # columns idle rather than a whole row's worth: at nt = 5 that is 20
-        # groups of 5 (100 cores working) against 10 groups of 11 (50 working).
+    # `grid.x % nt == 0`, restored. Dropping it packed `grid.x // nt` groups into
+    # a row, which uses more cores per row -- and leaves the *rest of the grid*
+    # idle, which is fatal until the idle-core bug is fixed in the kernel: at
+    # nt = 4 it turned 10 groups x 11 cores (all 110) into 20 x 4 (80), and the
+    # indexer then hung where it had been fine. Handoff 45.10.
+    if _KSG_ROWS == 0 and nt <= grid.x and grid.x % nt == 0:
         per_row = grid.x // nt
         cores_pg = nt
         groups = min(kt, per_row * grid.y)
@@ -2090,6 +2089,23 @@ def _ksgemv_plan(grid, kt, nt):
 
     if groups < 2:
         return None
+    # **Every core, or none of them.** A core outside every group runs the kernel
+    # with all-zero runtime args, so its `is_head` is 0, it takes the reader's
+    # non-head path and increments the `ready` semaphore of whatever sits at
+    # (0, 0) -- group 0's head, which then multicasts before its real members
+    # have armed. Measured: plans covering all 110 cores run (hc_down 10 x 11,
+    # router and qkv 5 x 22); plans leaving cores idle hang four times out of
+    # four (shexp 2 x 44 = 88, ssm_ab 80 x 1 = 80, indexer 20 x 4 = 80).
+    #
+    # Declining is the conservative half of the fix -- the caller falls back to
+    # `ttnn.linear`, which is slower but correct. The real fix is a "not in any
+    # group" runtime flag and an early return in the three kernels, keeping one
+    # whole-grid core range; a range *per group* is not it, because tt-metal
+    # allocates CBs and semaphores per range and the multicast then writes to
+    # offsets the members do not share. That variant hung the shipped hc_down
+    # path five runs out of five.
+    if groups * cores_pg != grid.x * grid.y:
+        return None
     return cores_pg, groups, where
 
 
@@ -2104,30 +2120,32 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
             raise RuntimeError(f"k-split gemv: {tag} must be interleaved")
         acc[tag] = ct
 
-    # **Only the cores in a group.** This used to launch on the whole grid and
-    # give the leftovers all-zero runtime args -- and an idle core's `is_head` is
-    # then 0, so it took the reader's *non-head* path and ran
-    # `noc_semaphore_inc(get_noc_addr(hx, hy, ...))` with hx = hy = 0: every idle
-    # core incremented the `ready` semaphore of whichever core sits at (0, 0),
-    # which is group 0's head. That head then saw its count satisfied before its
-    # real members had armed, multicast early, and a member that had not yet
-    # zeroed `valid` waited for ever.
+    # The whole grid, one range -- **not** one range a group. Restricting the
+    # core ranges to the cores with work is the right idea and it is how the
+    # idle-core bug below has to be fixed, but a ten-range CoreRangeSet made the
+    # *shipped* hc_down path hang five runs out of five where one whole-grid
+    # range had always been fine: tt-metal allocates circular buffers and
+    # semaphores per core range, so a group's members no longer share the L1
+    # offsets that the head's `noc_async_write_multicast_loopback_src` assumes.
     #
-    # Invisible whenever the plan covers all 110 cores, which is why `hc_down`
-    # (10 x 11) and the router (5 x 22) have always been fine and the shared
-    # expert (2 x 44 = 88), ssm_alpha|beta (80 x 1 = 80) and the indexer
-    # (20 x 4 = 80) hung four times out of four. Handoff 45.10.
-    #
-    # Each group is exactly one rectangle by construction, so the set is one
-    # range a group.
-    crs = ttnn.CoreRangeSet([
-        ttnn.CoreRange(where(g, 0), where(g, cores_pg - 1)) for g in range(groups)])
+    # The bug this was trying to fix is real and is described in handoff 45.10:
+    # a core outside every group gets all-zero runtime args, so `is_head` is 0,
+    # it takes the reader's non-head path and increments the `ready` semaphore of
+    # whatever sits at (0, 0) -- group 0's head. The fix has to be an explicit
+    # "not in any group" runtime flag and an early return in the three kernels,
+    # keeping one core range. Until that lands, only plans that cover all 110
+    # cores are safe, which is what `_ksgemv_plan` must therefore produce.
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    all_cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
     d0 = dev.get_devices()[0] if hasattr(dev, "get_devices") else dev
 
-    used = [where(g, j) for g in range(groups) for j in range(cores_pg)]
-    r_args: dict = {}
-    c_args: dict = {}
-    w_args: dict = {}
+    idle_r = [0] * 13
+    idle_c = [0, 0, 0, groups]
+    idle_w = [0] * 8
+    r_args = {c: idle_r for c in all_cores}
+    c_args = {c: idle_c for c in all_cores}
+    w_args = {c: idle_w for c in all_cores}
     cap = 0
     for g in range(groups):
         lo, hi = (kt * g) // groups, (kt * (g + 1)) // groups
@@ -2151,7 +2169,7 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
             kernel_source=str(_KDIR / name),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=crs, compile_time_args=ct,
-            runtime_args=[(c, args[c]) for c in used], config=cfgd)
+            runtime_args=[(c, args[c]) for c in all_cores], config=cfgd)
 
     # Not float32: packing into a Float32 circular buffer hangs the card here,
     # and the launch this replaces wrote bfloat16 partials to DRAM anyway.
