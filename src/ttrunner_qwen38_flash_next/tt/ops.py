@@ -1497,12 +1497,14 @@ def _ksplit_build(a, w, out, groups: int, kt: int, nt: int):
     n_active = len(plan)
     while len(plan) < len(cores):
         plan.append((0, 0, 0, 0))                     # idle core: writes nothing
+    deep = max(1, max(hi - lo for lo, hi, _, _ in plan))
 
     cbs = [
-        ttnn.CBDescriptor(total_size=4 * acc["a"][1], core_ranges=crs,
+        # A core's whole share of the reduction, so its reads go out together.
+        ttnn.CBDescriptor(total_size=deep * acc["a"][1], core_ranges=crs,
                           format_descriptors=[ttnn.CBFormatDescriptor(
                               buffer_index=0, data_format=a.dtype, page_size=acc["a"][1])]),
-        ttnn.CBDescriptor(total_size=4 * acc["w"][1], core_ranges=crs,
+        ttnn.CBDescriptor(total_size=deep * acc["w"][1], core_ranges=crs,
                           format_descriptors=[ttnn.CBFormatDescriptor(
                               buffer_index=1, data_format=w.dtype, page_size=acc["w"][1])]),
         ttnn.CBDescriptor(total_size=2 * acc["o"][1], core_ranges=crs,
@@ -1520,7 +1522,8 @@ def _ksplit_build(a, w, out, groups: int, kt: int, nt: int):
     aa, wa, oa = a.buffer_address(), w.buffer_address(), out.buffer_address()
     return ttnn.ProgramDescriptor(
         kernels=[
-            kern("ksplit_reader.cpp", [kt, nt] + acc["a"] + acc["w"],
+            kern("ksplit_reader.cpp",
+                 [kt, nt, acc["a"][1], acc["w"][1]] + acc["a"] + acc["w"],
                  [[aa, wa, lo, hi, n] for lo, hi, n, _ in plan],
                  ttnn.ReaderConfigDescriptor()),
             kern("ksplit_compute.cpp", [], [[hi - lo] for lo, hi, _, _ in plan],

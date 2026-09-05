@@ -29,13 +29,11 @@ void kernel_main() {
     }
     matmul_init(cb_a, cb_b);
 
+    cb_wait_front(cb_a, n_k);
+    cb_wait_front(cb_b, n_k);
     tile_regs_acquire();
     for (uint32_t i = 0; i < n_k; ++i) {
-        cb_wait_front(cb_a, 1);
-        cb_wait_front(cb_b, 1);
-        matmul_tiles(cb_a, cb_b, 0, 0, 0);
-        cb_pop_front(cb_a, 1);
-        cb_pop_front(cb_b, 1);
+        matmul_tiles(cb_a, cb_b, i, i, 0);
     }
     tile_regs_commit();
     tile_regs_wait();
@@ -43,4 +41,6 @@ void kernel_main() {
     pack_tile(0, cb_out);
     cb_push_back(cb_out, 1);
     tile_regs_release();
+    cb_pop_front(cb_a, n_k);
+    cb_pop_front(cb_b, n_k);
 }
