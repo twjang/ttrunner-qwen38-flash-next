@@ -4580,3 +4580,61 @@ calls -- six launches to normalise four groups and scale them. A two-launch
 kernel prices at ~18 us against 24.6, so about 0.8 ms; nothing else on the list
 is bigger. Section 25.1 still holds: the remaining gap is op *count*, and closing
 it means one kernel per sub-block rather than one per arithmetic step.
+
+### 27.9 Two more kernels, and where the session ended
+
+| change | `ab_step.py` | isolated |
+|---|---:|---|
+| q/k/v head split + both l2 norms, one launch | +0.77 | 42.4 -> 9.0 us, 4.69x |
+| DeltaNet tail (norm, weight, gate, both reshapes) | +0.74 | 29.0 -> 13.1 us, 2.22x |
+
+Both rest on the same observation: **at M = 1 the reshapes in these chains are
+the identity page mapping.** `[1, 1, 1, 3*Dk] -> [H, 1, 1, hd]` puts head h's
+tiles at pages TPH*h..+TPH-1 of their section, which is where they already were,
+and the only reason `ttnn` needs the reshape at all is that `rms_norm` reduces
+over the last axis. A kernel that does its own reduction needs neither reshape,
+and the split becomes a page copy.
+
+The reduction pattern both use, worth copying:
+
+    accumulate x_j * x_j elementwise across the head's TPH tiles   (SFPU)
+    sfpu_reduce<SUM, Float32, REDUCE_ROW>(dst)                     -> row r's
+                                                                      total in
+                                                                      column 0
+    scale, add eps, rsqrt                                          (SFPU)
+    pack to a CB, then mul_tiles_bcast_cols(x, scale, j, 0, dst)   (FPU)
+
+`REDUCE_ROW` leaving each row's total in that row's column 0 is exactly the
+operand shape `mul_tiles_bcast_cols` wants, which is what makes this cheap.
+
+INVARIANT 87: never mix the FPU broadcast ops and the SFPU inside one
+`tile_regs_acquire` window. `mul_tiles_bcast_cols` followed by `init_sfpu` and
+`mul_binary_tile` in a single window **compiles, runs, and returns a wrong
+answer** -- 1.04 relative against float64 where the ops it replaced are 5.3e-03,
+with nothing warning. Two windows handing over through a circular buffer are
+correct and cost about 0.6 us a head.
+
+INVARIANT 88: `EPS` is a macro in tt-metal's `llk_math_common_api.h`
+(1.19209e-07). A `constexpr uint32_t EPS` in a compute kernel fails to compile
+with "expected unqualified-id before numeric constant" pointing at *their*
+header. Name compile-time constants defensively.
+
+**Where the session ended.**
+
+    47.87 -> 41.4 ms a token, min 40.78      (20.9 -> 24.2 tok/s)
+
+`ab_step.py`'s deltas sum to 7.03 ms; the cross-process harness reads 6.5. The
+components, against a 41.65 ms baseline:
+
+    deltanet 8.99   (14.56 at the start of the session)
+    moe      9.51
+    qsa      3.70
+    shared   2.98
+    reinject 2.27
+
+Everything landed this session was a launch removed, never an op made faster.
+Nine changes: two layout choices, two op choices, one kernel that already existed
+and was not being used, one circular-buffer size, and four new kernels.
+
+The matmuls are ~9.4 ms and the roofline 7.9. Section 25.1 still describes the
+rest: about 3500 non-linear launches against the ~700 that would reach it.
