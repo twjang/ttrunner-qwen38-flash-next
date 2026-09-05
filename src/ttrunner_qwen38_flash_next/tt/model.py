@@ -48,6 +48,8 @@ KV_BLOCK = 32
 # produces, so the permute+transpose either side of the conv -- four wide
 # ops a layer, 144 a token -- simply do not happen.
 _NO_ROW_CONV = bool(os.environ.get("TT_NO_ROW_CONV"))
+# The MoE router weight in bfloat16 rather than the float32 it is stored in.
+_NO_BF16_ROUTER = bool(os.environ.get("TT_NO_BF16_ROUTER"))
 
 # Rows in a tile. The rope tables are bound row-expanded to this for the fused
 # kernel; on device it is the same two tiles either way.
@@ -1899,9 +1901,15 @@ class TTModel:
         else:
             gate_w = self.w.blk(layer, "ffn_gate_exps.weight")
             up_w = self.w.blk(layer, "ffn_up_exps.weight")
+        # The router weight is stored float32 -- 5.2 MB a layer, and at HiFi4 a
+        # float32 operand costs passes as well as bytes: 20.04 us against 14.00
+        # in bfloat16. The selection is what matters, not the logits, and the
+        # top-10 agreed on 240 of 240 over random rows before this was wired.
         routed = moe.moe_block(
             mixed,
-            self.w.blk(layer, "ffn_gate_inp.weight"),
+            self.w.blk(layer, "ffn_gate_inp.weight") if _NO_BF16_ROUTER
+            else self._as_dtype(self.w.blk(layer, "ffn_gate_inp.weight"),
+                                ttnn.bfloat16, ("router", layer)),
             gate_w,
             up_w,
             self.w.blk(layer, "ffn_down_exps.weight"),
