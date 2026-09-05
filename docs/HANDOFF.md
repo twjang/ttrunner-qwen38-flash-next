@@ -6310,6 +6310,22 @@ and `qkv` completed at 32.94 and 32.47 in the same window `shexp` and `ab` went
 4/4 -- but that was luck, not design, and the control should have been running
 from the first bisection rather than added after it.
 
+### 45.12 Refuted: the trace region
+
+With the full-coverage guard in place, `router` alone runs and `qkv` alone runs,
+but `router,qkv,indexer` together LOST four of four while the baseline in the
+same sweep completed at 33.03. The obvious suspect was invariant 105 -- three
+sites add ~96 programs to the capture, and a capture that overflows its region
+**hangs rather than raising**. Tested directly at **768 MB** instead of 256:
+
+    TT_KSG_WIDE=router,qkv,indexer  TTRUNNER_TRACE_BYTES=768M  ->  Terminated
+
+Three times the region, same hang. Not the trace region.
+
+INVARIANT 127: invariant 105's failure mode is real but it is not the
+explanation for every capture-adjacent hang. It costs one run to rule out --
+triple the region and re-run -- and that is cheaper than reasoning about it.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
