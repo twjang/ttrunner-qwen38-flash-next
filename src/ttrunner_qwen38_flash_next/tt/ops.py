@@ -332,6 +332,112 @@ def _rope_program(x, cos, sin, out, nt, nt_rope):
     ], semaphores=[], cbs=cbs)
 
 
+_DTAIL_OUT: dict = {}
+_DTAIL_FELL_BACK = False
+_NO_FUSED_DELTA_TAIL = bool(os.environ.get("TT_NO_FUSED_DELTA_TAIL"))
+
+
+def _delta_tail_program(o, z, w, out, tph, heads, recip_d, eps):
+    grid = o.device().compute_with_storage_grid_size()
+    n = min(heads, grid.x * grid.y)
+    cols = min(n, grid.x)
+    rows = (n + grid.x - 1) // grid.x
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+    cores = [ttnn.CoreCoord(cx, cy) for cy in range(rows) for cx in range(cols)]
+
+    acc = []
+    for t in (o, z, w, out):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError("fused delta tail: every operand must be interleaved")
+        acc.append(ct)
+    page = acc[0][1]
+    if any(a[1] != page for a in acc):
+        raise RuntimeError("fused delta tail: every operand must share a page size")
+
+    work = [((heads * i) // len(cores), (heads * (i + 1)) // len(cores))
+            for i in range(len(cores))]
+    sizes = {0: tph, 1: tph, 2: tph, 3: 2, 4: 2 * tph, 5: 2}
+    cbs = [ttnn.CBDescriptor(
+        total_size=sizes[i] * page, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=o.dtype, page_size=page)])
+        for i in range(6)]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("delta_tail_reader.cpp", [tph, page] + acc[0] + acc[1] + acc[2],
+             [[o.buffer_address(), z.buffer_address(), w.buffer_address(), lo, hi]
+              for lo, hi in work], ttnn.ReaderConfigDescriptor()),
+        kern("delta_tail_compute.cpp", [tph, recip_d, eps],
+             [[lo, hi] for lo, hi in work],
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("delta_tail_writer.cpp", [tph] + acc[3],
+             [[out.buffer_address(), lo, hi] for lo, hi in work],
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def fused_delta_tail(o, z, w, heads: int, head_dim: int, eps: float, key=None):
+    """`rms_norm(o) * w * sigmoid(z)`, flattened, in one launch. Or None.
+
+    Replaces two reshapes, an `rms_norm`, a sigmoid, a multiply and a reshape --
+    six launches a layer, 28.73 us. The reshapes are there only because
+    `ttnn.rms_norm` reduces over the last axis; a kernel that does its own
+    reduction leaves every mapping the identity.
+    """
+    global _DTAIL_FELL_BACK
+    if _NO_FUSED_DELTA_TAIL:
+        return None
+    try:
+        why = None
+        if list(o.shape) != [heads, 1, 1, head_dim]:
+            why = f"o is {list(o.shape)}, expected [{heads}, 1, 1, {head_dim}]"
+        elif list(z.shape) != [1, 1, 1, heads * head_dim]:
+            why = f"z is {list(z.shape)}, expected [1, 1, 1, {heads * head_dim}]"
+        elif list(w.shape) != [1, 1, 1, head_dim]:
+            why = f"weight is {list(w.shape)}, expected [1, 1, 1, {head_dim}]"
+        elif head_dim % _TILE:
+            why = f"head_dim {head_dim} is not a whole number of tiles"
+        elif z.dtype != o.dtype or w.dtype != o.dtype:
+            why = f"dtypes differ: o {o.dtype}, z {z.dtype}, weight {w.dtype}"
+        if why is not None:
+            if not _DTAIL_FELL_BACK:
+                _DTAIL_FELL_BACK = True
+                import warnings
+                warnings.warn(f"fused delta tail declined, using the ops: {why}",
+                              RuntimeWarning, stacklevel=2)
+            return None
+
+        okey = (key, id(o.device()), heads, head_dim, str(o.dtype))
+        out = _DTAIL_OUT.get(okey)
+        if out is None:
+            out = ttnn.from_torch(
+                torch.zeros(1, 1, 1, heads * head_dim), dtype=o.dtype,
+                layout=ttnn.TILE_LAYOUT, device=o.device(),
+                mesh_mapper=ttnn.ReplicateTensorToMesh(o.device()))
+            _DTAIL_OUT[okey] = out
+        bits = lambda f: struct.unpack("<I", struct.pack("<f", float(f)))[0]  # noqa: E731
+        ttnn.generic_op([o, z, w, out],
+                        _delta_tail_program(o, z, w, out, head_dim // _TILE, heads,
+                                            bits(1.0 / head_dim), bits(eps)))
+        return out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _DTAIL_FELL_BACK:
+            _DTAIL_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused delta tail unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 _QKVH_OUT: dict = {}
 _QKVH_FELL_BACK = False
 _NO_FUSED_QKV_HEADS = bool(os.environ.get("TT_NO_FUSED_QKV_HEADS"))

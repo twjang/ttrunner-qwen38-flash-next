@@ -920,16 +920,21 @@ class TTModel:
         # writes st.recurrent in place and returns the output
         out = linear_attn.decode_step(q, k, v, g_exp, beta, st.recurrent)
 
-        out = ttnn.reshape(out, (1, 1, batch * n_v, hd))
-        z_heads = ttnn.reshape(z, (1, 1, batch * n_v, hd))
-        normed = ttnn.rms_norm(
-            out, epsilon=cfg.rms_norm_eps, weight=self.w.blk(layer, "ssm_norm.weight"),
-            compute_kernel_config=HIFI4,
-        )
         # output_gate_type is "sigmoid" for this model, not the silu that
         # hidden_act would imply, and the GGUF does not record the field.
-        gated = ttnn.multiply(normed, ttnn.sigmoid(z_heads))
-        gated = ttnn.reshape(gated, (1, 1, batch, self.value_dim_local))
+        nw = self.w.blk(layer, "ssm_norm.weight")
+        gated = ops.fused_delta_tail(
+            out, z, self._as_dtype(nw, out.dtype, ("ssm_norm", layer)),
+            batch * n_v, hd, cfg.rms_norm_eps, key=("ssm", layer)) if batch == 1 else None
+        if gated is None:
+            out = ttnn.reshape(out, (1, 1, batch * n_v, hd))
+            z_heads = ttnn.reshape(z, (1, 1, batch * n_v, hd))
+            normed = ttnn.rms_norm(
+                out, epsilon=cfg.rms_norm_eps, weight=nw,
+                compute_kernel_config=HIFI4,
+            )
+            gated = ttnn.multiply(normed, ttnn.sigmoid(z_heads))
+            gated = ttnn.reshape(gated, (1, 1, batch, self.value_dim_local))
         # ssm_out is row-sharded on its contraction dim, so each device produces a
         # partial sum -- this is the collective that head-sharding costs.
         out = linear_rows(gated, self.w.blk(layer, "ssm_out.weight"), compute_kernel_config=HIFI4)
