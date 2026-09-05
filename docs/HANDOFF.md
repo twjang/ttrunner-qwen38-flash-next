@@ -5235,3 +5235,65 @@ Against the ~16.5 ms floor this decomposition allows (section 32), the model is
 at 46 %. Against the 7.9 ms that bytes alone suggest, 22 % -- and that number
 does not include the 4.4 ms of collectives or the launch floor, so it was never
 reachable by making the current graph cheaper.
+
+## 36. The multicast, which was the last item over a millisecond
+
+    47.87 -> 34.9 ms a token, median of three; 33.51 best
+    20.9  -> 28.7 tokens a second, 29.8 at the best step
+
+`gather_gemv` read the activation row once **per core** -- 2.1 MB of the 6.9 the
+gate|up projection moves -- and that duplication was what set its core count: the
+sweep's optimum sat where "more cores" and "more copies of the same row" crossed.
+`ttnn`'s matmul multicasts (`mcast_in0=True`); a `generic_op` has to do its own.
+
+    gate|up  35.01 us -> 27.99      down  25.74 -> 20.47
+
+and the optimum moved from four output columns a core to **two**, which is the
+duplication disappearing exactly where the model said it would. The whole feature
+goes from +2.55 to **+3.42 ms** on `ab_step.py`; the multicast is ~0.87 of that.
+Bit-identical, because only *which core reads a tile* changed.
+
+### 36.1 How, and the probe that came first
+
+`ttnn.SemaphoreDescriptor(id, core_ranges, initial_value)` in the
+`ProgramDescriptor`, `get_semaphore(id)` in the kernel, and
+`device.worker_core_from_logical_core` for the rectangle's physical corners. The
+handshake is the standard one: receivers clear their flag and signal the sender,
+the sender waits for the count, multicasts the data, then multicasts the flag.
+The **loopback** forms, because the sender is inside its own destination
+rectangle and the plain form forbids that.
+
+`scripts/kernels/mcast_probe.cpp` is eight cores, one page, checked exact. It was
+written first and on purpose: a wrong `num_dests` hangs the card, and finding
+that out inside a 48-layer model costs a device reset and the run.
+
+INVARIANT 96: a semaphore handshake gets a standalone probe before it goes near
+the model. The failure mode is a hang, not a wrong answer, and a hang has no
+stack trace.
+
+### 36.2 Still not the narrow matmuls
+
+With the multicast in hand the obvious next question is whether `gather_gemv`
+now beats `ttnn.linear` on the shapes that run at a fifth of bandwidth. It does
+not:
+
+    down|inject [2560,352]   linear_rows 12.19 us   gemv+mcast 15.15
+    router      [2560,512]   linear_rows 14.03      gemv+mcast 18.05
+
+identical against float64 in both cases. `ttnn`'s matmul is better tuned for a
+plain GEMV than this kernel is, and the multicast only pays where the *gather*
+is the point.
+
+### 36.3 What is left
+
+    the group norm's two reduction passes -> one   ~0.5   now possible: the
+                                                          semaphore machinery for
+                                                          a cross-core reduction
+                                                          exists
+    the expert weights transposed                  ~0.8   conversion-time
+    the group norm's pass 1 folded into reinject   ~0.6   needs a staleness guard
+    `normed` not materialised                      ~0.28
+    Ring topology                                  ~0.2   changes the numerics
+
+Fifteen changes this session, nine new kernels. Against the ~16.5 ms floor this
+decomposition allows, the model is at **47 %**.
