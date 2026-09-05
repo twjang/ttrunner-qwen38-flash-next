@@ -27,11 +27,15 @@ import os
 
 import ttnn
 
+from . import ops
+
 from .ops import HIFI4
 
 
 _NO_SPLIT_KQ = bool(os.environ.get("TT_NO_SPLIT_KQ"))
 _NO_BCAST_OUTER = bool(os.environ.get("TT_NO_BCAST_OUTER"))
+# The delta rule's tail as one launch a head.
+_NO_FUSED_DELTA_OUT = bool(os.environ.get("TT_NO_FUSED_DELTA_OUT"))
 # One megabyte of state, in tiles of a float32 32x32. Above this, reading it
 # twice costs more than the concat that avoids it.
 _SPLIT_KQ_MAX_TILES = 256
@@ -100,7 +104,18 @@ def decode_step(
         predicted = ttnn.matmul(k, decayed, compute_kernel_config=HIFI4)
         q_decayed = ttnn.matmul(q, decayed, compute_kernel_config=HIFI4)
 
-    delta = ttnn.multiply(ttnn.subtract(v, predicted), beta)
+    # Six ops -- a subtract, two multiplies, a reduction and two more -- in one
+    # launch when the shapes allow. `fused_delta_out` returns both `delta`, which
+    # the state update below still needs, and the step's output.
+    fused = None
+    if not _NO_FUSED_DELTA_OUT:
+        fused = ops.fused_delta_out(v, predicted, beta, q, k, q_decayed,
+                                    v.shape[0], v.shape[-1], key=id(state))
+    if fused is not None:
+        delta, fused_out = fused
+    else:
+        fused_out = None
+        delta = ttnn.multiply(ttnn.subtract(v, predicted), beta)
     # outer product kᵀ delta : [Dk, 1] x [1, Dv]. As a matmul this contracts over
     # a K of **one**, which is the worst shape a matmul has: 21.05 us against
     # 9.37 for the same numbers as a broadcast multiply, which is what an outer
@@ -112,5 +127,7 @@ def decode_step(
     # passes over it (1.23 ms vs 0.75 ms at B=32)
     ttnn.add(decayed, update, output_tensor=state)
 
+    if fused_out is not None:
+        return fused_out
     qk = ttnn.sum(ttnn.multiply(q, k), dim=-1, keepdim=True)          # [BH,1,1,1]
     return ttnn.add(q_decayed, ttnn.multiply(qk, delta))

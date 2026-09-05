@@ -354,6 +354,117 @@ def _rope_program(x, cos, sin, out, nt, nt_rope):
     ], semaphores=[], cbs=cbs)
 
 
+_DOUT_OUT: dict = {}
+_DOUT_FELL_BACK = False
+_NO_FUSED_DELTA_OUT = bool(os.environ.get("TT_NO_FUSED_DELTA_OUT"))
+
+
+def _delta_out_program(ins, delta, out, tph, heads):
+    dev = ins[0].device()
+    grid = dev.compute_with_storage_grid_size()
+    n = max(1, min(heads, grid.x * grid.y))
+    cols = min(n, grid.x)
+    rows = (n + grid.x - 1) // grid.x
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+    cores = [ttnn.CoreCoord(cx, cy) for cy in range(rows) for cx in range(cols)]
+
+    acc = []
+    for t in list(ins) + [delta, out]:
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError("fused delta out: every operand must be interleaved")
+        acc.append(ct)
+    page = acc[0][1]
+    if any(a[1] != page for a in acc):
+        raise RuntimeError("fused delta out: every operand must share a page size")
+
+    work = [((heads * i) // len(cores), (heads * (i + 1)) // len(cores))
+            for i in range(len(cores))]
+    sizes = {0: tph, 1: tph, 2: 2, 3: tph, 4: tph, 5: tph,
+             6: 2, 7: 2, 8: 2 * tph, 9: 2 * tph, 10: 2, 11: 2}
+    cbs = [ttnn.CBDescriptor(
+        total_size=n_ * page, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=ins[0].dtype, page_size=page)])
+        for i, n_ in sizes.items()]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    addrs = [t.buffer_address() for t in ins]
+    read_ct = [tph, page]
+    for a in acc[:6]:
+        read_ct += a
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("delta_out_reader.cpp", read_ct,
+             [addrs + [lo, hi] for lo, hi in work], ttnn.ReaderConfigDescriptor()),
+        kern("delta_out_compute.cpp", [tph], [[lo, hi] for lo, hi in work],
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("delta_out_writer.cpp", [tph] + acc[6] + acc[7],
+             [[delta.buffer_address(), out.buffer_address(), lo, hi]
+              for lo, hi in work], ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def fused_delta_out(v, predicted, beta, q, k, q_decayed, heads, head_dim, key=None):
+    """The delta rule's tail in one launch: `(delta, out)`. Or None.
+
+    Replaces a subtract, two multiplies, a reduction and two more multiplies --
+    six launches a layer on [BH, 1, 1, Dv] tensors -- with one core a head.
+    Written as `out = q_decayed + (qk*beta)*(v - predicted)` so the difference is
+    computed once and `delta` has a single consumer.
+    """
+    global _DOUT_FELL_BACK
+    if _NO_FUSED_DELTA_OUT:
+        return None
+    try:
+        why = None
+        want = [heads, 1, 1, head_dim]
+        for name, t in (("v", v), ("predicted", predicted), ("q", q), ("k", k),
+                        ("q_decayed", q_decayed)):
+            if list(t.shape) != want or t.dtype != v.dtype:
+                why = f"{name} is {list(t.shape)} {t.dtype}, expected {want} {v.dtype}"
+                break
+        if why is None and (list(beta.shape) != [heads, 1, 1, 1] or beta.dtype != v.dtype):
+            why = f"beta is {list(beta.shape)} {beta.dtype}"
+        if why is None and head_dim % _TILE:
+            why = f"head_dim {head_dim} is not a whole number of tiles"
+        if why is not None:
+            if not _DOUT_FELL_BACK:
+                _DOUT_FELL_BACK = True
+                import warnings
+                warnings.warn(f"fused delta out declined, using the ops: {why}",
+                              RuntimeWarning, stacklevel=2)
+            return None
+
+        okey = (key, id(v.device()), heads, head_dim, str(v.dtype))
+        bufs = _DOUT_OUT.get(okey)
+        if bufs is None:
+            bufs = tuple(
+                ttnn.from_torch(torch.zeros(heads, 1, 1, head_dim), dtype=v.dtype,
+                                layout=ttnn.TILE_LAYOUT, device=v.device(),
+                                mesh_mapper=ttnn.ReplicateTensorToMesh(v.device()))
+                for _ in range(2))
+            _DOUT_OUT[okey] = bufs
+        delta, out = bufs
+        ins = [v, predicted, beta, q, k, q_decayed]
+        ttnn.generic_op(ins + [delta, out],
+                        _delta_out_program(ins, delta, out, head_dim // _TILE, heads))
+        return delta, out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _DOUT_FELL_BACK:
+            _DOUT_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused delta out unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 _DTAIL_OUT: dict = {}
 _DTAIL_FELL_BACK = False
 _NO_FUSED_DELTA_TAIL = bool(os.environ.get("TT_NO_FUSED_DELTA_TAIL"))
