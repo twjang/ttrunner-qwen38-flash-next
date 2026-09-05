@@ -4638,3 +4638,80 @@ and was not being used, one circular-buffer size, and four new kernels.
 
 The matmuls are ~9.4 ms and the roofline 7.9. Section 25.1 still describes the
 rest: about 3500 non-linear launches against the ~700 that would reach it.
+
+## 28. The expert gather was the biggest thing left, and it was a copy
+
+The wide expert path gathered the selected experts' weights into a compact tensor
+and multiplied against that. Timed separately on the real weights:
+
+    gather gate|up  40.11 us      matmul gate|up  20.80 us
+    gather down     34.46 us      matmul down     15.68 us
+
+**3.58 ms a token to copy weights the matmul then reads again.** Every selected
+expert's weights crossed DRAM three times -- read by the gather, written by it,
+read by the matmul -- where they need to cross once.
+
+`moe.gather_gemv` reads them through the index instead. It is the k-split GEMV's
+compute kernel unchanged (accumulate `matmul_tiles` over the reduction into one
+destination tile) with a reader that resolves the weight page through the
+selection, the same arithmetic `expert_gather.cpp` already did.
+
+    ab_step.py, four rounds: +2.71 ms (+2.09, +1.23, +2.71, +2.85)
+
+and it is *nearer float64* than gather-then-multiply -- 2.14e-03 against 2.36e-03
+for gate|up -- because the destination register accumulates in fp32. Without
+`fp32_dest_acc_en` the 80-deep reduction in bfloat16 measured 6.4e-02.
+
+### 28.1 Why few cores, and how far it can go
+
+Each core owns a range of output tile columns and reads the activation row
+**once**, keeping it resident in its circular buffer and indexing it by tile
+rather than popping it. So the activation is re-read per *core*, not per column,
+and the core count is a real trade. Swept:
+
+    gate|up   2 cols/core: 52.98 us   4: 41.86   8: 35.94   16: 69.26
+    down      2: 32.00              4: 30.62    8: 49.14   16: 72.79
+
+The shape of that curve says what the limit is. Aggregate bandwidth saturates
+around **190 GB/s** for this access pattern at about thirteen cores, each pulling
+~15 GB/s. Above that, adding cores only adds duplicated activation reads (25
+cores move 8.6 MB where 13 move 6.9); below it, the cores cannot pull enough
+between them. The measured optimum is exactly where those cross.
+
+What is left on the table is the duplication itself: 2.1 MB of the 6.9 is the
+activation read thirteen times. Multicasting it from one core would need
+semaphores in the `ProgramDescriptor` and is worth about 0.9 ms across both
+projections.
+
+Above one row-tile the kernel falls back to the gather, because the activation's
+page layout stops being one page a column. Prefill is untouched.
+
+### 28.2 The matmuls are done
+
+`linear_shape_census.py` after this session: **7.78 ms a token in `ttnn.linear`
+against a 5.23 ms roofline, 67 % of bandwidth** -- the same fraction as before,
+on fewer calls. The four shapes furthest from the roof were swept against
+`ttnn.linear`'s default, five `in0_block_w` settings and `ksplit_linear`:
+
+    [320] x [320,10240]   fast_linear 15.56   best alternative 15.32
+    [2560] x [2560,1280]  fast_linear 14.42   best alternative 16.02
+    [2560] x [2560,512]   fast_linear 13.41   best alternative 11.75
+    [640] x [640,2560]    fast_linear  7.98   best alternative  8.88
+
+`fast_linear`'s config picker is already at or near the best of everything tried,
+and the one shape it loses on is worth 0.04 ms. **The 67 % is the practical
+ceiling for a GEMV at M = 1, not a configuration that has been left unturned.**
+
+One trap in that sweep, worth repeating because it is the day's recurring shape:
+`ksplit_linear` *returned None* for two of the four (its guard needs the split to
+buy two reduction groups, and `110 // nt` is zero when the output is 320 tiles
+wide). The timing loop dutifully measured a function that did nothing and
+reported **2.72 us, a 5.7x win**, which would have been 1.25 ms of imaginary
+saving. Any probe that calls a helper which can decline must assert it did not.
+
+### 28.3 Re-measured and still rejected: the alpha|beta k-split
+
+`_NO_AB_KSPLIT` was set from a cross-process comparison whose noise (~1 ms) was
+larger than the effect it was deciding. Re-run on `ab_step.py`, four rounds: the
+k-split is **0.57 ms slower** (-0.56, -0.70, -0.56, -0.66). The original call was
+right; it is now right for a reason that can be checked.
