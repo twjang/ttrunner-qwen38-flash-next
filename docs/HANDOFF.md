@@ -5653,6 +5653,18 @@ produced two wrong readings in this bisection before it was noticed. Kill by
 explicit PID (never `pkill -f`, which matches the shell running it and takes the
 whole command with it) and `tt-smi -r` between cases.
 
+INVARIANT 106: the fold's hang survives an `noc_async_atomic_barrier()` after
+the non-gatherer's `noc_semaphore_inc` -- which is a real latent defect worth
+keeping (every other `noc_semaphore_inc` in this project is followed by a
+`noc_semaphore_wait` that flushes it; this was the one place followed by nothing)
+but is not the cause. Three device cycles have now gone into a 0.35 ms item.
+Stop.
+
+INVARIANT 107: `step_n` at k > 1 no longer runs -- k = 2, 4 and 8 all raise
+(a copy op's shape check, then `tensor_apis.cpp:160`). The occupancy fit at
+handoff 2617, `t ~= 82.7 + 12.37k`, is therefore unrepeatable until that path is
+repaired, and it is the largest lever this project ever measured.
+
 INVARIANT 103: `TT_METAL_WATCHER` is not available here. It attaches, then
 throws out of `poll_watcher_data` and aborts the process. Hangs have to be
 bisected, not inspected.
@@ -5678,11 +5690,21 @@ attn out [2560,1312] 17.47 against 14.77); the two that would gain -- qsa
 [2560,512] bf8 and the indexer [2560,128] -- are 0.07 ms together with the fold
 off, which is under this rig's noise.
 
-INVARIANT 104: `pack_tile` into a **Float32** circular buffer hangs the packer
-here. Four cases, one clean run each: float32 partials hang with and without the
-hardware startup redone before the following SFPU window; activation-dtype
-partials run either way. The "SFPU window after a matmul window" theory that
-this was bisected to test was wrong.
+INVARIANT 104 (corrected): a `generic_op` **can** write a float32 tensor. A
+110-core kernel that copies 320 float32 tiles through the compute engine and
+writes them back runs with `fp32_dest_acc_en` either way (`f32probe.py`):
+
+    bf16, acc off   OK, 0.000e+00
+    f32,  acc off   OK, 1.953e-03      (bfloat16 rounding in the destination)
+    f32,  acc on    OK, 2.441e-04
+
+What was measured on the k-split is narrower than "float32 CBs hang": with the
+partial CB at Float32 the fold hangs, with it at the activation's dtype it runs,
+holding everything else fixed. So the interaction is between that **CB's format
+and something else in that kernel** -- the matmul window before it, the
+cross-core write into it, or its size -- and not a blanket rule. Do not use it
+to rule out a float32 output; the DeltaNet state update needs one and is not
+blocked.
 
 INVARIANT 105: the dev harnesses took ttnn's **default** trace region while
 `TTEngine` always passes 128 MB. A change that adds programs to the capture

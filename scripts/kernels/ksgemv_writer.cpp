@@ -61,6 +61,12 @@ void kernel_main() {
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(SEM_ID));
     if (!is_gatherer) {
         noc_semaphore_inc(get_noc_addr(gx, gy, (uint32_t)get_semaphore(SEM_ID)), 1);
+        // The increment is a **posted** atomic and this is the only place in
+        // this project where one is followed by nothing at all -- every other
+        // `noc_semaphore_inc` here is followed by a `noc_semaphore_wait`, which
+        // flushes it. The gatherer spins on exact equality, so one increment
+        // that never lands hangs it for ever.
+        noc_async_atomic_barrier();
         return;
     }
     noc_semaphore_wait(sem, g_count - 1);
