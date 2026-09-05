@@ -5811,3 +5811,107 @@ be bisected. Bisect the **kernel**, one construct at a time, against a control
 that is known to run -- not the surrounding code. Four hypotheses about the
 surroundings cost four cycles; one bisection of the kernel itself gave the rule
 in three.
+
+## 44. Batch 1 is the deliverable, and the roofline recomputed from the cache
+
+The user ruled on the question section 43 left open: **batch 1, always.** Not as
+a benchmarking convention -- because batch-1 latency *is* the decode user
+experience. Multi-row `step_n` decoding is therefore off the table as a way to
+reach the target, and every number below is one token, one sequence.
+
+(`step_n` itself still has to work -- a speculative verifier needs it -- so its
+k > 1 regression, invariant 107, remains a bug to fix. It is maintenance, not a
+route to the goal.)
+
+### 44.1 The residency inventory, from the files rather than from a plan
+
+Section 5.2 derived 3.645 GB/device/token from `plan.py`'s rules. Several
+tensors have been re-sharded since, so here it is re-derived from what is
+actually on disk -- `~/models/qwen38-tt-cache`, where a `.devN` suffix means the
+tensor is split four ways and its absence means every device holds a full copy.
+
+Per device per token, counting only what a decode step reads:
+
+| class | MB | note |
+|---|--:|---|
+| replicated dense | ~1690 | every device reads the same bytes |
+| sharded dense | ~1050 | `attn_qkv` 451, `ssm_out` 150, `attn_gate` 150, lm head 169, hc `down` 84, conv/scalars 45 |
+| routed experts | ~430 | top-10 of 512, `gateup` + `down`, sharded |
+| **total** | **~3170** | **8.2 ms at 388 GB/s -- 122 tok/s** |
+
+The replicated 1.69 GB, itemised, because it is the half with structure:
+`attn_q` 401, hc `up` 334, hc `norm`+`inject` 252 (float32), shared expert 266,
+`attn_output` 201, router 126 (bfloat16 -- the float32 copy is cast once and
+cached, so the stored 252 is not read), indexer 39, PLE 40, norms ~5.
+
+So **the target is just inside the byte roofline and nowhere near it in
+practice**: 127 tok/s is 7.9 ms against 8.2 ms of bytes at full bandwidth. It
+cannot be reached by moving bytes faster alone; it needs the replicated half cut
+down as well. That is the first honest statement of the goal's shape.
+
+### 44.2 What the 32 ms is actually made of
+
+Three of the four terms are now measured rather than modelled:
+
+    launches     ~2.0 ms   2686 x 0.8 us  (invariant 101, measured)
+    collectives  ~3.4 ms   181 calls      (section 31, measured)
+    weight bytes  ~8.2 ms  at 388 GB/s    (44.1, from the files)
+    ----------------------------------------------------------------
+    accounted    ~13.6 ms          against 32.08 measured
+    remainder    ~18.5 ms
+
+**The remainder is the GEMVs running below bandwidth**, which is invariant 38
+restated as a budget: at M = 1 `ttnn.linear` gives each output tile to one core,
+so a matmul whose output is `nt` tiles uses `nt` of the 110 cores and gets `nt/110`
+of the bandwidth. Every narrow-output weight in the model pays this.
+
+This is the single largest term in the step and it is not launches, not
+collectives, and not the number of bytes. It is *which cores read them*.
+
+### 44.3 Retracted: "0.5-0.9 ms of kernel headroom remains"
+
+Section 43 closed with that estimate and it was wrong. It was the sum of four
+leads that had been investigated, presented as though it bounded the whole
+model -- but the four leads did not include the largest component. DeltaNet is
+9.47 ms against ~2.1 ms of weight bytes, a 7.4 ms gap, and nothing in that
+estimate had looked at it.
+
+INVARIANT 110: a headroom figure is only a bound over the ground it has covered.
+Before quoting one, name the components it did **not** examine. The ceiling in
+43 was arithmetic over four leads and was quoted as a ceiling over the model.
+
+### 44.4 The DeltaNet's cheap thirds
+
+Ablating one piece of the linear-attention step at a time, against a 32.27 ms
+baseline (medians of 21 traced steps, run-to-run spread ~0.5 ms):
+
+| stubbed out | median | vs baseline |
+|---|--:|--:|
+| baseline | 32.27 | -- |
+| the causal convolution | 32.87 | +0.60 |
+| the q/k/v head split | 33.04 | +0.77 |
+
+Both measure *slower* than the baseline, which is the rig saying **zero** with a
+±0.5 ms hand: `_causal_conv_step` and `fused_qkv_heads` are already single-launch
+kernels and cost nothing worth chasing. DeltaNet's 9.47 ms is in the
+projections, the recurrence, the tail, or its 36 all-reduces -- not here.
+
+INVARIANT 111: this ablation rig resolves ~0.5 ms. A result inside that is not a
+small effect, it is no effect; do not report it as a saving or a regression.
+
+### 44.5 The trace capture wedges on two runs in five
+
+Independently of any change, `TracedDecoder`'s capture hangs on roughly 40 % of
+runs, always at exactly the same point -- the log stops after
+
+    Allocating device buffers is unsafe due to the existence of an active trace
+
+at a byte count identical across every hung run (6467 in these logs, against
+~10200 for one that finishes). It is not a stub, not a kernel, and not a code
+change: two consecutive baseline runs a minute apart went one each way.
+
+INVARIANT 112: a device harness needs **retries**, not a card reset before every
+run. Reset only after a run that actually failed, and take a configuration's
+result from the first of three tries that produces one. Treating a hang as a
+data point costs a bisection its meaning -- section 43's first DeltaNet sweep
+lost four cumulative configurations to one hang in the middle of it.

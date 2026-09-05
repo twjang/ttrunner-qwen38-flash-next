@@ -740,6 +740,14 @@ class TTModel:
         # the projection already produces, so it needs no permute either side.
         rows = x_col.shape[-1] != 1
         shape = (1, batch, 1, channels) if rows else (1, batch, channels, 1)
+        # A caller that pre-allocates the ring has to agree with what this
+        # derives from `x_col`, because the write-back below copies into it.
+        # `step_n` did not, and the mismatch surfaced as a copy between
+        # [1,1,C,1] and [1,1,1,C] rather than as anything that named the ring.
+        if state is not None and (state[0].shape[-1] != 1) != rows:
+            raise RuntimeError(
+                f"conv ring is {list(state[0].shape)} but this step's input "
+                f"{list(x_col.shape)} wants {'rows' if rows else 'columns'}")
         if state is None:
             state = [
                 ttnn.zeros(shape, dtype=ttnn.bfloat16,
@@ -886,7 +894,11 @@ class TTModel:
         ab = self._fused_pair(layer, "ssm_alpha.weight", "ssm_beta.weight")
         # Three output tiles, the narrowest in the model after the fusion above,
         # so the grid affords more reduction groups here than anywhere else.
-        both_ab = None if _NO_AB_KSPLIT else ksplit_linear(mixed, ab)
+        both_ab = None
+        if ops._KSG_WIDE:
+            both_ab = ops.ksgemv(mixed, ab, key=("ssm_ab", layer))
+        if both_ab is None and not _NO_AB_KSPLIT:
+            both_ab = ksplit_linear(mixed, ab)
         if both_ab is None:
             both_ab = linear_rows(mixed, ab, compute_kernel_config=HIFI4)
         half = both_ab.shape[-1] // 2
@@ -1533,16 +1545,18 @@ class TTModel:
             if st.conv is None:
                 # `_causal_conv_step` would make this on its first call, but the
                 # history has to be captured *before* the loop touches it.
+                # **Columns**, not the row form `_NO_ROW_CONV` selects for the
+                # single-token path: `qkv_col` above is [1, k, C, 1], so that is
+                # what `_causal_conv_step` derives its layout from and writes
+                # back. Branching on the flag here made the two disagree, and the
+                # write-back was then a copy between [1,1,C,1] and [1,1,1,C].
                 st.conv = [
-                    ttnn.zeros((1, 1, 1, self.conv_dim_local) if not _NO_ROW_CONV
-                               else (1, 1, self.conv_dim_local, 1),
+                    ttnn.zeros((1, 1, self.conv_dim_local, 1),
                                dtype=ttnn.bfloat16,
                                layout=ttnn.TILE_LAYOUT, device=self.mesh)
                     for _ in range(depth)
                 ]
             prior = [
-                ops.reshape_to(st.conv[d], (1, 1, 1, self.conv_dim_local))
-                if not _NO_ROW_CONV else
                 ttnn.reshape(ttnn.transpose(st.conv[d], -2, -1),
                              (1, 1, 1, self.conv_dim_local))
                 for d in range(depth - 1, -1, -1)          # oldest first

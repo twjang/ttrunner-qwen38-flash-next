@@ -1982,6 +1982,14 @@ _KSG_NOMCAST = bool(os.environ.get("TT_KSG_NOMCAST"))
 # first. Whatever the interaction is, it is not the fold's own handshake, and
 # 0.35 ms did not justify more 25-minute cycles to find it.
 _KSG_FOLD = os.environ.get("TT_KSG_FOLD", "0") == "1"
+# `ksplit_linear` and `ksgemv` split the same reduction; the difference is that
+# `ksgemv` has the group's head **multicast** the activation while `ksplit_linear`
+# leaves every core to read it. At M = 1 that is not a detail -- a group of
+# sixteen cores each reading the same 80-tile activation moves as many bytes as
+# the weight slice they are there to multiply. This flag moves the three
+# remaining `ksplit_linear`/`fast_linear` call sites (the MoE router, the shared
+# expert's gate|up, and ssm_alpha|beta) onto `ksgemv`. Off until measured.
+_KSG_WIDE = os.environ.get("TT_KSG_WIDE", "0") == "1"
 _KSG_SEM = int(os.environ.get("TT_KSG_SEM", "2"))
 _KSG_ROWS = int(os.environ.get("TT_KSG_ROWS", "0"))
 

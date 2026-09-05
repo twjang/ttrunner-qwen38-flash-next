@@ -24,7 +24,8 @@ from pathlib import Path
 import torch
 import ttnn
 
-from .ops import HIFI4, fast_linear, ksplit_linear, output_tiles as ops_output_tiles
+from .ops import (HIFI4, _KSG_WIDE, fast_linear, ksgemv, ksplit_linear,
+                   output_tiles as ops_output_tiles)
 
 TILE = 32
 _MM1D = ttnn._ttnn.operations.matmul.MatmulMultiCoreReuseMultiCast1DProgramConfig
@@ -194,7 +195,9 @@ def moe_block(
     # reduction groups -- measured 1.49x and more accurate than `ttnn.linear`
     # (invariant 57). Six is about where the split starts paying; the guard in
     # `ksplit_linear` declines anything narrower in groups than that pays for.
-    logits = ksplit_linear(x, router_w)
+    logits = ksgemv(x, router_w, key=("router", id(router_w))) if _KSG_WIDE else None
+    if logits is None:
+        logits = ksplit_linear(x, router_w)
     if logits is None:
         logits = fast_linear(x, router_w, compute_kernel_config=HIFI4)
     probs = ttnn.softmax(logits, dim=-1, compute_kernel_config=HIFI4)
@@ -997,7 +1000,12 @@ def shared_expert(
                          else ttnn.typecast(gv, gate_w.dtype))
         fused = ttnn.concat(parts, dim=-1)
         _SHEXP_GU[key] = fused
-    both = fast_linear(x, fused, compute_kernel_config=HIFI4)
+    # [2560, 1312] is forty-one output tiles, so `fast_linear` runs it on
+    # forty-one of a hundred and ten cores. The k-split affords two reduction
+    # groups of forty-four, which is the whole grid.
+    both = ksgemv(x, fused, key=("shexp_gu", id(fused))) if _KSG_WIDE else None
+    if both is None:
+        both = fast_linear(x, fused, compute_kernel_config=HIFI4)
     n = gate_w.shape[-1]
     e, mrows = both.shape[1], both.shape[2]
     # The same fusion `expert_ffn` has used since stage 3, which this path never
