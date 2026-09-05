@@ -6404,6 +6404,43 @@ costs stability and returns nothing measurable, so the k-split is **done** as a
 lever -- 45.8's table is an isolated-timing artifact, not 1.65 ms of headroom.
 Reopen it only if the program-count instability above is understood.
 
+### 45.15 Rejected: `TT_GG_COLS=1` -- and it is the third sighting of one bug
+
+`gather_gemv` ships `cols_per_core=2` and 1 had never been swept, only 2 against
+the pre-multicast cap. It halves `n`, so cols = 1 doubles the cores on both wide
+expert GEMVs. Measured against a **0-of-8** base rate:
+
+    TT_GG_COLS=2 (shipped)  32.68 ms, finished first try
+    TT_GG_COLS=1            HUNG, HUNG, HUNG
+
+Three of three where the unchanged configuration finishes every time. Rejected --
+and the reason it is rejected is the interesting part. Its core geometry:
+
+| setting | gate\|up | down |
+|---|---|---|
+| cols = 2 (shipped) | 50 cores in an 11x5 rectangle, **5 idle** | 40 in 11x4, **4 idle** |
+| cols = 1 | 100 cores in an 11x10 rectangle, **10 idle** | 80 in 11x8, **8 idle** |
+
+**Twice the idle cores, and it hangs.** That is 45.10's mechanism appearing in a
+*different kernel*, found empirically rather than by reading this one -- and it
+is the third sighting, after the `ksgemv` sites and `_KSG_FOLD`. Every
+configuration this project ships is one with few or no idle cores, which is why
+none of them has ever shown it.
+
+INVARIANT 130: the recurring hang in this project's `generic_op` kernels tracks
+the number of cores in the program that have **no work**. `ksgemv` proves the
+mechanism by inspection -- an idle core's zeroed runtime args make it signal the
+semaphore at (0, 0) -- and `gather_gemv` reproduces the correlation
+independently. Suspect it first in any kernel whose cores signal each other.
+
+That promotes the fix 45.10 wanted and got wrong. **One whole-grid core range,
+plus an explicit "not in any group" runtime flag and an early return in the
+kernels.** Not a range per group -- tt-metal allocates CBs and semaphores per
+range and that broke the shipped path (cd0b727). Done properly it would unlock,
+in one change: the shared expert's k-split, ssm_alpha\|beta's, the stability of
+the other k-split sites, `TT_GG_COLS=1`, and probably `_KSG_FOLD`, which has been
+unexplained since 42.1.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
@@ -6430,16 +6467,15 @@ finishes **8 times out of 8**. Measurement is cheap; it was the cards.
 
 What is left, with what each is actually worth:
 
-1. **`TT_GG_COLS=1`**, still unmeasured and the only untried item with a real
-   mechanism. `gather_gemv` passes `cols_per_core=2` and 1 was never swept, only
-   2 against the pre-multicast cap. It halves `n`, so cols = 1 doubles the cores
-   on both wide expert GEMVs -- 50 -> 100 and 44 -> 80 of 110. The MoE is 5.17 ms
-   and these are its two largest kernels.
-2. **The `ksgemv` program-count instability**, as a *correctness* item rather
-   than a performance one. Adding call sites destabilises the traced step in
-   proportion to the programs added (45.14's table) and nobody knows why. It
-   caps how far any future generic_op work can go, and the idle-core defect of
-   45.10 is a real bug sitting inside the same kernel whether or not it is this.
+1. **The idle-core defect, fixed properly** -- invariant 130. One whole-grid
+   core range, an explicit "not in any group" runtime flag, an early return in
+   the kernels. It is the single change that unlocks the most: the shared
+   expert's k-split, ssm_alpha|beta's, the stability of the other k-split sites,
+   `TT_GG_COLS=1`, and probably `_KSG_FOLD`. Three independent sightings now
+   (45.10, 45.14, 45.15) and a mechanism read from the source.
+2. **`TT_GG_COLS=1` re-run afterwards.** It is rejected today (hangs 3/3) but it
+   doubles the cores on the MoE's two largest kernels inside a 5.17 ms
+   component, and 1 is only unsafe because of the defect above.
 3. **The fabric all-reduce**, 0.6-1.3 ms and a hard build -- but 45.5 already
    took the cheap half of the same idea for -0.45 ms with no kernel, so what is
    left is the 4x gather the composite path pays and nothing else.
