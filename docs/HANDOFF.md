@@ -6363,6 +6363,47 @@ constant. Re-measure the base rate in the same session before quoting a run of
 failures as proof, or the same four hangs mean 2.6 % or 24 % depending on a
 number nobody checked.
 
+### 45.14 The base rate is **zero**, and the k-split sites buy nothing in model
+
+Eight plain baseline runs, no retries, clean cards:
+
+    32.55  32.29  31.36  31.53  32.80  32.94  32.67  33.01
+    RATE plain baseline: 8 finished, 0 hung, of 8
+
+**Not 40 %. Zero.** So 44.5's "the capture wedges on two runs in five" and
+invariant 112 describe a *degraded machine*, not this system: the failed
+`tt-smi -r` resets (45.11) had left the cards in that state for much of the
+session, and a clean reset with nothing holding `/dev/tenstorrent/*` restored
+them. 45.11's mechanism was right after all -- it was only wrong about the five
+hangs that immediately followed the per-group core-range change, which were mine.
+
+That makes every hang with a site enabled meaningful again:
+
+| sites on | ksgemv programs added | hangs before a finish |
+|---|--:|---|
+| none (hc_down only) | 0 | **0 of 8** |
+| `router` | 48 | 0 |
+| `qkv` | 24 | 1 |
+| `indexer` | 24 | 3 |
+| `router,qkv` | 72 | 2 |
+| `router,qkv,indexer` | 96 | **4 of 4, never finished** |
+
+Against a base rate of zero, that is a real effect and it scales with the number
+of `ksgemv` programs in the capture. The idle-core semaphore bug (45.10) is a
+genuine defect but it is **not** this: `router`, `qkv` and `indexer` all cover
+the full grid under the restored guard and they still destabilise the step.
+
+**And the sites buy nothing.** Their in-model medians -- router 32.94, qkv 32.47,
+indexer 32.40, router+qkv 33.25 -- all sit inside the baseline's own 31.36-33.01
+spread. The census's 2.39 ms isolated does not survive contact with the model,
+which is invariant 89 doing exactly what it says: an isolated trace over-prices a
+small op chain by two to four times, and what is left here is nothing.
+
+INVARIANT 129: `ksgemv`'s cost is already paid where it ships. Adding call sites
+costs stability and returns nothing measurable, so the k-split is **done** as a
+lever -- 45.8's table is an isolated-timing artifact, not 1.65 ms of headroom.
+Reopen it only if the program-count instability above is understood.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
