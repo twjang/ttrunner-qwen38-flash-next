@@ -5660,10 +5660,36 @@ keeping (every other `noc_semaphore_inc` in this project is followed by a
 but is not the cause. Three device cycles have now gone into a 0.35 ms item.
 Stop.
 
-INVARIANT 107: `step_n` at k > 1 no longer runs -- k = 2, 4 and 8 all raise
-(a copy op's shape check, then `tensor_apis.cpp:160`). The occupancy fit at
-handoff 2617, `t ~= 82.7 + 12.37k`, is therefore unrepeatable until that path is
-repaired, and it is the largest lever this project ever measured.
+INVARIANT 107: `step_n` at k > 1 no longer runs -- k = 2, 4 and 8 all raise.
+The occupancy fit at handoff 2617, `t ~= 82.7 + 12.37k`, is therefore
+unrepeatable until that path is repaired, and it is the largest lever this
+project ever measured (95 -> 22.71 ms a token at k = 8).
+
+Diagnosed, not fixed. At k = 2:
+
+    TT_FATAL: Input tensor shape Shape([1, 1, 4608, 1]) does not match output
+              tensor shape Shape([1, 1, 1, 4608])          (copy_device_operation)
+
+4608 is `conv_dim_local`, and the two shapes are the conv window's **column** and
+**row** layouts. The row-major conv (section 38, `_NO_ROW_CONV`) left the layout
+with two sources of truth:
+
+* `model.py:1537` allocates `st.conv` from the flag -- `(1,1,1,C)` when the row
+  conv is on, `(1,1,C,1)` when it is off;
+* `_causal_conv_step` derives its own layout from its **input**,
+  `rows = x_col.shape[-1] != 1` (model.py:719+), and writes the new window back
+  in whichever orientation that gives.
+
+At k = 1 the two always agree. On the `accept is not None` path they need not,
+and the write-back is then a copy between a `[1,1,C,1]` and a `[1,1,1,C]`. The
+`fresh = ttnn.reshape(ttnn.transpose(qkv_col, -2, -1), ...)` at model.py:1550
+has the same assumption baked in the other way.
+
+The fix is one source of truth -- derive the layout in `_causal_conv_step` from
+`state`'s own shape rather than from the input, so the state decides and the
+callers cannot disagree with it. k = 4 and 8 fail differently and later
+(`tensor_apis.cpp:160`, a host tensor of the wrong shape in `_fill_inputs`), so
+expect a second one behind this.
 
 INVARIANT 103: `TT_METAL_WATCHER` is not available here. It attaches, then
 throws out of `poll_watcher_data` and aborts the process. Hangs have to be
