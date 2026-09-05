@@ -775,6 +775,99 @@ def _gnorm_programs(x, w, part, scale, out, local, devid, nt_g, groups, recip, e
     return prog_a, prog_b
 
 
+# Rows of the core grid one group owns in the single-launch form. A group's
+# cores must be a rectangle for the scale multicast, and whole grid rows are the
+# rectangle that needs no bookkeeping. Two rows a group over four groups is 88 of
+# 110 cores, ~4 tiles each and a 22-tile fold.
+_GNORM1_ROWS = int(os.environ.get("TT_GNORM1_ROWS", "2"))
+_NO_GNORM1 = bool(os.environ.get("TT_NO_GNORM1"))
+
+
+def _gnorm1_program(x, w, out, local, devid, nt_g, groups, recip, eps):
+    """The whole grouped norm in ONE launch.
+
+    Two launches existed because pass 3 cannot start until pass 1 has written the
+    scale -- which, inside one launch, a semaphore says just as well. Each core
+    owns a run of tiles from exactly one group and reads them **once**: they stay
+    in L1 across both phases, so the stream crosses DRAM once instead of twice.
+    """
+    dev = x.device()
+    grid = dev.compute_with_storage_grid_size()
+    if grid.y // groups < 1:
+        raise RuntimeError(f"single-launch group norm: {groups} groups over "
+                           f"{grid.y} grid rows")
+    rows = max(1, min(_GNORM1_ROWS, grid.y // groups))
+    while rows > 1 and rows * grid.x > nt_g:
+        rows -= 1
+    cpg = rows * grid.x                       # cores a group, all of them active
+    if cpg > nt_g:
+        raise RuntimeError(f"single-launch group norm: {cpg} cores over {nt_g} tiles")
+
+    acc = {}
+    for tag, t in (("x", x), ("w", w), ("o", out), ("l", local), ("d", devid)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"single-launch group norm: {tag} must be interleaved")
+        acc[tag] = ct
+    page = acc["x"][1]
+    for tag in ("w", "o", "l"):
+        if acc[tag][1] != page:
+            raise RuntimeError("single-launch group norm: one page size for the tiles")
+
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, groups * rows - 1))])
+    d0 = dev.get_devices()[0] if hasattr(dev, "get_devices") else dev
+
+    cores, r_args, c_args, w_args, cap = [], [], [], [], 0
+    for g in range(groups):
+        y0, y1 = g * rows, g * rows + rows - 1
+        p0 = d0.worker_core_from_logical_core(ttnn.CoreCoord(0, y0))
+        p1 = d0.worker_core_from_logical_core(ttnn.CoreCoord(grid.x - 1, y1))
+        gp = d0.worker_core_from_logical_core(ttnn.CoreCoord(0, y0))
+        for j in range(cpg):
+            cy, cx = divmod(j, grid.x)
+            cores.append(ttnn.CoreCoord(cx, y0 + cy))
+            lo = g * nt_g + (nt_g * j) // cpg
+            hi = g * nt_g + (nt_g * (j + 1)) // cpg
+            cap = max(cap, hi - lo)
+            r_args.append([x.buffer_address(), w.buffer_address(), lo, hi - lo,
+                           cpg, int(j == 0), gp.x, gp.y,
+                           p0.x, p0.y, p1.x, p1.y, j])
+            c_args.append([hi - lo, int(j == 0), cpg])
+            w_args.append([out.buffer_address(), local.buffer_address(),
+                           devid.buffer_address(), lo, hi - lo, g])
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    # index 4 is the scale: **one** page, so its address is the same on every
+    # core and stable across the push -- which is what the multicast targets.
+    cbs = [ttnn.CBDescriptor(
+        total_size=n * page, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=x.dtype, page_size=page)])
+        for i, n in ((0, cap), (1, cap), (2, 1), (3, cpg), (4, 1), (5, 2), (6, 2),
+                     (8, 1))]
+    cbs.append(ttnn.CBDescriptor(
+        total_size=64 * ((acc["d"][1] + 64 + 63) // 64), core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=7, data_format=ttnn.uint32, page_size=64)]))
+
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("gnorm1_reader.cpp", [page, cpg] + acc["x"] + acc["w"], r_args,
+             ttnn.ReaderConfigDescriptor()),
+        kern("gnorm1_compute.cpp", [recip, eps], c_args,
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("gnorm1_writer.cpp", [nt_g, 1] + acc["o"] + acc["l"] + acc["d"],
+             w_args, ttnn.WriterConfigDescriptor()),
+    ], semaphores=[ttnn.SemaphoreDescriptor(id=i, core_ranges=crs, initial_value=0)
+                   for i in (0, 1)], cbs=cbs)
+
+
 def fused_group_norm(x, weight, eps: float, group_size: int, groups: int, key=None):
     """`grouped_rms_norm` and `mesh_partition` in two launches. Or None.
 
@@ -824,6 +917,12 @@ def fused_group_norm(x, weight, eps: float, group_size: int, groups: int, key=No
         part, scale, out, local = bufs
         devid = _gnorm_devid(dev)
         bits = lambda f: struct.unpack("<I", struct.pack("<f", float(f)))[0]  # noqa: E731
+        if not _NO_GNORM1:
+            p1 = _gnorm1_program(x, weight, out, local, devid,
+                                 group_size // _TILE, groups,
+                                 bits(1.0 / group_size), bits(eps))
+            ttnn.generic_op([x, weight, out, local, devid], p1)
+            return out, local
         pa, pb = _gnorm_programs(x, weight, part, scale, out, local, devid,
                                  group_size // _TILE, groups,
                                  bits(1.0 / group_size), bits(eps), _GNORM_PARTS)
