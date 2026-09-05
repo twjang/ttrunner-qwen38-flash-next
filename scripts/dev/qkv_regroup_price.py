@@ -27,9 +27,16 @@ from ttrunner_qwen38_flash_next.tt.ops import HIFI4, fast_linear     # noqa: E40
 LAYERS = 36
 REPS = 200
 SHAPES = [
-    (2560, 4608, "today: q|k stored three times over"),
-    (2560, 2560, "regrouped: q|k once"),
+    (2560, 4608, "attn_qkv today: q|k stored three times over"),
+    (2560, 2560, "attn_qkv regrouped: q|k once"),
     (2560, 1536, "attn_gate, for scale"),
+    # The same question for the shared expert, whose sharding is committed but
+    # not yet reconverted: does a quarter of the bytes buy a quarter of the time,
+    # or does the narrower output just empty the grid?
+    (2560, 1312, "shexp gate|up replicated"),
+    (2560, 352, "shexp gate|up column-sharded"),
+    (640, 2560, "shexp down replicated"),
+    (160, 2560, "shexp down row-sharded"),
 ]
 
 
@@ -37,28 +44,44 @@ def main() -> None:
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
     mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 4))
     try:
-        x = ttnn.from_torch(
-            torch.randn(1, 1, 1, 2560), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+        xs = {}
+        def act(k):
+            if k not in xs:
+                xs[k] = ttnn.from_torch(
+                    torch.randn(1, 1, 1, k), dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT, device=mesh,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+            return xs[k]
+
         out = {}
         for k, n, label in SHAPES:
+            x = act(k)
             w = ttnn.from_torch(
                 torch.randn(1, 1, k, n), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT,
                 device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
             for _ in range(10):                       # compile + warm
                 fast_linear(x, w, compute_kernel_config=HIFI4)
             ttnn.synchronize_device(mesh)
-            ts = []
-            for _ in range(REPS):
-                t0 = time.perf_counter()
-                fast_linear(x, w, compute_kernel_config=HIFI4)
+            # A sync per call measures the sync: all three shapes came back at
+            # ~129 us and 0.1 GB/s, which is `synchronize_device`, not the
+            # matmul. Issue a run of calls and sync once, then divide.
+            batches = []
+            for _ in range(9):
                 ttnn.synchronize_device(mesh)
-                ts.append(1e6 * (time.perf_counter() - t0))
-            ts.sort()
-            us = ts[len(ts) // 2]
+                t0 = time.perf_counter()
+                for _ in range(REPS):
+                    fast_linear(x, w, compute_kernel_config=HIFI4)
+                ttnn.synchronize_device(mesh)
+                batches.append(1e6 * (time.perf_counter() - t0) / REPS)
+            batches.sort()
+            us = batches[len(batches) // 2]
             mb = k * n * 1.0625 / 1e6
+            # `fast_linear` is nearly flat in N here -- 12.53 MB and 0.96 MB
+            # cost the same 30-36 us -- so the bound is the K loop, not bytes.
+            # `ksgemv` splits that loop across cores, which is the only thing
+            # that changes it. Time both.
             print(f"RESULT [{k:5d},{n:5d}] {us:7.2f} us  {mb:6.2f} MB  "
-                  f"{mb / us * 1e6 / 1e9 * 1e3:6.1f} GB/s  {label}", flush=True)
+                  f"{mb / us * 1e6 / 1e3:5.0f} GB/s  {label}", flush=True)
             out[(k, n)] = us
         gain = out[(2560, 4608)] - out[(2560, 2560)]
         print(f"RESULT regroup saves {gain:.2f} us a call, "

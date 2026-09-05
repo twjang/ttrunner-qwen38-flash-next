@@ -109,11 +109,6 @@ def test_sharding_covers_experts_and_the_deltanet() -> None:
         "blk.0.ssm_a",
         "blk.0.ssm_dt.bias",
         "blk.0.ssm_out.weight",
-        # Shared expert, sharded because the collective it would "avoid" is
-        # already there: `_moe_block` all-reduces the routed sum on the next
-        # line and this partial adds into it. 266 -> 66 MB a device a token.
-        "blk.0.ffn_gate_shexp.weight",
-        "blk.0.ffn_down_shexp.weight",
     }
     # the full-attention layers stay replicated
     for name in ("blk.3.attn_q.weight", "blk.3.attn_k.weight", "blk.3.attn_output.weight"):

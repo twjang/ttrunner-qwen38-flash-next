@@ -6089,6 +6089,54 @@ actually threatened.
 
 **On by default**; `TT_NO_AR_COMPOSITE` restores the native path.
 
+### 45.7 Retracted: bytes do not convert to time at M = 1
+
+45 argued that the remaining road is byte reduction, on the strength of the
+roofline in 44.1. Measured directly, that is wrong, and the measurement is
+cheap enough that it should have come first (`qkv_regroup_price.py`, one mesh,
+random weights, no model):
+
+| shape | us | MB | GB/s |
+|---|--:|--:|--:|
+| `attn_qkv` today [2560, 4608] | 36.84 | 12.53 | 340 |
+| `attn_qkv` regrouped [2560, 2560] | 34.64 | 6.96 | 201 |
+| `attn_gate` [2560, 1536] | 30.77 | 4.18 | 136 |
+| shexp gate\|up replicated [2560, 1312] | 30.79 | 3.57 | 116 |
+| shexp gate\|up sharded [2560, 352] | 29.54 | 0.96 | 32 |
+| shexp down replicated [640, 2560] | 32.08 | 1.74 | 54 |
+| shexp down sharded [160, 2560] | **38.23** | 0.44 | 11 |
+
+**A thirteenfold cut in bytes buys 20 % of the time, and one of these shards is
+slower than the tensor it replaces.** `fast_linear` at M = 1 has a floor around
+30 us and only the very largest shape is anywhere near bandwidth. Sharding a
+weight narrows it, and a narrower shape sits further down invariant 38's curve,
+so the byte saving is spent on the efficiency it costs.
+
+Two consequences, both retractions of things written earlier in this session:
+
+* **The `attn_qkv` v-head regroup is dead.** 2.20 us a call, 0.079 ms a token
+  before invariant 89's 2-4x discount -- against a re-conversion of six tensor
+  families and a kernel guard, with a silent mis-permutation as the failure
+  mode. 45.1 estimated 0.45 ms; the measurement says a tenth of that. Do not
+  spend it.
+* **Sharding the shared expert loses.** gate\|up saves 1.25 us and `down` costs
+  6.15, for +4.9 us a layer and **+0.24 ms a token**. plan.py is reverted; the
+  adaptive `_shexp_is_sharded` code stays, since it is correct either way and
+  costs nothing. The verified 0.4 ms finding was arithmetic on bytes, and bytes
+  are not the currency.
+
+INVARIANT 118: at M = 1 a `ttnn.linear` costs ~30 us whatever its shape, and
+only the largest weights are bandwidth-bound. So the roofline in 44.1 is a real
+lower bound on time and **not a lever**: cutting a weight's bytes moves the step
+only if the shape that remains still fills the grid. This restores invariant 55
+-- width is free until it fills the grid -- which 45 had implicitly contradicted.
+The levers stay what they were: fewer calls, wider outputs, and k-split kernels
+that give idle cores a piece of the reduction.
+
+INVARIANT 119: price a shape before converting weights for it. Two of this
+session's three "verified" findings were byte arithmetic that a fifteen-minute
+harness on random tensors refuted. It needs no weights, no model and no trace.
+
 INVARIANT 117: a paired, alternating A/B is the only reading this rig supports.
 Its absolute number drifted 1 ms over one sweep -- more than any change measured
 this session -- so an unpaired before/after is noise with a sign.
