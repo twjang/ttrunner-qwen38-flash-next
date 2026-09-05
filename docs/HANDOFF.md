@@ -5540,3 +5540,119 @@ two, three -- and if the line is not monotone, the term was never there.
 
 Eighteen changes, nine kernels. 235 tests, determinism 0.0e+00 and traced ==
 eager throughout. Against the ~16.5 ms this decomposition allows, **50 %**.
+
+## 41. The group norm in one launch, and what it says about launches
+
+`fused_group_norm` was two `generic_op` launches: a reduction pass writing each
+group's scale, then a pass reading the stream back to apply it. The second
+cannot start until the first has the scale -- which, inside one launch, a
+semaphore says just as well.
+
+`gnorm1_{reader,compute,writer}.cpp`. Each core owns a run of tiles from exactly
+one group and reads them **once**, keeping them in L1 across both phases, so the
+stream crosses DRAM once instead of twice. The group's gatherer folds the
+partials, takes the rsqrt, and multicasts the finished scale over the group's
+rectangle; a group owns a whole number of grid rows, so that rectangle is legal
+and the gatherer sits inside it (the loopback form, `N_DEST` counting every core).
+
+    group_norm_check.py    two launches 18.75 us -> one 15.56
+    normed vs float64      4.589e-03 -- the same as the ops path, to the digit
+    local vs mesh_partition    0.000e+00
+    rows a group           2 -> 15.56 us,  1 -> 16.11
+    ab_step.py, five rounds    **+0.08 ms**  (-0.02, +0.12, +0.11, -0.00, +0.09)
+
+The coordination lives in the **reader**, not the writer. The first version put
+it in the writer and hung the card. `gather_gemv_reader` is the multicast that
+is known to work here and it is a reader; moving the handshake there fixed it
+without any other change.
+
+### 41.1 The step is not launch-bound
+
+97 launches gone bought 0.08 ms. That is **0.8 us a launch**, against the ~1.8 us
+a bare launch was measured to cost in isolation and the ~3.0 us a 1-tile
+`generic_op` costs in a trace.
+
+INVARIANT 101: at this point removing launches is not the lever. 2686 launches
+at 0.8 us is ~2 ms of a 33 ms step; the other 31 ms is work. Fuse to stop
+reading the same bytes twice, or to do less arithmetic -- not to save dispatches.
+This retires the reasoning behind invariant 91 rather than contradicting it: 91
+said one launch is free and eight are not, and 41.1 prices the eight.
+
+## 42. A k-split GEMV
+
+`linear_shape_census.py` after section 40: **9.58 ms a token in `ttnn.linear`
+against a 5.80 ms roofline, 61 %**, and the gap is concentrated in the narrow
+outputs. At M = 1 each output tile goes to one core, so:
+
+     ms/token  calls      us  roof    eff  shape
+         1.21     96   12.58  2.47  19.6%  [1,2560] x [2560,352]  bf8
+         0.68     48   14.11  6.76  47.9%  [1,2560] x [2560,512]  bf16
+         0.36     36    9.94  0.63   6.4%  [1,2560] x [2560,24]   f32
+         0.33     24   13.83  3.59  26.0%  [1,2560] x [2560,512]  bf8
+         0.15     12   12.33  1.69  13.7%  [1,2560] x [2560,128]  bf16
+
+`ksgemv_{reader,compute,writer}.cpp` splits the *reduction* instead. Core
+(k-group, output tile) accumulates its slice of K into one tile; the partials are
+added afterwards.
+
+Two things separate it from the k-split this project already tried and rejected
+(`ksplit_*`, `TT_KSPLIT`, disabled since its removal was worth +1.82 ms):
+
+* **The activation is multicast.** Every core in a k-group needs the same
+  activation tiles, and at M = 1 an activation tile is thirty-one rows of padding
+  around one real row -- so reading it per core moves *more than the weight*:
+  1.80 MB against 0.96 for [2560, 352]. The group's head reads it once and
+  multicasts to the group's rectangle.
+* **The partials are float32** in a float32 destination, which is why the kernel
+  lands nearer the truth than the op it replaces rather than further:
+
+      shape                 kernel      ttnn.linear    speed
+      [2560, 352]         3.291e-03      1.100e-02     3.10x
+      [2560, 512] bf16    3.374e-03      1.413e-02     2.26x
+      [2560, 512] bf8     3.124e-03      1.250e-02     2.99x
+      [2560, 128]         2.151e-03      1.836e-02     3.35x
+      [2560,  32] f32     1.777e-03      1.023e-02     1.86x
+      [2560, 1312]        3.971e-03      1.331e-02     2.17x
+
+  (`ksgemv_check.py`, against float64 on the quantised operands. The speed column
+  is against **bare** `ttnn.linear`; the model calls it through
+  `decode_matmul_config`, which is roughly 2.5x faster than bare, so the A/B is
+  the number that decides this, not the ratio here.)
+
+A group is a rectangle so the head's multicast is legal: `nt` consecutive cores
+of one row when `nt` divides the grid width -- which gives a 1-tile output eleven
+groups a row -- and whole rows otherwise, with the cores past `nt` in the
+rectangle for the handshake only. Fewer than two groups and it declines.
+
+### 42.1 The in-kernel fold hangs, and is behind a flag
+
+The partials are added by `fused_group_sum` in its own launch. Folding them
+inside the kernel -- every group writing its partial into the gatherer's L1, a
+semaphore counting them, and a second compute window adding them -- is written
+and measured at nothing, because it hangs the card. It is behind `TT_KSG_FOLD`.
+
+Bisected with `TT_KSG_NOMCAST` / `TT_KSG_NOFOLD`, one clean device run each:
+
+    multicast on, fold off      OK
+    multicast off, fold off     OK
+    multicast off, fold on      HUNG
+
+So the multicast is fine and the fold is not. The one thing the fold does that
+no working kernel in this project does is put an **SFPU window after a matmul
+window** -- `compute_kernel_hw_startup<SrcOrder::Reverse>` plus `matmul_init`,
+then `init_sfpu` for the adds. That is the hypothesis to test next (redo the
+hardware startup in the default source order before the second window), not a
+verified cause.
+
+It is worth fixing: `fused_group_sum` is ~4 us of the k-split's ~10, so the fold
+is about 40 % of what the kernel costs.
+
+INVARIANT 102: a hung device run leaves a process holding all four cards. The
+next run then blocks on device open and looks like a hang of its own -- which
+produced two wrong readings in this bisection before it was noticed. Kill by
+explicit PID (never `pkill -f`, which matches the shell running it and takes the
+whole command with it) and `tt-smi -r` between cases.
+
+INVARIANT 103: `TT_METAL_WATCHER` is not available here. It attaches, then
+throws out of `poll_watcher_data` and aborts the process. Hangs have to be
+bisected, not inspected.
