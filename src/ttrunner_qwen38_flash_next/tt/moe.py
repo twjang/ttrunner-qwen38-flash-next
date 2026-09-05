@@ -543,6 +543,121 @@ def _buf(key, shape, dtype, device):
     return got
 
 
+_GEMV_FELL_BACK = False
+_NO_GATHER_GEMV = bool(os.environ.get("TT_NO_GATHER_GEMV"))
+# Output tile columns a core owns. The activation row is re-read per *core*, so
+# fewer cores move fewer bytes -- but too few and the cores cannot pull enough
+# DRAM between them. Swept in `gather_gemv_check.py`.
+_GEMV_COLS = int(os.environ.get("TT_GEMV_COLS", "4"))
+
+
+def _gather_gemv_program(x, weights, idx, out, k_sel, mode, idx16, cols_per_core):
+    dev = weights.device()
+    grid = dev.compute_with_storage_grid_size()
+    ke, ne = weights.shape[-2] // TILE, weights.shape[-1] // TILE
+    tpe = ke * ne
+    if mode == 2:
+        kt, kt_e, nt_out = ke, 0, k_sel * ne
+        half = ne // 2
+        if ne % 2:
+            raise RuntimeError("gate|up needs an even tile count to split")
+    else:
+        kt, kt_e, nt_out = k_sel * ke, ke, ne
+        half = 0
+
+    n = max(1, min(nt_out, (nt_out + cols_per_core - 1) // cols_per_core,
+                   grid.x * grid.y))
+    cols_ = min(n, grid.x)
+    rows_ = (n + grid.x - 1) // grid.x
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols_ - 1, rows_ - 1))])
+    cores = [ttnn.CoreCoord(cx, cy) for cy in range(rows_) for cx in range(cols_)]
+
+    acc = {}
+    for tag, t in (("a", x), ("w", weights), ("i", idx), ("o", out)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"gather gemv: {tag} must be interleaved")
+        acc[tag] = ct
+    a_page, w_page = acc["a"][1], acc["w"][1]
+
+    work = [((nt_out * i) // len(cores), (nt_out * (i + 1)) // len(cores))
+            for i in range(len(cores))]
+
+    cbs = [
+        # The activation row stays resident: KT tiles, indexed rather than popped.
+        ttnn.CBDescriptor(
+            total_size=kt * a_page, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=0, data_format=x.dtype, page_size=a_page)]),
+        ttnn.CBDescriptor(
+            total_size=2 * kt * w_page, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=1, data_format=weights.dtype, page_size=w_page)]),
+        ttnn.CBDescriptor(
+            total_size=64 * ((acc["i"][1] + 64 + 63) // 64), core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=2, data_format=ttnn.uint32, page_size=64)]),
+        ttnn.CBDescriptor(
+            total_size=2 * acc["o"][1], core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=16, data_format=out.dtype, page_size=acc["o"][1])]),
+    ]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    ct = [kt, kt_e, ne, tpe, half, k_sel, mode, weights.shape[1], idx16,
+          a_page, w_page] + acc["a"] + acc["w"] + acc["i"]
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("gather_gemv_reader.cpp", ct,
+             [[x.buffer_address(), weights.buffer_address(), idx.buffer_address(),
+               lo, hi] for lo, hi in work], ttnn.ReaderConfigDescriptor()),
+        kern("gather_gemv_compute.cpp", [kt], [[lo, hi] for lo, hi in work],
+             # fp32 in the destination register: the reduction is 80 tile
+             # products deep and bfloat16 accumulation over that is visible --
+             # 6.4e-02 against the gather-and-multiply path before this line.
+             ttnn.ComputeConfigDescriptor(math_fidelity=ttnn.MathFidelity.HiFi4,
+                                          fp32_dest_acc_en=True)),
+        kern("gather_gemv_writer.cpp", acc["o"],
+             [[out.buffer_address(), lo, hi] for lo, hi in work],
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def gather_gemv(x, weights, idx, k_sel: int, mode: int, out_shape, idx16: int = 0,
+                cols_per_core: int | None = None):
+    """`x @ gather(weights, idx)` without the gather. Or None.
+
+    The copy is the expensive half of today's path -- 40.11 us to gather gate|up
+    against 20.80 to multiply it -- because every selected expert's weights cross
+    DRAM three times: read by the gather, written by it, read by the matmul.
+    Reading them through the index here leaves one crossing.
+    """
+    global _GEMV_FELL_BACK
+    if _NO_GATHER_GEMV:
+        return None
+    try:
+        out = _buf(("gemv", mode, out_shape, str(x.dtype)), out_shape, x.dtype,
+                   weights.device())
+        ttnn.generic_op(
+            [x, weights, idx, out],
+            _gather_gemv_program(x, weights, idx, out, k_sel, mode, idx16,
+                                 cols_per_core or _GEMV_COLS))
+        return out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _GEMV_FELL_BACK:
+            _GEMV_FELL_BACK = True
+            import warnings
+            warnings.warn(f"gather gemv unavailable, using gather + matmul: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 def _gather_program(weights, indices, out, k_sel: int, wide: int, idx16: int = 0):
     grid = weights.device().compute_with_storage_grid_size()
     cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
@@ -772,8 +887,16 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
     if k_sel > 16:
         raise ValueError(f"k_sel {k_sel} exceeds a tile face; widen the index path")
 
-    gu = _gather(gate_w, idx_pad, k_sel, 2, (1, 1, gate_w.shape[-2], k_sel * 2 * n), 1)
-    both = fast_linear(x, gu, compute_kernel_config=HIFI4)
+    # The gather is the expensive half: 63.15 us to copy gate|up and multiply it
+    # against 35.94 to multiply it *through the index*, because a copied weight
+    # crosses DRAM three times and an indexed one crosses it once.
+    both = (gather_gemv(x, gate_w, idx_pad, k_sel, 2,
+                        (1, 1, x.shape[-2], k_sel * 2 * n), 1, 8)
+            if x.shape[-2] <= TILE else None)
+    if both is None:
+        gu = _gather(gate_w, idx_pad, k_sel, 2,
+                     (1, 1, gate_w.shape[-2], k_sel * 2 * n), 1)
+        both = fast_linear(x, gu, compute_kernel_config=HIFI4)
     hidden = fused_swiglu(both, k_sel * n)
 
     # Broadcast each expert's score across its n columns. `repeat_interleave` is
@@ -790,6 +913,11 @@ def wide_expert_ffn(x, gate_w, down_w, weights_local, k_sel, hidden_size,
         _GATHER_BUF[("spread_init", k_sel, n)] = True
     scaled = ttnn.multiply(hidden, ttnn.matmul(vals, spread, compute_kernel_config=HIFI4))
 
+    out = (gather_gemv(scaled, down_w, idx_pad, k_sel, 0,
+                       (1, 1, scaled.shape[-2], hidden_size), 1, 4)
+           if scaled.shape[-2] <= TILE else None)
+    if out is not None:
+        return out
     dw = _gather(down_w, idx_pad, k_sel, 0, (1, 1, k_sel * n, hidden_size), 1)
     return fast_linear(scaled, dw, compute_kernel_config=HIFI4)
 
