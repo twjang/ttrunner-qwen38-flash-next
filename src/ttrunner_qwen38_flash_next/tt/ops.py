@@ -135,11 +135,18 @@ def decode_matmul_config(x, w):
             # against 2.06e-02.
             blk = max((b for b in range(2, 11) if kt % b == 0), default=1)
             sub_w = next((sw for sw in (4, 2, 1) if per_core_n % sw == 0), 1)
-            # Only where the output does *not* already fill the grid. A shape
-            # with more output tiles than cores is saturated and the default is
-            # as good as anything: attn_q|gate [2560, 12288] is 384 tiles, runs
-            # at 93 % of bandwidth, and every config tried made it slower.
-            if blk > 2 and per_core_n == 1:
+            # Two conditions, both measured rather than reasoned.
+            #
+            # `per_core_n <= 2`: with more output tiles than that a core already
+            # has enough work queued to hide the read latency, and the config
+            # only gets in the way. attn_q|gate [2560, 12288] is 384 tiles over
+            # 110 cores, runs at 93 % of bandwidth by itself, and every setting
+            # tried made it *slower*; attn_qkv [2560, 4608] is 144 tiles and
+            # gains 1.43x.
+            #
+            # `kt >= 16`: a short reduction has little latency to hide. hc_up
+            # [320, 10240] is ten k-tiles and moves 1.03x at best.
+            if blk > 2 and per_core_n <= 2 and kt >= 16:
                 cfg = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
                     compute_with_storage_grid_size=grid,
                     in0_block_w=blk,

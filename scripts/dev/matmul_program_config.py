@@ -30,11 +30,13 @@ grid = mesh.compute_with_storage_grid_size()
 N_CORES = grid.x * grid.y
 
 SHAPES = [
-    ("MoE down      [1600, 2560]", 1600, 2560, ttnn.bfloat8_b),   # kt 50: no 4 or 8
-    ("hc_up          [320, 10240]", 320, 10240, ttnn.bfloat8_b),  # kt 10
-    ("MoE gate|up   [2560, 3200]", 2560, 3200, ttnn.bfloat4_b),   # kt 80
-    ("attn_output   [6144, 2560]", 6144, 2560, ttnn.bfloat8_b),   # kt 192
-    ("attn_q|gate   [2560, 12288]", 2560, 12288, ttnn.bfloat8_b), # nt 384 > cores
+    # The shapes whose output has *more* tiles than the grid has cores, which
+    # `decode_matmul_config` currently declines. attn_q|gate is 93 % efficient
+    # and every config made it worse; these two are not, so the rule may be too
+    # blunt.
+    ("attn_qkv      [2560, 4608]", 2560, 4608, ttnn.bfloat8_b),   # nt 144, 62 %
+    ("hc_up          [320, 10240]", 320, 10240, ttnn.bfloat8_b),  # nt 320, 59 %
+    ("attn_q|gate   [2560, 12288]", 2560, 12288, ttnn.bfloat8_b), # nt 384, 93 %
 ]
 
 HIFI4 = ttnn.WormholeComputeKernelConfig(
@@ -77,7 +79,7 @@ for label, K, N, wdt in SHAPES:
           flush=True)
 
     per_core_min = (nt + N_CORES - 1) // N_CORES
-    for per_core_N in (per_core_min, per_core_min * 2):
+    for per_core_N in (per_core_min, per_core_min + 1, per_core_min * 2):
         if (nt + per_core_N - 1) // per_core_N > N_CORES:
             continue
         for in0_block_w in (2, 4, 5, 8, 10, 16, 20, 32):
