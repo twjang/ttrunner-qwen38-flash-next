@@ -68,5 +68,47 @@ for M in (1, 8, 32):
         ok = False
         print(f"RESULT   !! the kernel is further from the truth than the ops", flush=True)
 
+# --- the raw form: (gate stream, first column) rather than a built tensor ----
+#
+# `gated_residual_mix` now hands the un-sliced stream over and the kernel reads
+# column `base + h` of it, applying the 2*sigmoid itself. Four ttnn ops a call
+# disappear, so this has to reproduce all four.
+SPAN = HIDDEN
+for M in (1, 8, 32):
+    hyper_h = torch.randn(1, 1, M, HC * HIDDEN) * 0.5
+    branch_h = torch.randn(1, 1, M, HIDDEN) * 0.5
+    whole_h = torch.randn(1, 1, M, SPAN + 32) * 0.5
+
+    def dev(t):
+        return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                               device=mesh, mesh_mapper=rep)
+
+    hyper, branch, whole = dev(hyper_h), dev(branch_h), dev(whole_h)
+
+    ops._NO_FUSED_REINJECT = True
+    ref = ttnn.to_torch(ops.reinject(hyper, branch, (whole, SPAN), HC),
+                        mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
+    ops._NO_FUSED_REINJECT = False
+    got = ttnn.to_torch(ops.reinject(hyper, branch, (whole, SPAN), HC),
+                        mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))[:1]
+    ttnn.synchronize_device(mesh)
+
+    inj64 = 2.0 * torch.sigmoid(whole_h[..., SPAN:SPAN + HC].to(torch.float64))
+    truth = (hyper_h.to(torch.float64)
+             + (inj64.permute(0, 1, 3, 2).unsqueeze(-1)
+                * branch_h.to(torch.float64).unsqueeze(2)).squeeze(1)
+             .permute(0, 2, 1, 3).reshape(1, 1, M, HC * HIDDEN))
+    scale = truth.abs().max().item()
+
+    def rel2(t):
+        return (t.to(torch.float64) - truth).abs().max().item() / max(scale, 1e-30)
+
+    d = (got.to(torch.float64) - ref.to(torch.float64)).abs().max().item() / max(scale, 1e-30)
+    print(f"RESULT raw M={M:2d}: vs the ops {d:.3e}; vs float64 kernel {rel2(got):.3e}, "
+          f"ops {rel2(ref):.3e}", flush=True)
+    if rel2(got) > max(rel2(ref) * 1.5, 1e-6):
+        ok = False
+        print("RESULT   !! the raw path is further from the truth than the ops", flush=True)
+
 print("RESULT " + ("the fused reinject matches" if ok else "MISMATCH"), flush=True)
 ttnn.close_mesh_device(mesh)

@@ -1,5 +1,8 @@
 // reinject_compute.cpp -- hyper + branch * inject, in registers.
 //
+// Compile-time args: 0 = SIGMOID_INJ (put the broadcast scalar through
+//                        2*sigmoid before multiplying, which is the gate the
+//                        four ttnn ops used to apply on the host side).
 // Runtime args: 0 = tiles this core owns.
 
 #include <cstdint>
@@ -7,9 +10,13 @@
 #include "api/compute/common.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_unary/binop_with_scalar.h"
 #include "api/compute/eltwise_binary_sfpu.h"
 
 void kernel_main() {
+    constexpr uint32_t SIGMOID_INJ = get_compile_time_arg_val(0);
+    // 2.0f
+    constexpr uint32_t TWO_BITS = 0x40000000u;
     const uint32_t n_tiles = get_arg_val<uint32_t>(0);
 
     constexpr uint32_t cb_branch = 0;
@@ -27,6 +34,12 @@ void kernel_main() {
         tile_regs_acquire();
         copy_tile(cb_branch, 0, 0);
         copy_tile(cb_bcast, 0, 1);
+        if (SIGMOID_INJ) {
+            sigmoid_tile_init();
+            sigmoid_tile(1);
+            binop_with_scalar_tile_init();
+            mul_unary_tile(1, TWO_BITS);
+        }
         mul_binary_tile_init();
         mul_binary_tile(0, 1, 2);
         copy_tile(cb_hyper, 0, 3);

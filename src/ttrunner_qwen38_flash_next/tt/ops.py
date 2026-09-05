@@ -566,15 +566,13 @@ def gated_residual_mix(
 
     inject = None
     if inject_w is not None:
-        # Already computed, in the tail of the fused matmul above.
-        n_inj = inject_w.shape[-1]
-        inject = ttnn.slice(whole, (0, 0, 0, span),
-                            (whole.shape[0], whole.shape[1], whole.shape[2], span + n_inj))
-        inject = ttnn.multiply(ttnn.sigmoid(inject), 2.0)
-        # Hand it back channel-major, [.., hc, M, 1], so `reinject` can broadcast
-        # against the branch without materialising anything. The permute is on a
-        # tensor of M*hc elements, so it is free.
-        inject = ttnn.permute(inject, (0, 3, 2, 1))
+        # Handed over **raw**, as (stream, first column). It is already computed,
+        # in the tail of the fused matmul above, and `reinject` reads column
+        # `span + h` of it directly -- so the slice, the sigmoid, the multiply
+        # and the permute that used to carve it out here are gone. Four ops on a
+        # stream four numbers wide, 96 times a token, and the kernel that
+        # consumes them was reading that tile anyway.
+        inject = (whole, span)
     return mixed, inject
 
 
@@ -599,7 +597,7 @@ def _reinject_output(hyper):
     return out
 
 
-def _reinject_program(hyper, branch, inject, out, hc_count: int):
+def _reinject_program(hyper, branch, inject, out, hc_count: int, inj_base=None):
     grid = hyper.device().compute_with_storage_grid_size()
     cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
     crs = ttnn.CoreRangeSet(
@@ -629,6 +627,14 @@ def _reinject_program(hyper, branch, inject, out, hc_count: int):
     work = [((total * c) // len(cores), (total * (c + 1)) // len(cores))
             for c in range(len(cores))]
 
+    # `inj_base` is set when `inject` is the raw gate stream rather than the
+    # [1, hc, M, 1] tensor the ttnn ops used to build; the kernel then reads
+    # column `inj_base + h` of it and applies the 2*sigmoid itself.
+    raw = inj_base is not None
+    inj_nt = output_tiles(inject.shape[-1]) if raw else 1
+    if raw and inject.shape[-1] < inj_base + hc_count:
+        raise RuntimeError("fused reinject: the gate stream is too narrow")
+
     cbs = [
         ttnn.CBDescriptor(
             total_size=2 * tile_bytes, core_ranges=crs,
@@ -652,12 +658,13 @@ def _reinject_program(hyper, branch, inject, out, hc_count: int):
     return ttnn.ProgramDescriptor(
         kernels=[
             kern("reinject_reader.cpp",
-                 [nt_h, hc_count, mt, tile_bytes, acc["i"][1], bf16]
+                 [nt_h, hc_count, mt, tile_bytes, acc["i"][1], bf16,
+                  int(raw), int(inj_base or 0), inj_nt]
                  + acc["h"] + acc["b"] + acc["i"],
                  [[hyper.buffer_address(), branch.buffer_address(),
                    inject.buffer_address(), lo, hi] for lo, hi in work],
                  ttnn.ReaderConfigDescriptor()),
-            kern("reinject_compute.cpp", [], [[hi - lo] for lo, hi in work],
+            kern("reinject_compute.cpp", [int(raw)], [[hi - lo] for lo, hi in work],
                  ttnn.ComputeConfigDescriptor()),
             kern("reinject_writer.cpp", acc["o"],
                  [[out.buffer_address(), lo, hi] for lo, hi in work],
@@ -689,17 +696,31 @@ def reinject(hyper: ttnn.Tensor, branch: ttnn.Tensor, inject: ttnn.Tensor, hc_co
     # the three favour the kernel and the mean is 0.39 ms, which is also the
     # first honest look at this rig's between-run drift -- about 1 ms, so a
     # single pair cannot resolve anything smaller.
+    # `gated_residual_mix` hands over the gate stream raw, as (tensor, column),
+    # so that the four ops that used to carve the injection out of it -- a
+    # slice, a sigmoid, a multiply and a permute, on a stream four numbers wide,
+    # 96 times a token -- happen inside the kernel that was already reading that
+    # tile.
+    base = None
+    if isinstance(inject, tuple):
+        inject, base = inject
+
     if not _NO_FUSED_REINJECT:
         try:
             out = _reinject_output(hyper)
-            ttnn.generic_op([hyper, branch, inject, out],
-                            _reinject_program(hyper, branch, inject, out, hc_count))
+            ttnn.generic_op(
+                [hyper, branch, inject, out],
+                _reinject_program(hyper, branch, inject, out, hc_count, base))
             return out
         except Exception:                                       # noqa: BLE001
             pass
 
     hidden = branch.shape[-1]
     m = branch.shape[-2]
+    if base is not None:
+        w = list(inject.shape)
+        inject = ttnn.slice(inject, (0, 0, 0, base), (w[0], w[1], w[2], base + hc_count))
+        inject = ttnn.permute(ttnn.multiply(ttnn.sigmoid(inject), 2.0), (0, 3, 2, 1))
     prod = ttnn.multiply(inject, branch)                       # [.., hc, M, hidden]
     prod = ttnn.reshape(ttnn.permute(prod, (0, 2, 1, 3)), (1, 1, m, hc_count * hidden))
     return ttnn.add(hyper, prod)

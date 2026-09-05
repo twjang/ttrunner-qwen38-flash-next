@@ -32,7 +32,19 @@
 //   3: TILE_BYTES      (aligned page size of hyper/branch/out -- one dtype)
 //   4: INJ_TILE_BYTES  (aligned page size of the inject tensor)
 //   5: BF16            (1: operands are bfloat16, 0: float32)
-//   6..: TensorAccessorArgs for hyper, branch, inject
+//   6: INJ_RAW         (1: `inject` is the *un-sliced* gate stream and column
+//                        INJ_BASE + h of it is the scalar, which the compute
+//                        kernel then puts through 2*sigmoid. 0: it is the
+//                        [1, HC, M, 1] tensor the ttnn ops used to build, one
+//                        page per (h, mt), value in column 0.)
+//   7: INJ_BASE        (first gate column, when INJ_RAW)
+//   8: INJ_NT          (tiles across a row of the gate stream, when INJ_RAW)
+//   9..: TensorAccessorArgs for hyper, branch, inject
+//
+// INJ_RAW exists because building that [1, HC, M, 1] tensor cost a slice, a
+// sigmoid, a multiply and a permute -- four ttnn ops, 96 times a token, on a
+// stream four numbers wide -- and this kernel was already reading the tile they
+// were built from.
 //
 // Runtime args: 0 hyper_addr, 1 branch_addr, 2 inject_addr, 3 work_lo, 4 work_hi
 
@@ -45,6 +57,9 @@ constexpr uint32_t MT = get_compile_time_arg_val(2);
 constexpr uint32_t TILE_BYTES = get_compile_time_arg_val(3);
 constexpr uint32_t INJ_TILE_BYTES = get_compile_time_arg_val(4);
 constexpr uint32_t BF16 = get_compile_time_arg_val(5);
+constexpr uint32_t INJ_RAW = get_compile_time_arg_val(6);
+constexpr uint32_t INJ_BASE = get_compile_time_arg_val(7);
+constexpr uint32_t INJ_NT = get_compile_time_arg_val(8);
 constexpr uint32_t NT = HC * NT_H;
 
 // Element offset of (row, col) in a 32x32 tile laid out as four 16x16 faces.
@@ -65,7 +80,7 @@ void kernel_main() {
     const uint32_t work_lo = get_arg_val<uint32_t>(3);
     const uint32_t work_hi = get_arg_val<uint32_t>(4);
 
-    constexpr auto h_ta = TensorAccessorArgs<6>();
+    constexpr auto h_ta = TensorAccessorArgs<9>();
     const auto h_acc = TensorAccessor(h_ta, hyper_addr);
     constexpr auto b_ta = TensorAccessorArgs<h_ta.next_compile_time_args_offset()>();
     const auto b_acc = TensorAccessor(b_ta, branch_addr);
@@ -76,14 +91,17 @@ void kernel_main() {
     // is only L1-aligned, so the landing address is forced to 64 B.
     const uint32_t scratch = (get_write_ptr(cb_scratch) + 63u) & ~63u;
 
-    uint32_t have = 0xffffffffu;            // which (h, mt) the scratch holds
+    uint32_t have = 0xffffffffu;            // which page the scratch holds
     for (uint32_t w = work_lo; w < work_hi; ++w) {
         const uint32_t mt = w / NT;
         const uint32_t c = w - mt * NT;
         const uint32_t h = c / NT_H;
         const uint32_t dt = c - h * NT_H;
 
-        const uint32_t which = h * MT + mt;
+        // Which page holds the scalar, and which column of it.
+        const uint32_t src_col = INJ_RAW ? ((INJ_BASE + h) & 31u) : 0u;
+        const uint32_t which = INJ_RAW ? (mt * INJ_NT + ((INJ_BASE + h) >> 5))
+                                       : (h * MT + mt);
         cb_reserve_back(cb_bcast, 1);
         const uint32_t bc = get_write_ptr(cb_bcast);
         if (which != have) {
@@ -91,15 +109,17 @@ void kernel_main() {
             noc_async_read_barrier();
             have = which;
         }
-        // Spread column 0 of the inject tile across all 32 columns, so the
-        // elementwise multiply downstream sees a per-row scalar.
+        // Spread that column across all 32, so the elementwise multiply
+        // downstream sees a per-row scalar. Rebuilt every work item rather than
+        // cached, because under INJ_RAW four consecutive h values share one
+        // page and differ only in the column.
         if (BF16) {
             volatile tt_l1_ptr uint16_t* src =
                 reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scratch);
             volatile tt_l1_ptr uint16_t* dst =
                 reinterpret_cast<volatile tt_l1_ptr uint16_t*>(bc);
             for (uint32_t r = 0; r < 32; ++r) {
-                const uint16_t v = src[tile_off(r, 0)];
+                const uint16_t v = src[tile_off(r, src_col)];
                 for (uint32_t col = 0; col < 32; ++col) {
                     dst[tile_off(r, col)] = v;
                 }
@@ -110,7 +130,7 @@ void kernel_main() {
             volatile tt_l1_ptr uint32_t* dst =
                 reinterpret_cast<volatile tt_l1_ptr uint32_t*>(bc);
             for (uint32_t r = 0; r < 32; ++r) {
-                const uint32_t v = src[tile_off(r, 0)];
+                const uint32_t v = src[tile_off(r, src_col)];
                 for (uint32_t col = 0; col < 32; ++col) {
                     dst[tile_off(r, col)] = v;
                 }
