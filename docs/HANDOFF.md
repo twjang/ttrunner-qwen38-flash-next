@@ -6265,6 +6265,35 @@ INVARIANT 123: write the prediction down before the run that tests it. "Full
 coverage runs, partial coverage hangs" was recorded with `qkv` and `indexer`
 still pending, which is the only reason their results mean anything.
 
+### 45.11 The hang rate is a feedback loop: a failed reset leaves worse cards
+
+After the site bisection, the *plain* configuration -- nothing changed, no flag
+set -- hung **four times out of four**. At the 40 % baseline rate that is 2.6 %,
+so it is not chance: the machine had degraded under the session's own load.
+
+The cause is visible in the sweep's own stderr, which nobody was reading because
+it goes to the log rather than to the result line:
+
+    flagab.sh: line 18: 614113 Bus error (core dumped) tt-smi -r
+    flagab.sh: line 18: 614391 Bus error (core dumped) tt-smi -r
+
+**`tt-smi -r` itself died twice.** A reset that core-dumps leaves the boards half
+re-initialised, the next run is likelier to hang, that hang triggers another
+reset, and the rate climbs. A clean `tt-smi -r` afterwards -- with every process
+killed first and nothing holding `/dev/tenstorrent/*` -- returned
+"Re-initializing boards after reset" and exit 0.
+
+INVARIANT 124: check the reset's exit status. A harness that pipes `tt-smi -r`
+to /dev/null and carries on cannot tell a recovered card from a wedged one, and
+the failure compounds: every subsequent hang is then partly its own fault.
+
+INVARIANT 125: run a **control** alongside any bisection of a stochastic hang.
+Four-of-four for a configuration means nothing unless the unchanged
+configuration was passing in the same window. Here it happens to hold -- `router`
+and `qkv` completed at 32.94 and 32.47 in the same window `shexp` and `ab` went
+4/4 -- but that was luck, not design, and the control should have been running
+from the first bisection rather than added after it.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
