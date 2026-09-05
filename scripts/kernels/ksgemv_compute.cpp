@@ -1,8 +1,12 @@
 // ksgemv_compute.cpp -- this core's slice of the reduction, and the fold.
 //
 // Phase 1: accumulate [kt_lo, kt_lo+klen) into one destination register and pack
-// it as a **float32** partial. The split changes the summation order, so the
-// partials are the one place the precision can be given back for nothing.
+// it. The partial CB carries the activation's dtype, not float32: packing into
+// a Float32 circular buffer hangs the card here. Bisected -- with float32
+// partials the fold hangs with or without redoing the hardware startup before
+// the SFPU window, and with the activation's dtype it runs either way. It costs
+// nothing, because the launch this replaces was writing bfloat16 partials to
+// DRAM anyway.
 //
 // Phase 2, on the core that owns output tile n in group 0: add the G partials
 // the writer collected and pack the output tile. FPU matmul and SFPU add never
@@ -12,8 +16,7 @@
 // for a core no group covers -- such a core must pack nothing, or it hands the
 // writer whatever its destination register happened to hold.
 //
-// Compile-time args: 0 FOLD (0 bisects the cross-core handshake out),
-//                    1 RESET (redo the hardware startup before the SFPU window)
+// Compile-time args: 0 FOLD (0 sends the partials to DRAM for `fused_group_sum`)
 // Runtime args: 0 klen, 1 active, 2 is_gatherer, 3 G
 
 #include <cstdint>
@@ -28,7 +31,6 @@
 
 void kernel_main() {
     constexpr uint32_t FOLD = get_compile_time_arg_val(0);
-    constexpr uint32_t RESET = get_compile_time_arg_val(1);
     constexpr uint32_t cb_a = 0, cb_w = 1, cb_part = 2, cb_fold = 3, cb_out = 16;
     constexpr uint32_t cb_acc = FOLD ? cb_part : cb_out;
 
@@ -61,12 +63,6 @@ void kernel_main() {
         return;
     }
     cb_wait_front(cb_fold, g_count);
-    // The matmul left the unpacker in SrcOrder::Reverse; nothing else in this
-    // project follows a matmul window with an SFPU one, so the startup is redone
-    // in the default order before the fold.
-    if constexpr (RESET) {
-        compute_kernel_hw_startup(cb_fold, cb_out);
-    }
     init_sfpu(cb_fold, cb_out);
     tile_regs_acquire();
     for (uint32_t j = 0; j < g_count; ++j) {

@@ -1969,16 +1969,21 @@ _NO_KSGEMV = bool(os.environ.get("TT_NO_KSGEMV"))
 # and TT_KSG_NOFOLD has each group write its own partial and skips the
 # cross-core handshake. A hang that survives both is in the matmul.
 _KSG_NOMCAST = bool(os.environ.get("TT_KSG_NOMCAST"))
-# The partials are added by `fused_group_sum` in its own launch. The in-kernel
-# fold -- every group writing its partial into the gatherer's L1 and a
-# semaphore counting them -- saves that launch and the DRAM round trip, and is
-# behind TT_KSG_FOLD because it hangs: the SFPU window that adds the partials
-# sits after a matmul window, which no working kernel here does.
+# The partials go to DRAM and `fused_group_sum` adds them in its own launch.
+#
+# TT_KSG_FOLD=1 folds them inside the kernel instead -- every group writes its
+# partial into the gatherer's L1, a semaphore counts them, a second compute
+# window adds them -- and that is 10.29 -> 8.91 us on [2560, 352], bit-identical
+# (3.291e-03 against float64 either way), about +0.35 ms a token. It is off
+# because it hangs **in the model** and nowhere else: ninety-six distinct
+# fold programs with an all_reduce between them capture and replay fine
+# (`ksg_trace.py 96 ar`), and twenty-five reps of one program in a trace are
+# fine, but the 48-layer step hangs with no device program event after the
+# first. Whatever the interaction is, it is not the fold's own handshake, and
+# 0.35 ms did not justify more 25-minute cycles to find it.
 _KSG_FOLD = os.environ.get("TT_KSG_FOLD", "0") == "1"
 _KSG_SEM = int(os.environ.get("TT_KSG_SEM", "2"))
 _KSG_ROWS = int(os.environ.get("TT_KSG_ROWS", "0"))
-_KSG_RESET = bool(os.environ.get("TT_KSG_RESET"))
-_KSG_BFPART = bool(os.environ.get("TT_KSG_BFPART"))
 
 
 def _ksgemv_plan(grid, kt, nt):
@@ -2057,8 +2062,9 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
             core_ranges=crs, compile_time_args=ct,
             runtime_args=[(c, args[c]) for c in all_cores], config=cfgd)
 
-    part_dt = x.dtype if _KSG_BFPART else ttnn.float32
-    part_page = acc["a"][1] if _KSG_BFPART else _TILE * _TILE * 4
+    # Not float32: packing into a Float32 circular buffer hangs the card here,
+    # and the launch this replaces wrote bfloat16 partials to DRAM anyway.
+    part_dt, part_page = a.dtype, acc["a"][1]
     cbs = [
         ttnn.CBDescriptor(
             total_size=cap * acc["a"][1], core_ranges=crs,
@@ -2086,8 +2092,7 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
              [nt, acc["a"][1], acc["w"][1], 1 if _KSG_NOMCAST else cores_pg]
              + acc["a"] + acc["w"],
              r_args, ttnn.ReaderConfigDescriptor()),
-        kern("ksgemv_compute.cpp",
-             [1 if _KSG_FOLD else 0, 1 if _KSG_RESET else 0], c_args,
+        kern("ksgemv_compute.cpp", [1 if _KSG_FOLD else 0], c_args,
              ttnn.ComputeConfigDescriptor(math_fidelity=ttnn.MathFidelity.HiFi4,
                                           fp32_dest_acc_en=True)),
         kern("ksgemv_writer.cpp",

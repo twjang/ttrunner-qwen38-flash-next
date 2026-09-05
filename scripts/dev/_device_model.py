@@ -37,6 +37,13 @@ def open_model(max_seq_len: int = 512, preload: bool = True, trace_region_bytes:
     """
     torch.set_num_threads(8)
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+    # TTRUNNER_TRACE_BYTES, for every harness at once. `TTEngine` always passes
+    # a trace region and these harnesses took ttnn's default, which is smaller:
+    # a change that adds programs to the capture then overflows it and **hangs
+    # rather than raising**, which cost this project a wrong verdict on a kernel
+    # that was fine.
+    if trace_region_bytes is None and os.environ.get("TTRUNNER_TRACE_BYTES"):
+        trace_region_bytes = int(os.environ["TTRUNNER_TRACE_BYTES"])
     kw = {} if trace_region_bytes is None else {"trace_region_size": trace_region_bytes}
     if num_command_queues is not None:
         # Two queues let two traces be issued independently, which is the usual
