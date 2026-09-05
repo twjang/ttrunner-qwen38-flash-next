@@ -30,10 +30,11 @@ grid = mesh.compute_with_storage_grid_size()
 N_CORES = grid.x * grid.y
 
 SHAPES = [
-    ("MoE gate|up   [2560, 3200]", 2560, 3200, ttnn.bfloat4_b),
-    ("MoE down      [1600, 2560]", 1600, 2560, ttnn.bfloat8_b),
-    ("attn_output   [6144, 2560]", 6144, 2560, ttnn.bfloat8_b),
-    ("shexp gate|up [2560, 1280]", 2560, 1280, ttnn.bfloat8_b),
+    ("MoE down      [1600, 2560]", 1600, 2560, ttnn.bfloat8_b),   # kt 50: no 4 or 8
+    ("hc_up          [320, 10240]", 320, 10240, ttnn.bfloat8_b),  # kt 10
+    ("MoE gate|up   [2560, 3200]", 2560, 3200, ttnn.bfloat4_b),   # kt 80
+    ("attn_output   [6144, 2560]", 6144, 2560, ttnn.bfloat8_b),   # kt 192
+    ("attn_q|gate   [2560, 12288]", 2560, 12288, ttnn.bfloat8_b), # nt 384 > cores
 ]
 
 HIFI4 = ttnn.WormholeComputeKernelConfig(
@@ -75,12 +76,12 @@ for label, K, N, wdt in SHAPES:
     print(f"RESULT {label}: default {base:7.2f}us  (kt {kt}, nt {nt}, {N_CORES} cores)",
           flush=True)
 
-    for per_core_N in (1, 2, 4):
-        cores_used = (nt + per_core_N - 1) // per_core_N
-        if cores_used > N_CORES:
+    per_core_min = (nt + N_CORES - 1) // N_CORES
+    for per_core_N in (per_core_min, per_core_min * 2):
+        if (nt + per_core_N - 1) // per_core_N > N_CORES:
             continue
-        for in0_block_w in (1, 2, 4, 8, kt):
-            if kt % in0_block_w:
+        for in0_block_w in (2, 4, 5, 8, 10, 16, 20, 32):
+            if kt % in0_block_w or in0_block_w > kt:
                 continue
             try:
                 pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(

@@ -127,11 +127,19 @@ def decode_matmul_config(x, w):
             kt = kdim // _TILE
             nt = output_tiles(w.shape[-1])
             per_core_n = (nt + n_cores - 1) // n_cores
-            # in0_block_w has to divide the K tiles exactly; take the largest
-            # that does, up to eight.
-            blk = next((b for b in (8, 4, 2) if kt % b == 0), 1)
+            # `in0_block_w` has to divide the K tiles exactly, so take the
+            # largest divisor up to ten. Ten and eight are level on kt=80
+            # (3.03x and 3.04x) and ten wins on kt=50 (2.19x against nothing,
+            # since neither 8 nor 4 divides it); above ten it gets slower *and*
+            # less accurate -- 16 is 2.48x on kt=192 where 8 is 2.61x, at 3.18e-02
+            # against 2.06e-02.
+            blk = max((b for b in range(2, 11) if kt % b == 0), default=1)
             sub_w = next((sw for sw in (4, 2, 1) if per_core_n % sw == 0), 1)
-            if blk > 2 or per_core_n > 1:
+            # Only where the output does *not* already fill the grid. A shape
+            # with more output tiles than cores is saturated and the default is
+            # as good as anything: attn_q|gate [2560, 12288] is 384 tiles, runs
+            # at 93 % of bandwidth, and every config tried made it slower.
+            if blk > 2 and per_core_n == 1:
                 cfg = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
                     compute_with_storage_grid_size=grid,
                     in0_block_w=blk,
