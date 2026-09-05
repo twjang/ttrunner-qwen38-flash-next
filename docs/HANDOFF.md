@@ -6040,3 +6040,40 @@ runs in one process -- almost never finishes, while a one-capture harness
 finishes three times in five. Prefer one capture per process and retry, and take
 a flag's A/B from repeated single-capture processes rather than from one
 in-process alternation.
+
+### 45.5 The composite path measured: -0.45 ms, from Python
+
+`TT_AR_COMPOSITE`, five paired runs, alternating so a drift cannot decide it
+(the rig moved a whole millisecond across this sweep -- 32.27 early, 33.96 at
+its worst -- which is why only the pairs are quoted):
+
+| | off | on | diff |
+|---|--:|--:|--:|
+| pair 1 | 32.96 | 32.44 | -0.52 |
+| pair 2 | 33.96 | 33.23 | -0.73 |
+| pair 3 | 33.28 | 33.03 | -0.25 |
+| pair 4 | 33.01 | 32.86 | -0.15 |
+| pair 5 | 32.88 | 32.28 | -0.60 |
+| **mean** | | | **-0.45** |
+
+Five of five in the same direction; a sign test puts that at p = 0.03, and there
+is a mechanism rather than a correlation. No kernel was written: the 84 wide
+reduces moved from `reduce_scatter_minimal_async` + `all_gather_async` (two
+fabric collectives) to `all_gather` + a local `fused_group_sum` (one).
+
+It is well under the 1.1-1.4 ms the two-collectives-to-one arithmetic predicts,
+and the reason is visible in the substitution: the all_gather materialises a
+tensor four times the size and the fold then reads it. A reduce-scatter-shaped
+collective moves a quarter of that. So the composite is one collective *and*
+more bytes, and -0.45 ms is what is left after the trade.
+
+That also re-prices the fabric kernel this session investigated and did not
+write. A hand-rolled line all-reduce is one collective's traversal **without**
+the 4x gather, so its headroom is the composite's saving plus the gather it
+avoids -- but it inherits the replay hang (45.4) and the reduction-order gate,
+against a step that is currently bit-reproducible. Measure the composite's
+quality first; it is the cheap half of the same idea.
+
+INVARIANT 117: a paired, alternating A/B is the only reading this rig supports.
+Its absolute number drifted 1 ms over one sweep -- more than any change measured
+this session -- so an unpaired before/after is noise with a sign.
