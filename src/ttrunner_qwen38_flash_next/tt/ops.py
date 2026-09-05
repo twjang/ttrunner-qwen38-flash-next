@@ -2140,7 +2140,7 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
     all_cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
     d0 = dev.get_devices()[0] if hasattr(dev, "get_devices") else dev
 
-    idle_r = [0] * 13
+    idle_r = [0] * 14        # trailing 0 = not in any group
     idle_c = [0, 0, 0, groups]
     idle_w = [0] * 8
     r_args = {c: idle_r for c in all_cores}
@@ -2159,7 +2159,8 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
             active = int(j < nt)
             gath = d0.worker_core_from_logical_core(where(0, j))
             r_args[c] = [a.buffer_address(), w.buffer_address(), lo, hi - lo, j,
-                         active, int(j == 0), c0.x, c0.y, c1.x, c1.y, ph.x, ph.y]
+                         active, int(j == 0), c0.x, c0.y, c1.x, c1.y, ph.x, ph.y,
+                         1]                       # in_group
             c_args[c] = [hi - lo, active, int(g == 0 and active), groups]
             w_args[c] = [out.buffer_address(), j, active, int(g == 0 and active),
                          groups, g, gath.x, gath.y]

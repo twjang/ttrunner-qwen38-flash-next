@@ -48,6 +48,22 @@ void kernel_main() {
     const uint32_t my1 = get_arg_val<uint32_t>(10);
     const uint32_t hx = get_arg_val<uint32_t>(11);
     const uint32_t hy = get_arg_val<uint32_t>(12);
+    // 1 for a core inside some group's rectangle, 0 for one this plan does not
+    // use at all. **Not** the same as `active`, which is 0 for a core that is in
+    // the rectangle for the handshake only and must still take part in it.
+    //
+    // Without this a core outside every group ran with all-zero runtime args, so
+    // `is_head` was 0, it took the non-head path below, and it
+    // `noc_semaphore_inc`d `get_noc_addr(0, 0, ...)` -- the semaphore of
+    // whichever core sits at (0, 0), which is group 0's head. That head then
+    // reached its count before its real members had armed and multicast early,
+    // leaving a member waiting for ever; the idle core then hung on its own
+    // `valid` too. Invisible whenever the plan covers all 110 cores, which is
+    // every configuration this project ships. Handoff 45.10 and invariant 130.
+    const uint32_t in_group = get_arg_val<uint32_t>(13);
+    if (in_group == 0) {
+        return;
+    }
 
     constexpr auto a_ta = TensorAccessorArgs<4>();
     const auto a_acc = TensorAccessor(a_ta, a_addr);

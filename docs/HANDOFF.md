@@ -6399,6 +6399,21 @@ spread. The census's 2.39 ms isolated does not survive contact with the model,
 which is invariant 89 doing exactly what it says: an isolated trace over-prices a
 small op chain by two to four times, and what is left here is nothing.
 
+**Corrected by a second sample.** Eight more plain runs, with the `in_group`
+guard in the reader, came back **6 of 8**. Fisher's exact on 8/8 against 6/8 is
+p = 0.47 -- no difference -- so the two samples pool to **14 finished, 2 hung of
+16, a base rate near 12 %**, and "zero" was one lucky sample. The guard itself
+cannot be the cause: for `hc_down` every one of the 110 cores is in a group, so
+the early return never fires and the only change is one extra runtime arg.
+
+At 12 % the site verdicts survive, and comfortably: 4-of-4 is 0.02 %, 3-of-3 is
+0.2 %. So shexp, ssm_ab, `TT_GG_COLS=1` and the three-site combination are all
+real, and so is the indexer needing three hangs before a finish.
+
+INVARIANT 131: quote a rate with its sample size, and pool samples before
+believing a difference. 8/8 and 6/8 are the *same* rate; reading the first as
+"zero" made a 12 % base rate look like a regression in the second.
+
 INVARIANT 129: `ksgemv`'s cost is already paid where it ships. Adding call sites
 costs stability and returns nothing measurable, so the k-split is **done** as a
 lever -- 45.8's table is an isolated-timing artifact, not 1.65 ms of headroom.
