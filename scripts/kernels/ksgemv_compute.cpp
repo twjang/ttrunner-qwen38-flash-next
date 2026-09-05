@@ -12,7 +12,8 @@
 // for a core no group covers -- such a core must pack nothing, or it hands the
 // writer whatever its destination register happened to hold.
 //
-// Compile-time args: 0 FOLD (0 bisects the cross-core handshake out)
+// Compile-time args: 0 FOLD (0 bisects the cross-core handshake out),
+//                    1 RESET (redo the hardware startup before the SFPU window)
 // Runtime args: 0 klen, 1 active, 2 is_gatherer, 3 G
 
 #include <cstdint>
@@ -27,6 +28,7 @@
 
 void kernel_main() {
     constexpr uint32_t FOLD = get_compile_time_arg_val(0);
+    constexpr uint32_t RESET = get_compile_time_arg_val(1);
     constexpr uint32_t cb_a = 0, cb_w = 1, cb_part = 2, cb_fold = 3, cb_out = 16;
     constexpr uint32_t cb_acc = FOLD ? cb_part : cb_out;
 
@@ -59,6 +61,12 @@ void kernel_main() {
         return;
     }
     cb_wait_front(cb_fold, g_count);
+    // The matmul left the unpacker in SrcOrder::Reverse; nothing else in this
+    // project follows a matmul window with an SFPU one, so the startup is redone
+    // in the default order before the fold.
+    if constexpr (RESET) {
+        compute_kernel_hw_startup(cb_fold, cb_out);
+    }
     init_sfpu(cb_fold, cb_out);
     tile_regs_acquire();
     for (uint32_t j = 0; j < g_count; ++j) {

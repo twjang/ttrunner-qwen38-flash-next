@@ -27,7 +27,13 @@ from _device_model import open_model                                 # noqa: E40
 MODULE = sys.argv[1] if len(sys.argv) > 1 else "ops"
 FLAG = sys.argv[2] if len(sys.argv) > 2 else "_NO_SMALL_EW"
 
-mesh, cfg, m = open_model(max_seq_len=4096)
+# The engine always passes a trace region (128 MB); this harness took ttnn's
+# default, and a change that adds programs to the capture then overflows it and
+# hangs rather than raising. TTRUNNER_TRACE_BYTES makes that a knob.
+import os as _os
+_TRACE = _os.environ.get("TTRUNNER_TRACE_BYTES")
+mesh, cfg, m = open_model(max_seq_len=4096,
+                          trace_region_bytes=int(_TRACE) if _TRACE else None)
 m.selection_active = False
 mod = importlib.import_module(f"ttrunner_qwen38_flash_next.tt.{MODULE}")
 from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder       # noqa: E402

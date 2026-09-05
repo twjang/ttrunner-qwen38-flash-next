@@ -1977,6 +1977,8 @@ _KSG_NOMCAST = bool(os.environ.get("TT_KSG_NOMCAST"))
 _KSG_FOLD = os.environ.get("TT_KSG_FOLD", "0") == "1"
 _KSG_SEM = int(os.environ.get("TT_KSG_SEM", "2"))
 _KSG_ROWS = int(os.environ.get("TT_KSG_ROWS", "0"))
+_KSG_RESET = bool(os.environ.get("TT_KSG_RESET"))
+_KSG_BFPART = bool(os.environ.get("TT_KSG_BFPART"))
 
 
 def _ksgemv_plan(grid, kt, nt):
@@ -2055,7 +2057,8 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
             core_ranges=crs, compile_time_args=ct,
             runtime_args=[(c, args[c]) for c in all_cores], config=cfgd)
 
-    part_page = _TILE * _TILE * 4                    # float32 partials
+    part_dt = x.dtype if _KSG_BFPART else ttnn.float32
+    part_page = acc["a"][1] if _KSG_BFPART else _TILE * _TILE * 4
     cbs = [
         ttnn.CBDescriptor(
             total_size=cap * acc["a"][1], core_ranges=crs,
@@ -2068,11 +2071,11 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
         ttnn.CBDescriptor(
             total_size=part_page, core_ranges=crs,
             format_descriptors=[ttnn.CBFormatDescriptor(
-                buffer_index=2, data_format=ttnn.float32, page_size=part_page)]),
+                buffer_index=2, data_format=part_dt, page_size=part_page)]),
         ttnn.CBDescriptor(
             total_size=groups * part_page, core_ranges=crs,
             format_descriptors=[ttnn.CBFormatDescriptor(
-                buffer_index=3, data_format=ttnn.float32, page_size=part_page)]),
+                buffer_index=3, data_format=part_dt, page_size=part_page)]),
         ttnn.CBDescriptor(
             total_size=2 * acc["o"][1], core_ranges=crs,
             format_descriptors=[ttnn.CBFormatDescriptor(
@@ -2083,7 +2086,8 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
              [nt, acc["a"][1], acc["w"][1], 1 if _KSG_NOMCAST else cores_pg]
              + acc["a"] + acc["w"],
              r_args, ttnn.ReaderConfigDescriptor()),
-        kern("ksgemv_compute.cpp", [1 if _KSG_FOLD else 0], c_args,
+        kern("ksgemv_compute.cpp",
+             [1 if _KSG_FOLD else 0, 1 if _KSG_RESET else 0], c_args,
              ttnn.ComputeConfigDescriptor(math_fidelity=ttnn.MathFidelity.HiFi4,
                                           fp32_dest_acc_en=True)),
         kern("ksgemv_writer.cpp",
@@ -2242,7 +2246,12 @@ def gated_residual_mix(
         # Measured here: 2.12x and more accurate than `ttnn.linear` (invariant
         # 57). `ksplit_linear` returns None if the split would not pay.
         fused_w = down_inject_weight(down_w, inject_w, span)
-        part = ksplit_linear(local, fused_w)
+        # [2560, 352] is eleven output tiles, so `ttnn.linear` runs it on eleven
+        # of a hundred and ten cores -- 19.6 % of bandwidth, and the worst line
+        # in the linear census. `ksgemv` splits the reduction instead.
+        part = ksgemv(local, fused_w, key=("grm_down", id(fused_w)))
+        if part is None:
+            part = ksplit_linear(local, fused_w)
         if part is None:
             part = linear_rows(local, fused_w, compute_kernel_config=HIFI4)
     whole = all_reduce(part)
