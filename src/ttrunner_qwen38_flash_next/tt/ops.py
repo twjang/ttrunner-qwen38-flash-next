@@ -332,6 +332,121 @@ def _rope_program(x, cos, sin, out, nt, nt_rope):
     ], semaphores=[], cbs=cbs)
 
 
+_QKVH_OUT: dict = {}
+_QKVH_FELL_BACK = False
+_NO_FUSED_QKV_HEADS = bool(os.environ.get("TT_NO_FUSED_QKV_HEADS"))
+
+
+def _qkv_heads_program(qkv, q_out, k_out, v_out, tph, kt, heads, eps, sq, sk):
+    grid = qkv.device().compute_with_storage_grid_size()
+    n = min(heads, grid.x * grid.y)
+    cols = min(n, grid.x)
+    rows = (n + grid.x - 1) // grid.x
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+    cores = [ttnn.CoreCoord(cx, cy) for cy in range(rows) for cx in range(cols)]
+
+    acc = []
+    for t in (qkv, v_out, q_out, k_out):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError("fused qkv heads: every operand must be interleaved")
+        acc.append(ct)
+    page = acc[0][1]
+    if any(a[1] != page for a in acc):
+        raise RuntimeError("fused qkv heads: every operand must share a page size")
+
+    work = [((heads * i) // len(cores), (heads * (i + 1)) // len(cores))
+            for i in range(len(cores))]
+    # All five buffers carry the activation's dtype: the packer is configured
+    # once and the kernel switches between the SFPU and the broadcast FPU path
+    # without reconfiguring it (invariant 76 in the other direction).
+    sizes = {0: tph, 1: tph, 2: 2, 3: 2 * tph, 4: 1}
+    cbs = [ttnn.CBDescriptor(
+        total_size=sizes[i] * page, core_ranges=crs,
+        format_descriptors=[ttnn.CBFormatDescriptor(
+            buffer_index=i, data_format=qkv.dtype, page_size=page)])
+        for i in range(5)]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, v) for c, v in zip(cores, args)], config=cfgd)
+
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("qkv_heads_reader.cpp", [0, kt, 2 * kt, tph, page] + acc[0] + acc[1],
+             [[qkv.buffer_address(), v_out.buffer_address(), lo, hi] for lo, hi in work],
+             ttnn.ReaderConfigDescriptor()),
+        kern("qkv_heads_compute.cpp", [tph, eps, sq, sk],
+             [[lo, hi] for lo, hi in work],
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("qkv_heads_writer.cpp", [tph] + acc[2] + acc[3],
+             [[q_out.buffer_address(), k_out.buffer_address(), lo, hi] for lo, hi in work],
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def fused_qkv_heads(qkv, key_dim: int, value_dim: int, heads: int, head_dim: int,
+                    eps: float, scale_q: float, scale_k: float, key=None):
+    """Split qkv into per-head q, k, v and l2-normalise q and k. Or None.
+
+    Replaces three slices, three reshapes, two `rms_norm`s and two scales -- ten
+    launches a layer, 42.23 us. At M = 1 the slices are tile-aligned and the
+    reshapes are the identity page mapping, so the split is a page copy and only
+    the two norms are arithmetic.
+    """
+    global _QKVH_FELL_BACK
+    if _NO_FUSED_QKV_HEADS:
+        return None
+    try:
+        why = None
+        shape = list(qkv.shape)
+        if shape[:3] != [1, 1, 1]:
+            why = f"qkv is {shape}; this path is M = 1 only"
+        elif shape[3] != 2 * key_dim + value_dim:
+            why = f"qkv is {shape[3]} wide, expected {2 * key_dim + value_dim}"
+        elif key_dim % _TILE or head_dim % _TILE or key_dim != heads * head_dim:
+            why = (f"key_dim {key_dim}, head_dim {head_dim}, heads {heads} are not "
+                   "a tile-aligned head split")
+        elif value_dim != heads * head_dim:
+            why = f"value_dim {value_dim} != heads {heads} x head_dim {head_dim}"
+        if why is not None:
+            if not _QKVH_FELL_BACK:
+                _QKVH_FELL_BACK = True
+                import warnings
+                warnings.warn(f"fused qkv heads declined, using the ops: {why}",
+                              RuntimeWarning, stacklevel=2)
+            return None
+
+        okey = (key, id(qkv.device()), tuple(shape), str(qkv.dtype))
+        outs = _QKVH_OUT.get(okey)
+        if outs is None:
+            outs = tuple(
+                ttnn.from_torch(
+                    torch.zeros(heads, 1, 1, head_dim), dtype=qkv.dtype,
+                    layout=ttnn.TILE_LAYOUT, device=qkv.device(),
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(qkv.device()))
+                for _ in range(3))
+            _QKVH_OUT[okey] = outs
+        q_out, k_out, v_out = outs
+        bits = lambda f: struct.unpack("<I", struct.pack("<f", float(f)))[0]  # noqa: E731
+        ttnn.generic_op(
+            [qkv, q_out, k_out, v_out],
+            _qkv_heads_program(qkv, q_out, k_out, v_out, head_dim // _TILE,
+                               key_dim // _TILE, heads, bits(eps),
+                               bits(scale_q), bits(scale_k)))
+        return q_out, k_out, v_out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _QKVH_FELL_BACK:
+            _QKVH_FELL_BACK = True
+            import warnings
+            warnings.warn(f"fused qkv heads unavailable, using the ops: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 _DSCAL_OUT: dict = {}
 _DSCAL_FELL_BACK = False
 _NO_FUSED_DELTA_SCALARS = bool(os.environ.get("TT_NO_FUSED_DELTA_SCALARS"))

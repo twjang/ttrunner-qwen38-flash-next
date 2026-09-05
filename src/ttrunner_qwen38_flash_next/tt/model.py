@@ -847,21 +847,31 @@ class TTModel:
             qkv = ops.reshape_to(conv_out, (1, 1, batch, self.conv_dim_local))
 
         kd = self.key_dim_local
-        q = self._slice_last(qkv, 0, kd)
-        k = self._slice_last(qkv, kd, 2 * kd)
-        v = self._slice_last(qkv, 2 * kd, 2 * kd + self.value_dim_local)
+        # Ten launches -- three slices, three reshapes, two `rms_norm`s and two
+        # scales -- to turn one row into three per-head stacks. At batch 1 the
+        # slices are tile-aligned and the reshapes are the identity page mapping,
+        # so the split is a page copy and only the two norms are arithmetic.
+        heads = ops.fused_qkv_heads(
+            qkv, kd, self.value_dim_local, batch * n_v, hd, 1e-6,
+            hd ** -0.5, 1.0, key=("ssm", layer)) if batch == 1 else None
+        if heads is not None:
+            q, k, v = heads
+        else:
+            q = self._slice_last(qkv, 0, kd)
+            k = self._slice_last(qkv, kd, 2 * kd)
+            v = self._slice_last(qkv, 2 * kd, 2 * kd + self.value_dim_local)
 
-        # No expansion: the converter gives this device exactly the twelve q/k
-        # heads its twelve v heads pair with, in matching order, so v-head i
-        # reads k-head i. Chunking q/k four ways instead and tiling the local
-        # heads is what cost the engine 25.5 % next-token accuracy against the
-        # reference's 80.9 % (docs/iterations/014).
-        q = ttnn.reshape(q, (batch * n_v, 1, 1, hd))
-        k = ttnn.reshape(k, (batch * n_v, 1, 1, hd))
-        v = ttnn.reshape(v, (batch * n_v, 1, 1, hd))
+            # No expansion: the converter gives this device exactly the twelve
+            # q/k heads its twelve v heads pair with, in matching order, so
+            # v-head i reads k-head i. Chunking q/k four ways instead and tiling
+            # the local heads is what cost the engine 25.5 % next-token accuracy
+            # against the reference's 80.9 % (docs/iterations/014).
+            q = ttnn.reshape(q, (batch * n_v, 1, 1, hd))
+            k = ttnn.reshape(k, (batch * n_v, 1, 1, hd))
+            v = ttnn.reshape(v, (batch * n_v, 1, 1, hd))
 
-        q = self._l2norm(q, scale=hd**-0.5)
-        k = self._l2norm(k)
+            q = self._l2norm(q, scale=hd**-0.5)
+            k = self._l2norm(k)
 
         # `ssm_alpha` and `ssm_beta` are [2560, 48] each and take the same input,
         # so they are one matmul with a wider output. Width costs nothing until
