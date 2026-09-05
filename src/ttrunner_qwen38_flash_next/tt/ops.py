@@ -1960,6 +1960,201 @@ def ksplit_linear(x, w):
     reduced = fused_group_sum(out, key=key)
     return reduced if reduced is not None else ttnn.sum(out, dim=1, keepdim=True)
 
+
+_KSG_OUT: dict = {}
+_KSG_FELL_BACK = False
+_NO_KSGEMV = bool(os.environ.get("TT_NO_KSGEMV"))
+# Bisection handles, off in every normal run: TT_KSG_NOMCAST makes every core
+# read its own activation tiles instead of taking the group head's multicast,
+# and TT_KSG_NOFOLD has each group write its own partial and skips the
+# cross-core handshake. A hang that survives both is in the matmul.
+_KSG_NOMCAST = bool(os.environ.get("TT_KSG_NOMCAST"))
+# The partials are added by `fused_group_sum` in its own launch. The in-kernel
+# fold -- every group writing its partial into the gatherer's L1 and a
+# semaphore counting them -- saves that launch and the DRAM round trip, and is
+# behind TT_KSG_FOLD because it hangs: the SFPU window that adds the partials
+# sits after a matmul window, which no working kernel here does.
+_KSG_FOLD = os.environ.get("TT_KSG_FOLD", "0") == "1"
+_KSG_SEM = int(os.environ.get("TT_KSG_SEM", "2"))
+_KSG_ROWS = int(os.environ.get("TT_KSG_ROWS", "0"))
+
+
+def _ksgemv_plan(grid, kt, nt):
+    """Cores as (k-group, output tile), each group a rectangle. Or None.
+
+    A group has to be a rectangle because the head multicasts the activation to
+    it. Two shapes of rectangle cover everything the model runs: when `nt`
+    divides the grid width, `nt` consecutive cores of one row -- so a 1-tile
+    output gets one group a core and eleven groups a row -- and otherwise whole
+    rows, with the cores past `nt` in the rectangle for the handshake only.
+    """
+    if _KSG_ROWS == 0 and nt <= grid.x and grid.x % nt == 0:
+        per_row = grid.x // nt
+        cores_pg = nt
+        groups = min(kt, per_row * grid.y)
+
+        def where(g, j):
+            return ttnn.CoreCoord((g % per_row) * nt + j, g // per_row)
+    else:
+        rows_pg = max(_KSG_ROWS, -(-nt // grid.x))
+        cores_pg = rows_pg * grid.x
+        groups = min(kt, grid.y // rows_pg)
+
+        def where(g, j):
+            return ttnn.CoreCoord(j % grid.x, g * rows_pg + j // grid.x)
+
+    if groups < 2:
+        return None
+    return cores_pg, groups, where
+
+
+def _ksgemv_program(a, w, out, kt, nt, plan):
+    dev = a.device()
+    grid = dev.compute_with_storage_grid_size()
+    cores_pg, groups, where = plan
+    acc = {}
+    for tag, t in (("a", a), ("w", w), ("o", out)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"k-split gemv: {tag} must be interleaved")
+        acc[tag] = ct
+
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    all_cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
+    d0 = dev.get_devices()[0] if hasattr(dev, "get_devices") else dev
+
+    idle_r = [0] * 13
+    idle_c = [0, 0, 0, groups]
+    idle_w = [0] * 8
+    r_args = {c: idle_r for c in all_cores}
+    c_args = {c: idle_c for c in all_cores}
+    w_args = {c: idle_w for c in all_cores}
+    cap = 0
+    for g in range(groups):
+        lo, hi = (kt * g) // groups, (kt * (g + 1)) // groups
+        cap = max(cap, hi - lo)
+        head = where(g, 0)
+        ph = d0.worker_core_from_logical_core(head)
+        c0 = d0.worker_core_from_logical_core(head)
+        c1 = d0.worker_core_from_logical_core(where(g, cores_pg - 1))
+        for j in range(cores_pg):
+            c = where(g, j)
+            active = int(j < nt)
+            gath = d0.worker_core_from_logical_core(where(0, j))
+            r_args[c] = [a.buffer_address(), w.buffer_address(), lo, hi - lo, j,
+                         active, int(j == 0), c0.x, c0.y, c1.x, c1.y, ph.x, ph.y]
+            c_args[c] = [hi - lo, active, int(g == 0 and active), groups]
+            w_args[c] = [out.buffer_address(), j, active, int(g == 0 and active),
+                         groups, g, gath.x, gath.y]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, args[c]) for c in all_cores], config=cfgd)
+
+    part_page = _TILE * _TILE * 4                    # float32 partials
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=cap * acc["a"][1], core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=0, data_format=a.dtype, page_size=acc["a"][1])]),
+        ttnn.CBDescriptor(
+            total_size=cap * acc["w"][1], core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=1, data_format=w.dtype, page_size=acc["w"][1])]),
+        ttnn.CBDescriptor(
+            total_size=part_page, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=2, data_format=ttnn.float32, page_size=part_page)]),
+        ttnn.CBDescriptor(
+            total_size=groups * part_page, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=3, data_format=ttnn.float32, page_size=part_page)]),
+        ttnn.CBDescriptor(
+            total_size=2 * acc["o"][1], core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=16, data_format=out.dtype, page_size=acc["o"][1])]),
+    ]
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("ksgemv_reader.cpp",
+             [nt, acc["a"][1], acc["w"][1], 1 if _KSG_NOMCAST else cores_pg]
+             + acc["a"] + acc["w"],
+             r_args, ttnn.ReaderConfigDescriptor()),
+        kern("ksgemv_compute.cpp", [1 if _KSG_FOLD else 0], c_args,
+             ttnn.ComputeConfigDescriptor(math_fidelity=ttnn.MathFidelity.HiFi4,
+                                          fp32_dest_acc_en=True)),
+        kern("ksgemv_writer.cpp",
+             [part_page, 1 if _KSG_FOLD else 0, _KSG_SEM, nt] + acc["o"], w_args,
+             ttnn.WriterConfigDescriptor()),
+    ], semaphores=[ttnn.SemaphoreDescriptor(id=i, core_ranges=crs, initial_value=0)
+                   for i in range(max(2, _KSG_SEM + 1))], cbs=cbs)
+
+
+def ksgemv(x, w, key=None):
+    """`x @ w` with the reduction split across cores. Or None.
+
+    `ttnn.linear` at M = 1 gives each output tile to one core, so a narrow output
+    leaves the grid idle: `[2560, 352]` is eleven tiles and runs at 19.6 % of
+    bandwidth, ninety-six times a token. This splits the reduction instead, folds
+    the partials in the kernel rather than with a `ttnn.sum`, and has the group's
+    head multicast the activation -- which at M = 1 is not a detail, since a
+    padded activation tile duplicated across a group is larger than the weight.
+    """
+    global _KSG_FELL_BACK
+    if _NO_KSGEMV:
+        return None
+    try:
+        why = None
+        if len(x.shape) != 4 or x.shape[0] != 1 or x.shape[1] != 1:
+            why = f"x is {list(x.shape)}; this path is [1, 1, M, K]"
+        elif x.shape[-2] > _TILE:
+            why = f"x has {x.shape[-2]} rows; this path is one tile of rows"
+        elif int(x.shape[-1]) != int(w.shape[-2]):
+            why = f"x is {x.shape[-1]} wide, w reduces {w.shape[-2]}"
+        elif int(w.shape[-2]) % _TILE or int(w.shape[-1]) % _TILE:
+            why = f"w is {list(w.shape)}; both axes must be whole tiles"
+        if why is not None:
+            if not _KSG_FELL_BACK:
+                _KSG_FELL_BACK = True
+                import warnings
+                warnings.warn(f"k-split gemv declined, using ttnn.linear: {why}",
+                              RuntimeWarning, stacklevel=2)
+            return None
+
+        dev = x.device()
+        kt, nt = int(w.shape[-2]) // _TILE, int(w.shape[-1]) // _TILE
+        plan = _ksgemv_plan(dev.compute_with_storage_grid_size(), kt, nt)
+        if plan is None:
+            return None                # the output already fills the grid
+
+        groups = plan[1]
+        okey = (key, id(dev), int(w.shape[-1]), str(x.dtype), groups,
+                int(x.shape[-2]))
+        out = _KSG_OUT.get(okey)
+        if out is None:
+            out = ttnn.from_torch(
+                torch.zeros(1, 1 if _KSG_FOLD else groups, int(x.shape[-2]),
+                            int(w.shape[-1])),
+                dtype=x.dtype, layout=ttnn.TILE_LAYOUT, device=dev,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(dev))
+            _KSG_OUT[okey] = out
+        ttnn.generic_op([x, w, out], _ksgemv_program(x, w, out, kt, nt, plan))
+        if _KSG_FOLD:
+            return out
+        reduced = fused_group_sum(out, key=okey)
+        return reduced if reduced is not None else ttnn.sum(out, dim=1, keepdim=True)
+    except Exception as exc:                                        # noqa: BLE001
+        if not _KSG_FELL_BACK:
+            _KSG_FELL_BACK = True
+            import warnings
+            warnings.warn(f"k-split gemv unavailable, using ttnn.linear: "
+                          f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+
+
 # --- down and inject as one matmul -------------------------------------------
 #
 # `inject_w` is [10240, 4]: four output columns, one tile, and the narrowest
