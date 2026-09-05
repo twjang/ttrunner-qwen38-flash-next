@@ -4523,3 +4523,60 @@ The matmuls are 9.45 ms and the memory roofline is 7.9. Everything above is the
 gap, and every entry in it is a chain of ops that exists to move between the ops
 around it.
 
+### 27.6 Three more, and what each cost to find
+
+| change | `ab_step.py` | shape of the fix |
+|---|---:|---|
+| `decode_step`: split matmul + broadcast outer | +0.56 | op choice, no kernel |
+| shared expert uses `fused_swiglu` | +0.57 | a kernel that already existed |
+| k-split partials reduced on their own cores | +0.38 | a new, very small kernel |
+
+The step reads **40.78 ms** median on `decode_ablation_check.py none`, from 47.87
+at the start of the session. The `ab_step.py` deltas sum to 5.52; that harness
+drifts about two milliseconds between processes, so the two numbers are the same
+number.
+
+**An outer product is not a matmul.** `kᵀ delta` was `ttnn.matmul` contracting
+over a K of one -- 21.05 us, against 9.37 for the broadcast multiply that is what
+an outer product actually is, bit for bit the same answer.
+
+**A change under the noise floor can still be worth keeping.** The split matmul
+and the broadcast outer read -0.10 and +0.10 flipped one at a time, and +0.56
+flipped together. `ab_step.py` now takes comma-separated flags.
+
+INVARIANT 86: two changes of ~0.3 ms each cannot be decided separately on this
+rig. Flip them together, then split only if the pair wins.
+
+### 27.7 Rejected, with numbers
+
+* **The norm weight inside `ttnn.rms_norm`.** Would drop a 320-tile multiply
+  (7.31 us). The layernorm weight is one vector broadcast over rows, and the
+  hyper-connection norm's weight differs per group (max difference 8.7 between
+  groups of `hc_attn_norm.weight`), so it cannot be expressed. It also measured
+  wrong before that was understood -- relative error 1.23.
+* **Applying the norm weight while still sharded.** Eight cores instead of a
+  hundred and ten, so it should have been ~5 us cheaper. It is **41.00 us against
+  24.55**, and off by 1.08e-02 as well. `ttnn.multiply` on two width-sharded
+  operands is not the cheap path it looks like.
+* **`w:` ablations are broken.** Stubbing any piece of the wide expert path
+  (`w:scale`, `w:swiglu`, `w:gather`, `w:linear1`, `w:linear2`) makes
+  `apply_experts` fall back to `sparse_matmul`, and every one of them reads
+  ~145 ms against a 43 ms baseline. They cannot be used to price anything inside
+  that path.
+
+### 27.8 Where it stands
+
+    47.87 -> 40.78 ms a token      (21.0 -> 24.5 tok/s)
+    matmuls  ~9.4 ms               memory roofline 7.9 ms
+
+Measured components, against a 44.7 ms baseline taken in the same batch:
+
+    deltanet 11.18   moe 8.76   shared 3.64   g:down 3.08   g:norm 2.83
+    reinject 2.84    qsa 4.27   g:up 1.42     g:mean 0.98   g:allreduce 0.92
+    decode_step 1.51 (inside deltanet)
+
+The largest single fusible chain left is `grouped_rms_norm` at 2.83 ms over 100
+calls -- six launches to normalise four groups and scale them. A two-launch
+kernel prices at ~18 us against 24.6, so about 0.8 ms; nothing else on the list
+is bigger. Section 25.1 still holds: the remaining gap is op *count*, and closing
+it means one kernel per sub-block rather than one per arithmetic step.
