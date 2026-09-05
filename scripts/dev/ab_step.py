@@ -14,6 +14,18 @@ this does the same, flipping a module attribute between captures.
 
 Takes the minimum of nine timed steps, twice each way, alternating, and reports
 both orders so a warm-up trend is visible rather than hidden.
+
+**This rarely finishes any more, and it is not the flag's fault.** A traced
+replay wedges with about 2 % probability (handoff 45.4 -- in *replay*, not
+capture, which 44.5 had wrong), so a harness's chance of completing falls off
+with the number of replays it does. Four captures and four timed runs in one
+process compound that into near-certain failure, while a one-capture harness
+finishes three times in five. Until the replay hang is found, A/B a flag with
+repeated single-capture processes and retries instead: see
+`scratchpad/flagab.sh`, which runs `deltanet_cumulative.py` with no stubs once
+per process and takes the median of the runs that survive. The in-process design
+here is still the right one -- it is what removes the rig's ~0.5 ms drift -- so
+this is worth reviving the moment the replay hang is fixed.
 """
 import importlib
 import sys
