@@ -381,6 +381,8 @@ _SWIGLU_OUT: dict = {}
 _SWIGLU_FELL_BACK = False
 # The shared expert had its own unfused copy of the SwiGLU chain.
 _NO_SHEXP_SWIGLU = bool(os.environ.get("TT_NO_SHEXP_SWIGLU"))
+# The shared expert's scalar gate concatenated onto its gate|up matmul.
+_NO_FUSED_SHEXP_GATE = bool(os.environ.get("TT_NO_FUSED_SHEXP_GATE"))
 
 
 def _swiglu_output(src, n_out: int):
@@ -964,10 +966,23 @@ def shared_expert(
     """The always-on expert, with its own sigmoid gate."""
     # gate and up take the same input, so they are one matmul with a wider
     # output: 3.48 ms a token becomes 1.93 (invariant 55).
-    key = (id(gate_w), id(up_w))
+    # `gate_vec` is [2560, 1]: one output tile, one core of a hundred and ten,
+    # **9.80 us to produce a single number** -- and it takes the same input as
+    # gate|up. Concatenated onto the end it is free: 14.67 us for the pair
+    # against 24.19 apart, because output width costs nothing until it fills the
+    # grid (invariant 55). The tail tile is sliced back off, which is ~3 us of
+    # the ~9.5 saved.
+    key = (id(gate_w), id(up_w), id(gate_vec), _NO_FUSED_SHEXP_GATE)
     fused = _SHEXP_GU.get(key)
     if fused is None:
-        fused = ttnn.concat([gate_w, up_w], dim=-1)
+        parts = [gate_w, up_w]
+        if not _NO_FUSED_SHEXP_GATE:
+            pad = (TILE - gate_vec.shape[-1] % TILE) % TILE
+            gv = ttnn.pad(gate_vec, [(0, 0), (0, 0), (0, 0), (0, pad)], 0.0) if pad \
+                else gate_vec
+            parts.append(gv if gv.dtype == gate_w.dtype
+                         else ttnn.typecast(gv, gate_w.dtype))
+        fused = ttnn.concat(parts, dim=-1)
         _SHEXP_GU[key] = fused
     both = fast_linear(x, fused, compute_kernel_config=HIFI4)
     n = gate_w.shape[-1]
@@ -988,9 +1003,15 @@ def shared_expert(
     # a 10 KB weight, **0.1 % of bandwidth**, 48 calls a token. It is the exact
     # shape the k-split exists for -- give the other 79 cores a slice of the
     # 2560-long reduction instead.
-    gate = None if _NO_SHEXP_KSPLIT else ksplit_linear(x, gate_vec)
-    if gate is None:
-        gate = fast_linear(x, gate_vec, compute_kernel_config=HIFI4)
+    if _NO_FUSED_SHEXP_GATE:
+        gate = None if _NO_SHEXP_KSPLIT else ksplit_linear(x, gate_vec)
+        if gate is None:
+            gate = fast_linear(x, gate_vec, compute_kernel_config=HIFI4)
+    else:
+        # The original width, not the padded one: `out` is 2560 wide and the
+        # gate has to broadcast against it, which a 32-column slice will not.
+        gate = ttnn.slice(both, (0, 0, 0, 2 * n),
+                          (1, e, mrows, 2 * n + gate_vec.shape[-1]))
     return ttnn.multiply(out, ttnn.sigmoid(gate))
 
 
