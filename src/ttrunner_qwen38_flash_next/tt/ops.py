@@ -356,7 +356,23 @@ def fused_gated_mean(mix, normed, hc_count: int, hidden_size: int,
 # a pairwise summation and better conditioned than one long serial accumulation.
 # The two differ from each other by 1.73e-02, which is what nearly got this
 # discarded -- divergence from `ttnn.linear` is not error (invariant 57).
-_NO_FUSED_REINJECT = bool(os.environ.get("TT_NO_FUSED_REINJECT"))
+# The fused reinject is **off**. It is correct -- bit-exact against the ops in
+# the sense that matters, and *closer* to float64 at every shape once the
+# destination registers accumulate in fp32 (4.06e-03 against 4.35e-03 at M=1,
+# 3.54e-03 against 6.11e-03 on the raw form) -- and it is slower: 51.74/51.44 ms
+# a token against 50.79/50.79 for the eight ttnn ops it replaces, both pairs
+# agreeing.
+#
+# Why, so nobody rebuilds it: the SFPU multiplies whole tiles, so the per-row
+# injection scalar has to be spread across a tile first, and that spread is 1024
+# scalar writes which the reader redoes for every one of the 320 output tiles a
+# call. Caching it does not help because the circular buffer's slots alternate.
+# The ops it replaces are launch-bound rather than bandwidth-bound -- 5.8 us each
+# whatever they move (invariant 66) -- so eight of them on 655 KB tiles is a low
+# bar that a kernel doing real per-tile work does not clear.
+#
+# `TT_FUSED_REINJECT=1` turns it back on.
+_NO_FUSED_REINJECT = os.environ.get("TT_FUSED_REINJECT", "0") != "1"
 _KSPLIT: dict = {}
 _KS_KDIR = Path(__file__).resolve().parents[3] / "scripts" / "kernels"
 
@@ -577,6 +593,7 @@ def gated_residual_mix(
 
 
 _REINJECT_OUT: dict = {}
+_REINJECT_FELL_BACK = False
 
 
 def _reinject_output(hyper):
@@ -619,8 +636,8 @@ def _reinject_program(hyper, branch, inject, out, hc_count: int, inj_base=None):
         raise RuntimeError(f"fused reinject: dtype {hyper.dtype} unsupported")
 
     hidden = branch.shape[-1]
-    nt_h = hidden // TILE
-    mt = max(branch.shape[-2] // TILE, 1)
+    nt_h = hidden // _TILE
+    mt = max(branch.shape[-2] // _TILE, 1)
     if hyper.shape[-1] != hc_count * hidden:
         raise RuntimeError("fused reinject: hyper is not hc_count * hidden wide")
     total = mt * hc_count * nt_h
@@ -664,8 +681,12 @@ def _reinject_program(hyper, branch, inject, out, hc_count: int, inj_base=None):
                  [[hyper.buffer_address(), branch.buffer_address(),
                    inject.buffer_address(), lo, hi] for lo, hi in work],
                  ttnn.ReaderConfigDescriptor()),
+            # fp32 in the destination registers. Without it the product and
+            # the sum each round to bfloat16 on the way through DST, which is
+            # one rounding more than the ops it replaces do -- measured 7.98e-03
+            # against float64 where the ops are 4.35e-03.
             kern("reinject_compute.cpp", [int(raw)], [[hi - lo] for lo, hi in work],
-                 ttnn.ComputeConfigDescriptor()),
+                 ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
             kern("reinject_writer.cpp", acc["o"],
                  [[out.buffer_address(), lo, hi] for lo, hi in work],
                  ttnn.WriterConfigDescriptor()),
@@ -712,8 +733,17 @@ def reinject(hyper: ttnn.Tensor, branch: ttnn.Tensor, inject: ttnn.Tensor, hc_co
                 [hyper, branch, inject, out],
                 _reinject_program(hyper, branch, inject, out, hc_count, base))
             return out
-        except Exception:                                       # noqa: BLE001
-            pass
+        except Exception as exc:                                # noqa: BLE001
+            # Not silent. A `pass` here would leave the ops running while every
+            # measurement claimed the kernel -- which is the exact shape of the
+            # bug this project already recorded once, in `moe_block`.
+            global _REINJECT_FELL_BACK
+            if not _REINJECT_FELL_BACK:
+                _REINJECT_FELL_BACK = True
+                import warnings
+                warnings.warn(
+                    f"fused reinject unavailable, using the ops: "
+                    f"{type(exc).__name__}: {exc}", RuntimeWarning, stacklevel=2)
 
     hidden = branch.shape[-1]
     m = branch.shape[-2]

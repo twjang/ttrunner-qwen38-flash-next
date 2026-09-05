@@ -91,7 +91,13 @@ void kernel_main() {
     // is only L1-aligned, so the landing address is forced to 64 B.
     const uint32_t scratch = (get_write_ptr(cb_scratch) + 63u) & ~63u;
 
-    uint32_t have = 0xffffffffu;            // which page the scratch holds
+    // Which (page, column) the *broadcast* CB slot already holds. Work items run
+    // consecutively in c, so h -- and with it the column -- changes once every
+    // NT_H of them: rebuilding the spread on every item was 1024 scalar writes a
+    // tile and cost more than the ops this kernel replaces.
+    uint32_t have = 0xffffffffu;
+    uint32_t have_col = 0xffffffffu;
+    uint32_t bcast_l1 = 0;
     for (uint32_t w = work_lo; w < work_hi; ++w) {
         const uint32_t mt = w / NT;
         const uint32_t c = w - mt * NT;
@@ -104,16 +110,23 @@ void kernel_main() {
                                        : (h * MT + mt);
         cb_reserve_back(cb_bcast, 1);
         const uint32_t bc = get_write_ptr(cb_bcast);
+        const bool fresh = (which != have) || (src_col != have_col) || (bc != bcast_l1);
         if (which != have) {
             noc_async_read_page(which, i_acc, scratch);
             noc_async_read_barrier();
             have = which;
         }
+        if (fresh) {
+            have_col = src_col;
+            bcast_l1 = bc;
+        }
         // Spread that column across all 32, so the elementwise multiply
         // downstream sees a per-row scalar. Rebuilt every work item rather than
         // cached, because under INJ_RAW four consecutive h values share one
         // page and differ only in the column.
-        if (BF16) {
+        if (!fresh) {
+            // the CB slot already holds this scalar spread
+        } else if (BF16) {
             volatile tt_l1_ptr uint16_t* src =
                 reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scratch);
             volatile tt_l1_ptr uint16_t* dst =

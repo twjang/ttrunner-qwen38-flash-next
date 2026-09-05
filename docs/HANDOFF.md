@@ -3962,3 +3962,62 @@ larger sample, and several in this session were closer than they looked. The two
 that survive it are the k-split zero bug (median NLL 0.415 -> 0.236, against a
 0.226-0.232 spread) and the exact-vs-threshold router rule, which was
 indistinguishable and is now known to have been *comfortably* indistinguishable.
+
+## 20. The fused reinject: a silent `except`, and then a negative result
+
+Two lessons, in the order they were learned.
+
+### 20.1 It had never run
+
+`reinject`'s fused path was written, measured at "0.40 ms", committed, extended
+to take the gate stream raw, measured again at "0.2 ms", and committed again. It
+had **never executed**. `_reinject_program` used `TILE` where this module spells
+it `_TILE`, every call raised `NameError`, and the fallback was:
+
+    except Exception:                                       # noqa: BLE001
+        pass
+
+So both "measurements" were the op path against the op path, and the check that
+declared it *bit-identical* was comparing the fallback with itself.
+
+This is the same defect this project already recorded once, in `moe_block`,
+where a silent swallow "would have left the old path running while every
+measurement claimed the new one". The comment saying so was three hundred lines
+away in another file.
+
+INVARIANT 71: a fallback around a kernel must be loud the first time it fires.
+Not a log line at debug level -- a `warnings.warn` that shows up in a
+measurement's own output. A kernel that silently is not running looks exactly
+like a kernel that is not helping, and the second is a much more comfortable
+conclusion to reach.
+
+### 20.2 And once it ran, it lost
+
+With the name fixed the kernel is correct, and *more* accurate than the ops once
+the destination registers accumulate in fp32 -- against float64 at M=1 it is
+4.06e-03 where the ops are 4.35e-03, and on the raw gate form 3.54e-03 against
+6.11e-03. Without `fp32_dest_acc_en` it was 7.98e-03, one rounding worse than the
+ops, which the check caught.
+
+It is also **slower**: 51.74 and 51.44 ms a token against 50.79 and 50.79 for the
+eight ttnn ops it replaces, both pairs agreeing. Off by default;
+`TT_FUSED_REINJECT=1` turns it on.
+
+The reason is worth keeping, because it bounds the whole fusion backlog. The
+SFPU multiplies whole tiles, so a per-row scalar has to be spread across one
+first, and that spread is 1024 scalar writes which the reader redoes for each of
+the 320 output tiles a call. Caching it fails because the circular buffer's slots
+alternate.
+
+INVARIANT 72: the ops a fusion replaces are launch-bound, not bandwidth-bound --
+5.8 us each whatever they move (invariant 66). Eight of them on 655 KB tiles is
+40 us, and a kernel that does any real per-tile work does not clear that bar.
+Fusion pays where the replaced ops are *many and tiny*, or where the kernel's own
+work is *less* than theirs (the SwiGLU and gated-mean kernels both removed
+E=128-wide traffic; this one added scalar work instead).
+
+That also explains the two earlier misfires in this session. The op-count model
+-- `(N - 2) x 5.8 us` -- is an upper bound on what a fusion can return, and the
+kernel's own cost is the term nobody estimates. On this evidence the remaining
+"~10 ms of fusion" in 17.1 should be read as an upper bound with no lower bound
+attached.
