@@ -53,9 +53,80 @@ def grouped_rms_norm(
 
     # Fold the group axis into rows so the normalised axis is the last one.
     folded = ttnn.reshape(x, (shape[0], shape[1], shape[2] * groups, group_size))
-    normed = ttnn.rms_norm(folded, epsilon=eps, compute_kernel_config=HIFI4)
+    normed = _sharded_rms_norm(folded, eps)
+    if normed is None:
+        normed = ttnn.rms_norm(folded, epsilon=eps, compute_kernel_config=HIFI4)
     normed = ttnn.reshape(normed, shape)
     return ttnn.multiply(normed, weight)
+
+
+# `ttnn.rms_norm` on its default program config is **18.0 us** for the 80-tile
+# row this normalises, three to four times what a wide elementwise op costs. Its
+# sharded config is 5.6 us -- and *four times more accurate*, 4.96e-03 from
+# float64 against the default's 2.09e-02 (`rms_norm_config.py`), which is the
+# same shape as the matmul's program config (handoff 19): the default is not a
+# neutral choice, it is a slow and slightly worse one.
+#
+# The sharding round trip costs ~2.1 us each way and is counted in the total.
+_RMSN_CFG: dict = {}
+_NO_SHARDED_RMSNORM = bool(os.environ.get("TT_NO_SHARDED_RMSNORM"))
+
+
+def _sharded_rms_norm(x, eps: float):
+    """`rms_norm` through the sharded config, or None to let the caller use the op."""
+    if _NO_SHARDED_RMSNORM:
+        return None
+    # **One row-tile only.** The sharded config's `block_h` is the row-tile
+    # count, and the reduction it performs depends on it -- so a batch whose
+    # folded stream is more than 32 rows normalises differently from a single
+    # sequence, and `batch_equivalence_check.py` went 32/32 -> 8/32. The default
+    # op is row-count independent. Restricting this to one row-tile keeps decode
+    # (four rows at batch 1) on the fast path and everything wider on the exact
+    # one; the two still differ from each other, which is the price and is why
+    # `TT_NO_SHARDED_RMSNORM=1` exists.
+    if x.shape[-2] > _TILE:
+        return None
+    key = (tuple(x.shape), str(x.dtype), id(x.device()))
+    plan = _RMSN_CFG.get(key)
+    if plan is False:
+        return None
+    try:
+        if plan is None:
+            grid = x.device().compute_with_storage_grid_size()
+            nt = output_tiles(x.shape[-1])
+            rows = max(x.shape[-2], _TILE)
+            plan = False
+            # Eight cores at ten tiles each was the fastest that builds; twenty
+            # and beyond are rejected by the op, and fewer than four gives up
+            # most of the speed.
+            for n_cores in (8, 10, 4, 5, 2):
+                if nt % n_cores or n_cores > grid.x * grid.y:
+                    continue
+                bw = nt // n_cores
+                sub = next((sw for sw in (4, 2, 1) if bw % sw == 0), 1)
+                crs = ttnn.num_cores_to_corerangeset(n_cores, grid, True)
+                spec = ttnn.ShardSpec(crs, [rows, x.shape[-1] // n_cores],
+                                      ttnn.ShardOrientation.ROW_MAJOR)
+                mc = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                                       ttnn.BufferType.L1, spec)
+                pc = ttnn.LayerNormShardedMultiCoreProgramConfig(
+                    compute_with_storage_grid_size=grid, subblock_w=sub,
+                    block_h=max(1, (x.shape[-2] + _TILE - 1) // _TILE),
+                    block_w=bw, inplace=False)
+                xs = ttnn.to_memory_config(x, mc)
+                ttnn.rms_norm(xs, epsilon=eps, program_config=pc, memory_config=mc)
+                plan = (mc, pc)
+                break
+            _RMSN_CFG[key] = plan
+            if plan is False:
+                return None
+        mc, pc = plan
+        xs = ttnn.to_memory_config(x, mc)
+        out = ttnn.rms_norm(xs, epsilon=eps, program_config=pc, memory_config=mc)
+        return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG)
+    except Exception:                                               # noqa: BLE001
+        _RMSN_CFG[key] = False
+        return None
 
 
 def reshape_to(x: ttnn.Tensor, shape) -> ttnn.Tensor:

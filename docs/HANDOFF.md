@@ -4375,3 +4375,46 @@ racing garbage into tile (0,0), which was the model's entire run-to-run
 nondeterminism. The last one matters most for whoever continues: **the rig is now
 bit-reproducible and batch-exact to 32 slots**, so a change can be decided
 instead of argued about.
+
+## 26. `ttnn.rms_norm`'s default config is slow *and* less accurate
+
+The same shape as the matmul (19). `grouped_rms_norm` is 3.83 ms of the step, and
+`grouped_norm_pieces.py` puts it where it was not expected -- at M=1 the two
+re-tiling reshapes are only 4.98 and 6.22 us, the weight multiply 6.98, and
+**`ttnn.rms_norm` itself is 18.0 us** on an 80-tile row.
+
+`rms_norm_config.py` runs it through `LayerNormShardedMultiCoreProgramConfig`:
+
+| | us | vs float64 |
+|---|---:|---:|
+| default | 18.00 | 2.09e-02 |
+| 2 cores, block_w 40 | 9.99 | 6.75e-03 |
+| 4 cores, block_w 20 | 6.85 | **4.73e-03** |
+| **8 cores, block_w 10** | **5.57** | 4.96e-03 |
+| 10 cores, block_w 8 | 5.57 | 6.68e-03 |
+
+**3.2x faster and four times nearer the truth.** Twenty cores and beyond are
+rejected by the op. The sharding round trip is ~2.1 us each way and is counted.
+
+Deployed in `grouped_rms_norm`, measured with `ab_step.py`: **+1.28 ms**, step
+48.53 -> 47.25.
+
+INVARIANT 82: ttnn's default program configs are not neutral choices. Twice now
+-- the matmul's `in0_block_w` of two, and this -- the default has been both
+slower and less accurate than a config chosen for the shape. Any op that takes a
+`program_config` is worth ten minutes of sweeping before it is worth a kernel.
+
+### 26.1 The price, which is real
+
+The sharded config's `block_h` is the row-tile count and its reduction depends on
+it, so a stream of more than 32 rows normalises differently from a shorter one.
+`batch_equivalence_check.py` went 32/32 -> 8/32.
+
+Restricting it to a single row-tile keeps decode on the fast path (four rows at
+batch 1) and sends anything wider to the exact op, but the two still differ from
+each other, so **batched decode is now exact to 8 slots rather than 32**. Batch 8
+is 8/8; batch 32 agrees row-to-row and no longer matches a single-sequence run.
+
+That is a deliberate trade of a serving property for 1.28 ms of the thing the
+goal asks for, and `TT_NO_SHARDED_RMSNORM=1` reverses it. Anyone who needs
+32-slot exactness more than 2.7 % of the step should set it.
