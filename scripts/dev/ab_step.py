@@ -32,13 +32,19 @@ m.selection_active = False
 mod = importlib.import_module(f"ttrunner_qwen38_flash_next.tt.{MODULE}")
 from ttrunner_qwen38_flash_next.tt.traced import TracedDecoder       # noqa: E402
 
-if not hasattr(mod, FLAG):
-    raise SystemExit(f"{MODULE} has no attribute {FLAG}")
-original = getattr(mod, FLAG)
+# Several flags at once, comma-separated: two changes that are each within the
+# noise can still be worth keeping or dropping together, and flipping them one
+# at a time cannot tell you.
+FLAGS = FLAG.split(",")
+for f in FLAGS:
+    if not hasattr(mod, f):
+        raise SystemExit(f"{MODULE} has no attribute {f}")
+original = {f: getattr(mod, f) for f in FLAGS}
 
 
 def measure(off: bool) -> float:
-    setattr(mod, FLAG, off)
+    for f in FLAGS:
+        setattr(mod, f, off)
     state = m.new_state(batch=1)
     dec = TracedDecoder(m, state)
     dec.reset()
@@ -57,7 +63,7 @@ def measure(off: bool) -> float:
 
 ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 3
 
-print(f"RESULT flipping {MODULE}.{FLAG} (its default is {original})", flush=True)
+print(f"RESULT flipping {MODULE}.{FLAG} (defaults {original})", flush=True)
 # The first capture in a process is reliably the slowest -- caches, first-touch
 # allocation, the program cache filling -- and whichever side runs first wears
 # that cost. One discarded measurement makes the two sides comparable; without
@@ -71,7 +77,8 @@ for i in range(ROUNDS):
     off.append(b)
     print(f"RESULT   round {i + 1}: on {a:7.2f} ms   off {b:7.2f} ms   "
           f"{b - a:+.2f}", flush=True)
-setattr(mod, FLAG, original)
+for _f, _v in original.items():
+    setattr(mod, _f, _v)
 
 mo, mf = min(on), min(off)
 print(f"RESULT best: on {mo:7.2f} ms, off {mf:7.2f} ms -> "

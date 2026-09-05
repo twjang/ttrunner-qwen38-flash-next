@@ -23,9 +23,26 @@ chunk of tokens rather than one.
 
 from __future__ import annotations
 
+import os
+
 import ttnn
 
 from .ops import HIFI4
+
+
+_NO_SPLIT_KQ = bool(os.environ.get("TT_NO_SPLIT_KQ"))
+_NO_BCAST_OUTER = bool(os.environ.get("TT_NO_BCAST_OUTER"))
+# One megabyte of state, in tiles of a float32 32x32. Above this, reading it
+# twice costs more than the concat that avoids it.
+_SPLIT_KQ_MAX_TILES = 256
+
+
+def _tiles(t) -> int:
+    n = 1
+    sh = list(t.shape)
+    for d in sh[:-2]:
+        n *= d
+    return n * max(1, (sh[-2] + 31) // 32) * max(1, (sh[-1] + 31) // 32)
 
 
 def decode_step(
@@ -62,16 +79,35 @@ def decode_step(
     #                                  = q@decayed + (q·k) delta
     #
     # since q and k are single rows, so q @ kᵀ is a scalar per head.
-    kq = ttnn.concat([k, q], dim=-2)                                  # [BH,1,2,Dk]
-    both = ttnn.matmul(kq, decayed, compute_kernel_config=HIFI4)      # [BH,1,2,Dv]
-    shape = list(both.shape)
-    v_dim = shape[-1]
-    predicted = ttnn.slice(both, (0, 0, 0, 0), (shape[0], shape[1], 1, v_dim))
-    q_decayed = ttnn.slice(both, (0, 0, 1, 0), (shape[0], shape[1], 2, v_dim))
+    #
+    # It stops paying once the state is small. `chain_price.py`: the concat is
+    # **20.15 us** -- a two-row stack of [BH,1,1,Dk] tensors is a sub-tile row
+    # interleave, which is data movement, not arithmetic -- and the matmul costs
+    # 23.59 us at two rows against 23.86 at one, so the second matmul is nearly
+    # free. With the two slices that the split also removes (5.26 us each), one
+    # matmul plus a concat plus two slices is 54.2 us where two matmuls are 47.7.
+    # The saving is the concat; the crossover is where reading the state twice
+    # costs more than that, which at 388 GB/s is around a megabyte.
+    small = _tiles(state) <= _SPLIT_KQ_MAX_TILES
+    if _NO_SPLIT_KQ or not small:
+        kq = ttnn.concat([k, q], dim=-2)                              # [BH,1,2,Dk]
+        both = ttnn.matmul(kq, decayed, compute_kernel_config=HIFI4)  # [BH,1,2,Dv]
+        shape = list(both.shape)
+        v_dim = shape[-1]
+        predicted = ttnn.slice(both, (0, 0, 0, 0), (shape[0], shape[1], 1, v_dim))
+        q_decayed = ttnn.slice(both, (0, 0, 1, 0), (shape[0], shape[1], 2, v_dim))
+    else:
+        predicted = ttnn.matmul(k, decayed, compute_kernel_config=HIFI4)
+        q_decayed = ttnn.matmul(q, decayed, compute_kernel_config=HIFI4)
 
     delta = ttnn.multiply(ttnn.subtract(v, predicted), beta)
-    # outer product kᵀ delta : [Dk, 1] x [1, Dv]
-    update = ttnn.matmul(ttnn.transpose(k, -2, -1), delta, compute_kernel_config=HIFI4)
+    # outer product kᵀ delta : [Dk, 1] x [1, Dv]. As a matmul this contracts over
+    # a K of **one**, which is the worst shape a matmul has: 21.05 us against
+    # 9.37 for the same numbers as a broadcast multiply, which is what an outer
+    # product is. Both round to bfloat16 at the end and agree to 3.9e-03.
+    kt = ttnn.transpose(k, -2, -1)
+    update = (ttnn.matmul(kt, delta, compute_kernel_config=HIFI4) if _NO_BCAST_OUTER
+              else ttnn.multiply(kt, delta))
     # write straight into the state buffer: `copy(add(...), state)` made two full
     # passes over it (1.23 ms vs 0.75 ms at B=32)
     ttnn.add(decayed, update, output_tensor=state)
