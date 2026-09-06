@@ -7628,6 +7628,26 @@ numerical bug. Stop looking at the maths. Something is reading or writing memory
 it does not own, and the question is which core and which page -- not which
 formula.
 
+**Interleaved states do not reproduce it.** `recur_seq_check.py` gained
+`TT_RECUR_LAYERS_SIM=L`, which keeps L independent states and cycles them the way
+the model's 36 DeltaNet layers do -- the obvious candidate if the foreign data
+comes from one launch's leftovers reaching the next. At L=36, 36 steps, no model
+loaded:
+
+    op chain final state error   4.193e-01
+    fused   final state error    4.187e-01
+
+The float64 reference is meaningless there (it tracks one chain, not 36), but the
+comparison that matters is fused against op chain, and **they agree**. So
+interleaving alone is not the trigger, and there is still no reproduction outside
+the model -- every attempt costs a 7-minute `device_quality.py` run.
+
+That is the first thing the next session should fix. Candidates for what the
+model adds that the standalone does not: 47 other layers' programs between
+consecutive DeltaNet launches, ~2200 ops a step touching L1, the QSA layers'
+allocations, and the MoE's expert gathers. Bisect by adding those to the
+standalone, not by removing them from the model.
+
 **Next step**, and it is small: read one `kt` tile back with `to_torch` and see
 where the data sits. If it is in row 0, the fix is either `transpose_wh_tile` in
 the compute kernel (the codebase already uses it) or dropping `kt` entirely and

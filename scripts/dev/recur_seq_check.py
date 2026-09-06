@@ -65,15 +65,22 @@ def main() -> None:
             ref_outs.append(rq @ decayed + (rq * rk).sum(-1, keepdim=True) * delta)
             ref_state = decayed + rk.transpose(-2, -1) @ delta
 
+        LAYERS = int(__import__("os").environ.get("TT_RECUR_LAYERS_SIM", "1"))
+
         def arm(fused):
             # `decode_step` tries the fused path itself when TT_FUSED_RECUR=1,
             # so the control arm has to switch the module flag off -- otherwise
             # both arms run the same kernel and report identical error, which is
             # exactly what the first version of this script did.
             ops._NO_FUSED_RECUR = not fused
-            st = dev(s0)
+            # `TT_RECUR_LAYERS_SIM=L` keeps L independent states and cycles
+            # through them, the way the model's 36 DeltaNet layers do. One state
+            # is the case that passes; handoff 45.36 says the corruption is
+            # foreign data, so interleaved launches are what to try next.
+            sts = [dev(s0) for _ in range(LAYERS)]
             errs = []
             for i, (q, k, v, g, b) in enumerate(seq):
+                st = sts[i % LAYERS]
                 dq, dk, dv_, dg, db = (dev(x) for x in (q, k, v, g, b))
                 if fused:
                     out = ttnn.from_torch(
@@ -86,7 +93,7 @@ def main() -> None:
                 else:
                     got = la.decode_step(dq, dk, dv_, dg, db, st)
                 errs.append(float((back(got) - ref_outs[i]).abs().max()))
-            return errs, back(st)
+            return errs, back(sts[0])
 
         base = arm(False)
         fus = arm(True)
