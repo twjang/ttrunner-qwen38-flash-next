@@ -88,7 +88,7 @@ void kernel_main() {
     constexpr uint32_t DKT = get_compile_time_arg_val(0);
     constexpr uint32_t STAGE = get_compile_time_arg_val(1);
     constexpr uint32_t cb_s = 0, cb_q = 1, cb_k = 2, cb_v = 3, cb_g = 4, cb_b = 5,
-                       cb_kt = 6;
+                       cb_kt = 6, cb_mask = 15, cb_ktm = 18;
     constexpr uint32_t cb_dec = 7, cb_pred = 8, cb_qdec = 9, cb_qk = 10,
                        cb_diff = 11, cb_delta = 12, cb_upd = 13, cb_op = 14;
     constexpr uint32_t cb_out = 16, cb_snew = 17;
@@ -275,11 +275,37 @@ void kernel_main() {
     // more and then addressing them with an indexed `pack_tile` is an indexed
     // write into a wrapped circular buffer, and that is where the restructured
     // write-back hung two runs out of two against a 12 % base rate.
-    matmul_init(cb_kt, cb_delta);
+    // **Mask kt's pad columns first** (handoff 45.32, invariant 150). The outer
+    // product below is a matmul, and `matmul_tiles` contracts all 32 columns --
+    // `sum_c kt[a,c] * delta[c,b]` only collapses to `kt[a,0] * delta[0,b]` if
+    // one operand's padding is zero. `kt` reaches this kernel through
+    // `ttnn.transpose` on a recycled buffer, so its pad columns hold whatever
+    // was there before; in the model that made the *state* infinite while the
+    // output, which never contracts over the pad, stayed correct to 9.6e-04.
+    // `cb_mask` is 1 in column 0 and 0 elsewhere, so `cb_ktm` has exactly the
+    // column the outer product needs and nothing else.
+    cb_wait_front(cb_mask, 1);
+    init_sfpu(cb_kt, cb_ktm);
+    cb_reserve_back(cb_ktm, DKT);
+    for (uint32_t i = 0; i < DKT; ++i) {
+        tile_regs_acquire();
+        copy_tile(cb_kt, i, 0);
+        copy_tile(cb_mask, 0, 1);
+        mul_binary_tile_init();
+        mul_binary_tile(0, 1, 2);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile(2, cb_ktm, i);
+        tile_regs_release();
+    }
+    cb_push_back(cb_ktm, DKT);
+    cb_wait_front(cb_ktm, DKT);
+
+    matmul_init(cb_ktm, cb_delta);
     cb_reserve_back(cb_op, DKT);
     for (uint32_t i = 0; i < DKT; ++i) {
         tile_regs_acquire();
-        matmul_tiles(cb_kt, cb_delta, i, 0, 0);
+        matmul_tiles(cb_ktm, cb_delta, i, 0, 0);
         tile_regs_commit();
         tile_regs_wait();
         pack_tile(0, cb_op, i);

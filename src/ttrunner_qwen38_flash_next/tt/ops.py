@@ -2221,7 +2221,35 @@ _NO_FUSED_RECUR = os.environ.get("TT_FUSED_RECUR", "0") != "1"
 _RECUR_STAGE = int(os.environ.get("TT_RECUR_STAGE", "6"))
 
 
-def _recur_program(state, q, k, kt, v, g, b, out, bh, dkt, dvt):
+_RECUR_MASK: dict = {}
+
+
+def _recur_col_mask(like):
+    """One tile, 1 in column 0 and 0 elsewhere. See handoff 45.32.
+
+    The state update's outer product is a `matmul_tiles`, which contracts all 32
+    columns of a tile, so it is the outer product only if one operand's padding
+    is zero -- and `kt` arrives via `ttnn.transpose` on a recycled buffer, whose
+    pad columns hold whatever was there before. `from_torch` zero-pads, so this
+    mask is clean by construction, and multiplying `kt` by it makes the
+    contraction exact whatever the buffer held.
+    """
+    key = (id(like.device()), str(like.dtype))
+    got = _RECUR_MASK.get(key)
+    if got is None:
+        import torch
+        t = torch.zeros(1, 1, _TILE, _TILE)
+        t[..., :, 0] = 1.0
+        if os.environ.get("TT_RECUR_MASK_ZERO") == "1":
+            t[...] = 0.0        # diagnostic: does the mask path apply at all?
+        got = ttnn.from_torch(t, dtype=like.dtype, layout=ttnn.TILE_LAYOUT,
+                              device=like.device(),
+                              mesh_mapper=ttnn.ReplicateTensorToMesh(like.device()))
+        _RECUR_MASK[key] = got
+    return got
+
+
+def _recur_program(state, q, k, kt, v, g, b, out, bh, dkt, dvt, mask):
     """One core per (head, output column-tile). See `scripts/kernels/recur_*`."""
     dev = state.device()
     grid = dev.compute_with_storage_grid_size()
@@ -2236,7 +2264,7 @@ def _recur_program(state, q, k, kt, v, g, b, out, bh, dkt, dvt):
 
     acc = {}
     for tag, t in (("s", state), ("q", q), ("k", k), ("v", v), ("g", g), ("b", b),
-                   ("kt", kt), ("o", out)):
+                   ("kt", kt), ("o", out), ("m", mask)):
         ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
         if len(ct) != 2:
             raise RuntimeError(f"fused recurrence: {tag} must be interleaved")
@@ -2250,7 +2278,8 @@ def _recur_program(state, q, k, kt, v, g, b, out, bh, dkt, dvt):
         h, j = (idx // dvt, idx % dvt) if active else (0, 0)
         r_args[c] = [state.buffer_address(), q.buffer_address(), k.buffer_address(),
                      v.buffer_address(), g.buffer_address(), b.buffer_address(),
-                     h, j, active, kt.buffer_address()]
+                     h, j, active, kt.buffer_address(),
+                     mask.buffer_address()]
         c_args[c] = [active]
         w_args[c] = [out.buffer_address(), state.buffer_address(), h, j, active]
 
@@ -2272,12 +2301,13 @@ def _recur_program(state, q, k, kt, v, g, b, out, bh, dkt, dvt):
            cb(4, 1, g), cb(5, 1, b), cb(6, dkt, kt),
            cb(7, dkt, state), cb(8, 1, state), cb(9, 1, state), cb(10, 1, state),
            cb(11, 1, state), cb(12, 1, state), cb(13, 1, state), cb(14, dkt, state),
-           cb(16, 1, out), cb(17, dkt, state)]
+           cb(16, 1, out), cb(17, dkt, state),
+           cb(15, 1, mask), cb(18, dkt, state)]
 
     return ttnn.ProgramDescriptor(kernels=[
         kern("recur_reader.cpp",
              [dkt, dvt, spage, vpage] + acc["s"] + acc["q"] + acc["k"]
-             + acc["v"] + acc["g"] + acc["b"] + acc["kt"],
+             + acc["v"] + acc["g"] + acc["b"] + acc["kt"] + acc["m"],
              r_args, ttnn.ReaderConfigDescriptor()),
         kern("recur_compute.cpp", [dkt, _RECUR_STAGE], c_args,
              ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
@@ -2318,9 +2348,10 @@ def fused_recurrence(state, q, k, kt, v, g_exp, beta, out):
                 _RECUR_FELL_BACK = True
                 _declined("fused recurrence", why)
             return None
-        ttnn.generic_op([state, q, k, v, g_exp, beta, kt, out],
+        mask = _recur_col_mask(state)
+        ttnn.generic_op([state, q, k, v, g_exp, beta, kt, out, mask],
                         _recur_program(state, q, k, kt, v, g_exp, beta, out,
-                                       bh, dkt, dvt))
+                                       bh, dkt, dvt, mask))
         return out
     except Exception as exc:                                        # noqa: BLE001
         if not _RECUR_FELL_BACK:

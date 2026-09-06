@@ -22,8 +22,14 @@
 // defect by construction.
 //
 // Compile-time args: 0 DKT, 1 DVT, 2 SPAGE, 3 VPAGE,
-//                    4.. TensorAccessorArgs for state, q, k, v, g, b
-// Runtime args: 0 state, 1 q, 2 k, 3 v, 4 g, 5 b, 6 head, 7 j, 8 active, 9 kt
+//                    4.. TensorAccessorArgs for state, q, k, v, g, b, kt, mask
+// Runtime args: 0 state, 1 q, 2 k, 3 v, 4 g, 5 b, 6 head, 7 j, 8 active, 9 kt,
+//               10 mask
+//
+// `mask` is one tile, 1 in column 0 and 0 elsewhere. `kt` is a [Dk, 1] column
+// whose pad columns hold whatever the buffer held before, and the state update
+// contracts all 32 of them (handoff 45.32, invariant 150). Multiplying kt by
+// this mask makes that contraction exact.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -34,7 +40,7 @@ void kernel_main() {
     constexpr uint32_t SPAGE = get_compile_time_arg_val(2);
     constexpr uint32_t VPAGE = get_compile_time_arg_val(3);
     constexpr uint32_t cb_s = 0, cb_q = 1, cb_k = 2, cb_v = 3, cb_g = 4, cb_b = 5,
-                       cb_kt = 6;
+                       cb_kt = 6, cb_mask = 15;
 
     const uint32_t head = get_arg_val<uint32_t>(6);
     const uint32_t j = get_arg_val<uint32_t>(7);
@@ -57,6 +63,8 @@ void kernel_main() {
     const auto b_acc = TensorAccessor(b_ta, get_arg_val<uint32_t>(5));
     constexpr auto kt_ta = TensorAccessorArgs<b_ta.next_compile_time_args_offset()>();
     const auto kt_acc = TensorAccessor(kt_ta, get_arg_val<uint32_t>(9));
+    constexpr auto m_ta = TensorAccessorArgs<kt_ta.next_compile_time_args_offset()>();
+    const auto m_acc = TensorAccessor(m_ta, get_arg_val<uint32_t>(10));
 
     // The scalars first: the compute kernel wants them resident for the whole
     // pass and they are one tile each.
@@ -66,6 +74,8 @@ void kernel_main() {
     noc_async_read_page(head, b_acc, get_write_ptr(cb_b));
     cb_reserve_back(cb_v, 1);
     noc_async_read_page(head * DVT + j, v_acc, get_write_ptr(cb_v));
+    cb_reserve_back(cb_mask, 1);
+    noc_async_read_page(0, m_acc, get_write_ptr(cb_mask));
 
     cb_reserve_back(cb_q, DKT);
     cb_reserve_back(cb_k, DKT);
@@ -93,6 +103,7 @@ void kernel_main() {
     cb_push_back(cb_g, 1);
     cb_push_back(cb_b, 1);
     cb_push_back(cb_v, 1);
+    cb_push_back(cb_mask, 1);
     cb_push_back(cb_q, DKT);
     cb_push_back(cb_k, DKT);
     cb_push_back(cb_kt, DKT);

@@ -7412,6 +7412,53 @@ Fix (1) is the one to try, and `TT_RECUR_VERIFY=1` is now the gate for it: the
 state column must come back at ~1e-03, not inf, **at seq 2047**, before any
 timing number from this kernel means anything.
 
+### 45.33 The padding fix is real but partial -- and the residue is not the outer product
+
+Implemented fix (1): a one-tile column mask (1 in column 0, zero elsewhere,
+built by `from_torch` so its own padding is clean), multiplied into `kt` before
+the outer product. `cb_mask` = 15, `cb_ktm` = 18, one extra SFPU multiply a call.
+
+| at seq 2047 | worst `out` | worst `state` |
+|---|--:|--:|
+| before | 9.613e-04 | **inf** |
+| with the kt mask | 9.613e-04 | **6.200e+01** |
+
+So the padding really was contaminating the state -- the infinity is gone. But
+62 is not 1e-03, next-token accuracy is unchanged at 46.7 %, and the kernel is
+still unusable.
+
+**And a diagnostic that constrains the residue sharply.** Forcing the mask to
+**all zeros** should make `ktm` zero, the outer product zero, and the new state
+exactly `decayed` -- a completely different, much larger error. Instead:
+
+    mask = column-0    worst state 6.200e+01
+    mask = all zeros   worst state 6.200e+01     <- identical
+
+The state error does not depend on the outer product's value at all. Whatever
+produces the 62 is therefore **not** the `matmul_tiles` contraction, and 45.32's
+account -- correct about the infinity -- does not explain what is left.
+
+Two readings, and they have not been separated yet:
+
+1. A second corruption in the state write-back, downstream of the outer product
+   (the `cb_dec` + `cb_op` add, or the writer's pages).
+2. **The verifier itself.** 62.00 to four figures in two runs that differ in
+   their token trajectories is suspiciously stable for a data-dependent error.
+   `_verify` clones the state before the fused call and reruns
+   `decode_step(..., _no_fuse=True)` on the clone, passing the *uncast*
+   operands where the fused path used cast ones. If the ops arm is not
+   reproducing the same computation, the 62 is an artifact and the real
+   remaining state error is unknown.
+
+**Separate them first**, before any more kernel work: run the verifier with
+`TT_FUSED_RECUR=1` but the fused path forced to decline, so both arms are the op
+chain. The state column must then read ~0. If it reads 62, the verifier is
+wrong and 45.33's numbers say nothing about the kernel.
+
+The mask stays in -- it is strictly more correct than assuming pad contents, and
+`TT_FUSED_RECUR` is off by default so it is dormant. Invariant 150 stands on its
+own: the infinity was real and the assumption that produced it was real.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
