@@ -8093,8 +8093,35 @@ number to beat.
    **2.2 ms** in model, ~1.5 recoverable) and its feasibility settled at 45.21
    (a packet from a `generic_op` is **3.03x** cheaper than the op it replaces,
    measured, with the five API gotchas written down). Largest identified item
-   left and the only one measured in the model rather than in isolation. The
-   probe is the scaffold: extend it from one packet to a 4-chip line reduce.
+   left and the only one measured in the model rather than in isolation.
+
+   **Ready to build, with the design settled.** 45.40 swept hop count and found
+   distance free within noise (control 87.8, one hop 83.6, three hops 75.3 us on
+   an 88 us launch), so this is a **chain, not a tree**: chip d forwards to
+   d+1, and only the last hop's latency is on the critical path.
+
+   The shape, concretely -- each chip already holds its own partial, so:
+
+       chip 0: send partial to 1, fused-inc 1's semaphore
+       chip d (1..2): wait sem, add incoming to own partial, send to d+1
+       chip 3: wait sem, add, then send the total back down with num_hops=3,
+               1 and 2 taking it off the wire on the way past
+
+   and the six API facts it needs are all written down: the send functions live
+   behind `using namespace tt::tt_fabric::linear::experimental` (45.21), the
+   connection args splice in at a fixed runtime-arg index from
+   `ttnn.setup_fabric_connection` which **mutates** the ProgramDescriptor
+   (45.21), `MeshProgramDescriptor` is keyed by `MeshCoordinateRange` not
+   `MeshCoordinate` (45.21), `NocUnicastAtomicIncFusedCommandHeader` takes four
+   fields (45.21), a never-taken `if constexpr` branch is still fully compiled
+   (45.21), and the connection is opened to the **adjacent** node with distance
+   carried by `num_hops` (45.40, invariant 159).
+
+   **The number to beat is 26 us**, the model's cost for one wide reduce (45.19)
+   -- *not* the probe's 236 us `ttnn.all_reduce`, which is launch-dominated in
+   the isolated harness like everything else there (invariant 89). Build it,
+   then measure it paired in the model with `ab_step.py`; the probe's 2.83x is
+   evidence the mechanism works, not a prediction.
 4. **`decode_step` as one kernel**, ~0.45 ms corrected, in the largest component.
 
 And what is closed, so nobody re-opens it: byte reduction (45.7), the `attn_qkv`
