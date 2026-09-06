@@ -114,6 +114,14 @@ def _verify(state, q, k, v, g_exp, beta, got):
         # is a different bug entirely (handoff 45.36).
         w2["mag_fused"] = max(w2.get("mag_fused", 0.0), float(f.abs().max()))
         w2["mag_host"] = max(w2.get("mag_host", 0.0), float(state_h.abs().max()))
+        # |host state| came back exactly equal to |host outer|, which says the
+        # carried term is ~0 -- i.e. the decay nearly wipes the state each step.
+        # If so, a fused state stuck at 62 means the decay is not being applied.
+        w2["mag_pre"] = max(w2.get("mag_pre", 0.0), float(P.abs().max()))
+        w2["mag_decayed"] = max(w2.get("mag_decayed", 0.0),
+                                float(decayed_h.abs().max()))
+        w2["g_min"] = min(w2.get("g_min", 1e9), float(G.min()))
+        w2["g_max"] = max(w2.get("g_max", 0.0), float(G.max()))
     w = _VERIFY_WORST
     w["out"] = max(w["out"], do)
     w["state"] = max(w["state"], ds)
@@ -126,7 +134,10 @@ def _verify(state, q, k, v, g_exp, beta, got):
                   f"RESULT   fused state vs host decayed {w['vs_decayed']:.3e}\n"
                   f"RESULT   host |outer| magnitude      {w['outer_mag']:.3e}\n"
                   f"RESULT   |fused state| {w['mag_fused']:.3e}   "
-                  f"|host state| {w['mag_host']:.3e}",
+                  f"|host state| {w['mag_host']:.3e}\n"
+                  f"RESULT   |pre state| {w['mag_pre']:.3e}   "
+                  f"|host decayed| {w['mag_decayed']:.3e}   "
+                  f"g_exp in [{w['g_min']:.4f}, {w['g_max']:.4f}]",
                   flush=True)
 
 

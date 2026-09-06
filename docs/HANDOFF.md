@@ -7651,6 +7651,54 @@ chain to 9.613e-04, so `cb_dec` is right. Whatever inflates the state is
 downstream of a correct `decayed` and a correct `cb_ktm`, which leaves the final
 `add_binary_tile` loop, the pack into `cb_snew`, and the writer's pages.
 
+### 45.38 Page ownership is perfect, and the 62 never comes back as an input
+
+Tested the write mapping directly. At STAGE 7 every core writes the *same*
+`ktm[i]` tile of its head, so for a fixed (head, tile-row) the four `j`-columns
+must be identical -- and different tile-rows and different heads must not be:
+
+    head0 tilerow 0..3: max |j-column - j0| = 0.0000e+00   (all four)
+    head0 tilerow0 vs tilerow1            = 4.8651e-01
+    head0     vs head1                    = 4.7322e-01
+
+**Exact.** No core writes a page it does not own, nothing collides, and the
+`head*DKT*DVT + i*DVT + j` arithmetic is right. The write path is exonerated
+along with everything else.
+
+Then the magnitudes, which do not fit together:
+
+    |pre state|     6.824e+00
+    |host decayed|  6.824e+00      identical to pre -- g_exp reaches 1.0
+    |host state|    6.830e+00
+    |fused state|   6.209e+01      9.1x
+    g_exp in [0.0000, 1.0000]
+
+**If the kernel writes a state of 62, the next call's `pre` must be 62.** It
+never is: across all 360 calls the pre-state's largest element stays 6.82. So
+the 62-magnitude thing the verifier reads back immediately after the fused call
+is *not* what the model carries into the next step.
+
+That is a contradiction, and it is the most useful thing here, because only a few
+situations produce it: the verifier's `to_torch` of the state is reading
+something other than the buffer the next call reads (a stale host copy, or a
+different device's shard -- note `ConcatMeshToTensor` returns 48 rows for 12
+heads across 4 devices, and **the four devices' shards are compared as if they
+were 48 distinct heads**); or the state is written twice per call and the
+verifier catches the intermediate.
+
+**The mesh-shard reading is the one to check first.** `_verify` compares
+`sa[:m]` against `sb[:m]` with `m = 48`, i.e. it compares every device's copy of
+head h against every other's. If one device's shard diverges -- which a
+replicated state should never do, but a `generic_op` writing per-device could --
+the difference shows up as a huge state error while the model, reading its own
+device's copy, carries something small. That would make the 62 real *and*
+consistent with `pre` staying at 6.82, and it would mean the bug is
+per-device divergence, not arithmetic.
+
+Slice the comparison to one device (`[:12]`, not `[:48]`) and re-run. One run
+decides it, and it should have been the first thing checked about a verifier
+that reads a replicated tensor.
+
 **`cb_dec` cannot be probed with STAGE 5, and does not need to be.** STAGE 5
 writes `decayed` out *as* the state, so the state becomes `state * g_exp` every
 step -- starting from zero it stays zero for ever, and the run duly reports
