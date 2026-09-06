@@ -6830,6 +6830,43 @@ theorising about op mixing; stages 2 and 3 then ran clean, so stage 1 had been
 the ~12 % base-rate flake (45.14). Without that rate measured the same night, the
 next hours would have gone into a phantom. Invariant 128, earning itself back.
 
+### 45.25 The fused recurrence in model: -0.88 ms, on the *pessimistic* form
+
+Paired and alternating, with the fusion engaged:
+
+| | off | on | diff |
+|---|--:|--:|--:|
+| pair 1 | 32.93 | 31.79 | **-1.14** |
+| pair 2 | 32.54 | 31.92 | **-0.62** |
+
+And `traced_vs_eager` MATCHes token for token with it on.
+
+**This is the form that is deliberately handicapped**, so the number is a floor,
+not a ceiling. It pays two costs the shipping version will not:
+
+* **five `ttnn.typecast` calls a layer** -- the model hands `decode_step`
+  bfloat16 q/k/v/g/beta against a float32 state, and one compute kernel
+  configures its unpacker from one circular buffer (invariant 76). ~0.9 ms a
+  token, on 48-tile tensors.
+* **`reinject` declining.** The fused output carries the state's dtype, so
+  `reinject` sees a float32 branch, warns "wants one dtype for hyper, branch and
+  out" and falls back to the ops for the rest of the layer.
+
+Both go away the same way: `fused_qkv_heads` and `fused_delta_scalars` emitting
+the state's dtype at source, which costs nothing (48 tiles each) and which
+model.py:928 already records as changing nothing measurable. Then no casts, no
+downstream decline, and the fused kernel's own 2.95 ms target is what is left.
+
+One thing that does **not** work, tried: allocating the output from the *uncast*
+`v` so cb_out stays bfloat16 and the compute narrows on the pack. It hung -- the
+same family as `ksgemv_compute`'s note that packing into a Float32 CB hangs here.
+The dtype has to be fixed upstream, not at the pack.
+
+INVARIANT 139: a fused kernel's **output dtype** is part of its interface. Change
+it and the next fused kernel downstream may silently decline, turning a win into
+a loss -- `reinject` did exactly that here, and only the decline warning made it
+visible. Check what consumes the output before choosing its dtype.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
@@ -6856,10 +6893,12 @@ finishes **8 times out of 8**. Measurement is cheap; it was the cards.
 
 What is left, with what each is actually worth:
 
-1. **Land the fused `decode_step`** -- built and correct on device (45.24), one
-   step from engaging: `fused_qkv_heads` and `fused_delta_scalars` must emit
-   float32 so the guard stops declining. Then time it against the 2.95 ms it
-   targets, and gate it with `device_quality.py`.
+1. **Land the fused `decode_step`** -- built, correct on device, and measured at
+   **-0.88 ms** in its handicapped form (45.24, 45.25). Make `fused_qkv_heads`
+   and `fused_delta_scalars` emit the state's dtype: that removes five casts a
+   layer *and* stops `reinject` declining, and it is the whole remaining gap
+   between -0.88 and the 2.95 ms the fusion targets. Then gate with
+   `device_quality.py` and flip the default.
 2. **`TT_GG_COLS=1`**, an untried item with a mechanism and a component worth
    attacking: it doubles the cores on the MoE's two largest
    kernels inside 5.17 ms. It hangs 3-of-3 today and 45.16 shows the idle-core

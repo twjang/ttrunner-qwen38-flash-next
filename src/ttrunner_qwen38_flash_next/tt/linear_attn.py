@@ -105,11 +105,30 @@ def decode_step(
     # lands inside a trace capture, which is the "allocating device buffers is
     # unsafe" hazard. In the model the state is float32 and q/k/v arrive
     # bfloat16, so the decline is the common path, not the rare one.
-    if not ops._NO_FUSED_RECUR and all(
-            t.dtype == state.dtype for t in (q, k, v, g_exp, beta)):
+    if not ops._NO_FUSED_RECUR:
+        # The model hands this bfloat16 q/k/v/g/beta against a float32 state, and
+        # one compute kernel configures its unpacker from one circular buffer
+        # (invariant 76), so they have to agree. Casting here is the *measurable*
+        # form, not the shipping one: five casts on 48-tile tensors, ~0.9 ms a
+        # token, against the 2.95 ms the fusion targets. The shipping form is
+        # `fused_qkv_heads` and `fused_delta_scalars` emitting the state's dtype
+        # in the first place, which costs nothing -- do that once this is timed.
+        # `ttnn.typecast` allocates at capture and the replay reuses it, so it is
+        # trace-safe in a way a `generic_op` output is not.
+        fq, fk, fv, fg, fb = (
+            t if t.dtype == state.dtype else ttnn.typecast(t, state.dtype)
+            for t in (q, k, v, g_exp, beta))
         fused_all = ops.fused_recurrence(
-            state, q, k, ttnn.transpose(k, -2, -1), v, g_exp, beta,
-            _recur_out(state, v))
+            state, fq, fk, ttnn.transpose(fk, -2, -1), fv, fg, fb,
+            # `fv`, so the output CB is the state's dtype. Allocating it from
+            # the *uncast* `v` makes cb_out bfloat16 and the compute then packs
+            # a float32 dst into it -- which hung, in the same family as
+            # `ksgemv_compute`'s note that packing into a Float32 CB hangs here.
+            # The cost is that `reinject` downstream sees a float32 branch and
+            # declines ("wants one dtype for hyper, branch and out"), so this
+            # form is measurable but not shippable: the shipping fix is upstream
+            # dtypes, not a narrowing pack.
+            _recur_out(state, fv))
         if fused_all is not None:
             return fused_all
 
