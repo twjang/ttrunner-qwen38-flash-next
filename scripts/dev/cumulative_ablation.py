@@ -25,13 +25,23 @@ def grm_stub(hyper, nw, dw, uw, iw, eps, hc, H):
                                              hyper.shape[2], H))
     return mixed, (None if iw is None else hyper)
 
+# A stub that returns its *input object* hands the caller a tensor the captured
+# graph expects some op to have written, and `moe` and `deltanet` then hang the
+# capture -- reproducibly, twice each, where `qsa` runs clean. `ttnn.clone` gives
+# the caller a distinct buffer of the same shape, which is what the graph wants.
+# It costs one launch a call, so the number it yields is a slight *under*-estimate
+# of the component, not an over-estimate.
+def _passthrough(mixed, *a, **k):
+    return ttnn.clone(mixed)
+
+
 STUBS = {
-    "moe":      lambda: setattr(moe, "moe_block", lambda mixed, *a, **k: mixed),
-    "shared":   lambda: setattr(moe, "shared_expert", lambda mixed, *a, **k: mixed),
+    "moe":      lambda: setattr(moe, "moe_block", _passthrough),
+    "shared":   lambda: setattr(moe, "shared_expert", _passthrough),
     "grm":      lambda: (setattr(ops, "gated_residual_mix", grm_stub),
                          setattr(mm, "gated_residual_mix", grm_stub)),
     "deltanet": lambda: setattr(mm.TTModel, "_linear_attention_step",
-                                lambda self, mixed, *a, **k: mixed),
+                                lambda self, mixed, *a, **k: ttnn.clone(mixed)),
     "qsa":      lambda: setattr(mm.TTModel, "_attention_step",
                                 lambda self, mixed, *a, **k: mixed),
     "reinject": lambda: setattr(ops, "reinject",

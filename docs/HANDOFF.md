@@ -7280,6 +7280,68 @@ section assembled an eager number from one harness and a traced number from
 another, got 32.01 against 32.65, and concluded the trace was worthless. One
 process says 546 against 32.0. Two harnesses are two experiments.
 
+### 45.31 The component map of the 32.65 ms, and it is not where 45 was digging
+
+`cumulative_ablation.py` hung on `moe` and again on `deltanet` -- twice each,
+reproducibly, where `qsa` ran clean. The cause is the stub, not the device: it
+returned its **input object**, so the caller got a tensor the captured graph
+expects some op to have written. Returning `ttnn.clone(mixed)` -- a distinct
+buffer of the same shape -- makes both run. That costs one launch a call, so
+every figure below slightly *under*-states its component.
+
+INVARIANT 149: an ablation stub must return a **new** buffer, not its argument.
+An identity stub hangs the trace capture here, and it hangs it silently: the run
+just never finishes, which reads as device instability rather than as a bug in
+the probe. That is what stalled the cumulative sweep at its second step, twice.
+
+Single-part, against a **32.65 ms** baseline (traced, batch 1, `max_seq_len`
+4096, `selection_active` False):
+
+| component | stripped | **cost** | calls it owns |
+|---|--:|--:|--:|
+| DeltaNet (36 layers) | 24.29 | **8.36 ms** | ~216 in `linear_attn` + projections |
+| `gated_residual_mix` | 25.97 | **6.68 ms** | ~670, the most of anything |
+| MoE (48 layers) | 26.98 | **5.67 ms** | ~430 |
+| `all_reduce` | 28.79 | **3.86 ms** | 181 collectives |
+| QSA (12 layers) | 28.99 | **3.66 ms** | ~200 |
+| shared expert | 31.47 | **1.18 ms** | |
+| `reinject` | 32.61 | **0.04 ms** | |
+| PLE | 32.62 | **0.03 ms** | |
+| *everything* (`layers`) | 0.47 | 32.18 ms | |
+
+Single-part costs overlap, so they sum to 29.5 against 32.2 rather than to it
+exactly (that is 44.2's warning, and why this is a ranking rather than a budget).
+
+**Three things change from this.**
+
+**GRM is the second-largest component and section 45 never touched it.** 6.68 ms,
+96 invocations a token at ~7 ops each -- `ksgemv`/`linear` -> `all_gather` ->
+`fused_group_sum` -> `silu` -> `slice` -> `linear_rows` -> `fused_gated_mean`.
+Its `all_reduce` is *also* counted in the 3.86 ms row, so the two overlap, but
+whatever the split, this is a bigger target than the DeltaNet recurrence that
+45.23 through 45.27 spent themselves on.
+
+**DeltaNet is the largest, and the recurrence is only a third of it.** 8.36 ms
+here against the 2.95 ms 45.23 measured for `decode_step` alone. So even a
+*working* fused recurrence -- which 45.27 shows we do not have -- addresses at
+most a third of the block. The other ~5.4 ms is the conv, the projections, the
+norms and the gating.
+
+**`reinject` and PLE are finished.** 0.04 and 0.03 ms. The fused reinject work
+paid out completely; there is nothing left in either, and 45.25b's plan to buy
+back `reinject`'s fusion is worth 0.04 ms at most, not the "rest of the layer"
+it was framed as. Withdrawn.
+
+Ranked, what is left in the 32.65 ms:
+
+    DeltaNet   8.36    of which the recurrence is ~2.95 and unfixed
+    GRM        6.68    never attacked; largest call count in the model
+    MoE        5.67    already on the wide-expert path
+    collectives 3.86   composite all-reduce already shipped (-0.45)
+    QSA        3.66    plus 73.5 ms more once the selection turns on (45.26)
+    shexp      1.18
+    rest       ~3      norms, embedding, head, glue
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
