@@ -8048,6 +8048,21 @@ behaviour), seq 2049, selection on, 64 stepped tokens:
 Identical to every digit, `traced_vs_eager` MATCHes token for token, 235 tests
 pass. **On by default.**
 
+**And the rest of the tail is not worth touching, which is invariant 91 again.**
+The mask is built by scattering 0/1 flags into a zero row and then turning the
+whole row into an additive mask with `(row - 1) * 1e9` -- two elementwise passes
+over `max_seq_len`, isolated at 441 us a layer, 5.3 ms a token. Scattering the
+*finished* values onto a persistent -1e9 row instead does the same arithmetic on
+`visible`, a quarter the width, and should have bought most of that.
+
+    topk fix only          61.5 ms
+    topk fix + folded tail 61.3 ms
+
+**0.2 ms of a predicted 5.3.** Reverted. Removing two ops from a chain is
+absorbed by the neighbours that remain; `topk` paid because it is one enormous
+op, not because it was one of many. The isolated number over-priced this by more
+than twenty times, which is invariant 89 at the extreme end of its range.
+
 INVARIANT 163: `ttnn.topk` is O(nb x k) here -- 4.4 ms for k=512 of 2048, and
 9.4 ms of 4096. Before reaching for it, ask how many candidates can actually
 win: this call was searching 2048 blocks for 512 winners that could only ever
