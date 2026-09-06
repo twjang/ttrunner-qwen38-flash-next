@@ -22,7 +22,14 @@ measured window.
 |---|---|---|
 | weight load | 2373 s | **6.0 s** (395×) |
 | decode, batch 64 | 0.75 tok/s | **107.6 tok/s** (143×) |
-| decode, batch 1 (eager) | 1338 ms | **518 ms** (2.6×) |
+| decode, batch 1 (eager) | 1338 ms | **546 ms** (2.5×) |
+| decode, batch 1 (traced) | — | **32.0 ms** — 31.3 tok/s |
+
+**Batch 1 is now 32.0 ms a token traced**, and that number is only meaningful
+with its regime attached — see the two regimes below. Tracing is worth 17x here
+(546 ms eager against 32.0 traced, both measured in one process at
+`max_seq_len 512`), so any batch-1 figure taken eagerly is describing a
+different program's cost structure.
 
 ```
    B  median ms      p10      p90     tok/s   ms/tok
@@ -101,16 +108,73 @@ End-to-end through the engine, greedy, 12 output tokens after a 5-token prompt
 (so 17 device steps produce 12 tokens — prompts are fed one token per step):
 
 The server defaults to a single user: one slot at the model's full 262144-token
-context, traced. Per-token cost is flat in position because the step is dominated by the MoE and DeltaNet and the
-sparse-attention budget is fixed at 2048 — long context costs memory, not time.
+context, traced.
+
+**There are two decode regimes and they differ by 3x.** `indexer_budget` is 2048.
+Below that position the sparse selection is provably a no-op, so `TTEngine` runs
+with `selection_active = False`; at 2048 it flips. Measured in one harness at one
+sequence length, changing only that flag:
+
+| `selection_active` | ms/step | tok/s |
+|---|--:|--:|
+| False — positions 0..2047 | **32.3** | 31.0 |
+| True — positions >= 2048 | **105.8** | 9.5 |
+
+So the *attention* is budget-limited at 2048 selected tokens, but **the selection
+itself costs 73.5 ms a token**, 69 % of the long-context step. Long context costs
+memory *and* time, and a batch-1 number quoted without its regime says little.
+The `ms/step` column below is the below-budget regime.
+
+### Where the 32 ms goes, and how far the roofline is
+
+Single-part ablation of the 32.65 ms step (`scripts/dev/cumulative_ablation.py`),
+below the budget:
+
+| component | cost |
+|---|--:|
+| DeltaNet (36 layers) | **8.36 ms** |
+| `gated_residual_mix` | **6.68 ms** |
+| MoE (48 layers) | **5.67 ms** |
+| collectives | 3.86 ms |
+| QSA (12 layers) | 3.66 ms |
+| shared expert | 1.18 ms |
+| `reinject`, PLE | 0.04, 0.03 ms |
+
+The weight read is ~3.17 GB a device a token, which is **8.2 ms at the measured
+388 GB/s — 122 tok/s**. That is a floor, not a target: a perfect implementation
+still spends it. At 32.0 ms the step is **26 % of its own roofline**, and the
+gap is structural rather than incidental — at M = 1 `ttnn.linear` gives each
+output tile to one core, so a matmul with 16 output tiles (the router) runs on
+16 of 110 cores. 460 such calls carry 80 % of the bytes moved.
+
+Two things follow, both measured rather than argued:
+
+* **Cutting bytes does not buy time at M = 1.** A thirteenfold byte reduction
+  buys 20 % of the time, and one shard measured *slower* than the tensor it
+  replaced.
+* **1.69 of the 3.17 GB is replicated** — read four times over, once per device.
+  A single memory holding the same weights would read 7.61 GB of unique bytes
+  per token; the mesh reads 12.7. That penalty is architectural, not a kernel
+  problem.
+
+`docs/PRINCIPLES.md` is the distilled version of all of this — the machine, the
+two regimes, the four principles that decide what is worth trying, the
+measurement discipline, and the framework pitfalls. Read it before touching the
+decode path. `docs/HANDOFF.md` is the chronological log behind it.
 The K/V cache is 6.4 GB per sequence at full length, so slots and context trade
 directly and the engine checks them against the DRAM budget at construction.
 
 | slots | context | ms/token | ms/step |
 |---|---|---|---|
-| 1 | **262144** | 300.5 | **173.7** |
+| 1 | **262144** | 300.5 | 173.7 |
 | 2 | 131072 | 319.0 | — |
 | 3 | 65536 | 323.7 | — |
+
+(That table predates the work in `docs/HANDOFF.md` 44-46 and has not been
+re-measured at 262144 since; the current traced step is **32.0-32.7 ms** at
+`max_seq_len` 512, 4096 and 8192, consistent across all three. Opening the model
+at 262144 allocates a 6.4 GB K/V slot and a 65536-entry indexer block cache, so
+that configuration is slow to *set up* whatever the step costs.)
 
 (236.2 ms until `docs/iterations/022`, which found that the routed MoE was 65 %
 of the step and that almost none of that was the experts -- at M = 1 the row axis
@@ -225,8 +289,10 @@ src/ttrunner_qwen38_flash_next/
                 bench.py       per-section timing
   server/     OpenAI-compatible FastAPI app (backend-agnostic)
 scripts/      codebook generation, Telegram progress notifier
-tests/        94 tests
-docs/iterations/  observation -> remedy -> result log for every step
+tests/        235 tests
+docs/PRINCIPLES.md  the machine, the principles, the pitfalls -- read this first
+docs/HANDOFF.md     the chronological log behind it
+docs/iterations/    observation -> remedy -> result log for every step
 ```
 
 ## Quick start
