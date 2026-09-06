@@ -109,6 +109,11 @@ def _verify(state, q, k, v, g_exp, beta, got):
                                float((f - decayed_h).abs().max()))
         w2["outer_mag"] = max(w2.get("outer_mag", 0.0),
                               float((state_h - decayed_h).abs().max()))
+        # Magnitudes, not just differences: if |fused| is ~0 while |host| is ~62,
+        # the kernel is writing an empty state rather than a wrong one, and that
+        # is a different bug entirely (handoff 45.36).
+        w2["mag_fused"] = max(w2.get("mag_fused", 0.0), float(f.abs().max()))
+        w2["mag_host"] = max(w2.get("mag_host", 0.0), float(state_h.abs().max()))
     w = _VERIFY_WORST
     w["out"] = max(w["out"], do)
     w["state"] = max(w["state"], ds)
@@ -119,7 +124,9 @@ def _verify(state, q, k, v, g_exp, beta, got):
         if "vs_full" in w:
             print(f"RESULT   fused state vs host full   {w['vs_full']:.3e}\n"
                   f"RESULT   fused state vs host decayed {w['vs_decayed']:.3e}\n"
-                  f"RESULT   host |outer| magnitude      {w['outer_mag']:.3e}",
+                  f"RESULT   host |outer| magnitude      {w['outer_mag']:.3e}\n"
+                  f"RESULT   |fused state| {w['mag_fused']:.3e}   "
+                  f"|host state| {w['mag_host']:.3e}",
                   flush=True)
 
 

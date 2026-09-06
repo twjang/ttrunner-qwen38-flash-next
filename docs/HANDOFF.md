@@ -7628,6 +7628,44 @@ numerical bug. Stop looking at the maths. Something is reading or writing memory
 it does not own, and the question is which core and which page -- not which
 formula.
 
+### 45.37 The fused state is ~9x too large, and three repro attempts failed
+
+Measured the magnitudes rather than inferring them (I had just argued from the
+difference that the fused state was ~0; it is the opposite):
+
+    |fused state|   6.209e+01
+    |host state|    6.830e+00
+    |host outer|    6.830e+00
+
+The kernel writes a state **nine times larger** than the correct one, every step,
+with the decay holding it at ~62 rather than letting it diverge. `|host state|`
+equals `|host outer|` because `g_exp < 1` shrinks the carried term hard, so a
+correct step is dominated by the fresh outer product.
+
+That is a **scaling** error, not garbage -- 62 is stable across runs and bounded,
+which random memory would not be. The obvious candidate is the decay: if the
+kernel wrote `state + outer` instead of `state * g_exp + outer`, the state would
+climb to roughly `N x |outer|` and sit there. **But the output forbids it.**
+`out = q . decayed + (q . k) * delta` reads `decayed` directly and matches the op
+chain to 9.613e-04, so `cb_dec` is right. Whatever inflates the state is
+downstream of a correct `decayed` and a correct `cb_ktm`, which leaves the final
+`add_binary_tile` loop, the pack into `cb_snew`, and the writer's pages.
+
+**Three reproduction attempts outside the model, all negative.**
+`recur_seq_check.py` now takes `TT_RECUR_LAYERS_SIM`, `TT_RECUR_NOISE` and
+`TT_RECUR_CAST`:
+
+| standalone configuration | fused final state error |
+|---|--:|
+| baseline (1 state, float32 `from_torch`) | 4.193e-04 |
+| 36 interleaved states, as the model has | 4.187e-01 vs op chain's 4.193e-01 -- **they agree** |
+| 8 junk matmuls between every launch | 4.193e-04, unchanged |
+| operands built bfloat16 then `typecast`, as the model does | 3.204e-04 |
+
+None reproduces it. So it is not the number of live states, not dirty memory
+between launches, and not the operands' provenance -- and the debug loop is
+still a 7-minute `device_quality.py` run per probe.
+
 **Interleaved states do not reproduce it.** `recur_seq_check.py` gained
 `TT_RECUR_LAYERS_SIM=L`, which keeps L independent states and cycles them the way
 the model's 36 DeltaNet layers do -- the obvious candidate if the foreign data

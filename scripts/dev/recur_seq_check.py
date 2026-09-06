@@ -37,7 +37,19 @@ def main() -> None:
     comp = ttnn.ConcatMeshToTensor(mesh, dim=0)
     torch.manual_seed(0)
     try:
+        # `TT_RECUR_CAST=1` builds the operands the way the *model* does: bfloat16
+        # from the projections, then `ttnn.typecast` up to the state's float32.
+        # The standalone's `from_torch(float32)` is the one provenance the model
+        # never uses, and after 36 interleaved states and 8 noise matmuls failed
+        # to reproduce (handoff 45.36), it is the difference left.
+        CAST = __import__("os").environ.get("TT_RECUR_CAST") == "1"
+
         def dev(t):
+            if CAST:
+                low = ttnn.from_torch(t, dtype=ttnn.bfloat16,
+                                      layout=ttnn.TILE_LAYOUT,
+                                      device=mesh, mesh_mapper=rep)
+                return ttnn.typecast(low, DT)
             return ttnn.from_torch(t, dtype=DT, layout=ttnn.TILE_LAYOUT,
                                    device=mesh, mesh_mapper=rep)
 
@@ -66,6 +78,7 @@ def main() -> None:
             ref_state = decayed + rk.transpose(-2, -1) @ delta
 
         LAYERS = int(__import__("os").environ.get("TT_RECUR_LAYERS_SIM", "1"))
+        NOISE = int(__import__("os").environ.get("TT_RECUR_NOISE", "0"))
 
         def arm(fused):
             # `decode_step` tries the fused path itself when TT_FUSED_RECUR=1,
@@ -80,6 +93,19 @@ def main() -> None:
             sts = [dev(s0) for _ in range(LAYERS)]
             errs = []
             for i, (q, k, v, g, b) in enumerate(seq):
+                # `TT_RECUR_NOISE=N` runs N unrelated ops between recurrence
+                # launches. Handoff 45.36: the corruption is foreign data and
+                # does not reproduce standalone, so the question is what the
+                # model puts *between* two DeltaNet launches that this harness
+                # does not -- 47 other layers and ~2200 ops a step.
+                for _ in range(NOISE):
+                    junk = ttnn.from_torch(
+                        torch.randn(1, 1, 32, 2560) * 3.0, dtype=DT,
+                        layout=ttnn.TILE_LAYOUT, device=mesh, mesh_mapper=rep)
+                    jw = ttnn.from_torch(
+                        torch.randn(1, 1, 2560, 512) * 3.0, dtype=DT,
+                        layout=ttnn.TILE_LAYOUT, device=mesh, mesh_mapper=rep)
+                    ttnn.linear(junk, jw)
                 st = sts[i % LAYERS]
                 dq, dk, dv_, dg, db = (dev(x) for x in (q, k, v, g, b))
                 if fused:
