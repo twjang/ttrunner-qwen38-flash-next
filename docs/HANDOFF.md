@@ -7970,6 +7970,32 @@ the largest chunk it will ever stream looks free and is not: multiply it by ever
 copy of that program in the trace. Size streaming CBs for the pipeline depth,
 not the payload.
 
+**The change, specified.** `ksgemv_reader.cpp` bulk-reserves today --
+`cb_reserve_back(cb_a, klen)`, fill all `klen`, `cb_push_back(cb_a, klen)` -- and
+`ksgemv_compute.cpp` mirrors it with one `cb_wait_front(cb_a, klen)` and one
+`cb_pop_front`. Chunking both to a depth of 2 is mechanical: the reader loops
+`for (c = 0; c < klen; c += D)` reserving/filling/pushing `D` at a time, and the
+compute keeps its single `tile_regs_acquire()` while doing
+`cb_wait_front(D) / matmul_tiles / cb_pop_front(D)` inside it -- `dst`
+accumulates across the chunks exactly as it does across tiles now. `cb0` and
+`cb1` then drop from `cap x page` to `2 x page`, taking the router's program from
+81920 B to ~30 KB.
+
+**But weigh it before building it.** Where `ksgemv` *does* run -- four sites,
+capture stable -- it measured **33.02 ms against a 31.4-32.7 baseline**: no gain,
+if anything slightly worse. 45.14's four site configurations said the same thing
+from single runs. So the most likely outcome of this work is a *more rigorous
+null*, not a speedup: it would let the k-split be measured across all 48 sites
+instead of four, and the four-site reading predicts that measurement comes back
+flat.
+
+That matters for what section 46 should say. The 22.5 ms in the narrow GEMVs is
+real arithmetic -- 460 calls carrying 2.197 GB that would take 5.66 ms at full
+bandwidth -- but the one mechanism built to claim it does not claim it, at any
+scale yet tested. **The gap between 32 ms and the 8.2 ms roofline currently has
+no identified remedy in this design**, and that is a more honest summary than
+"the k-split is blocked by a hang".
+
 **And it still buys nothing where it runs.** Four sites gave 33.02 ms against a
 baseline of 31.4-32.7 -- no gain, if anything slightly worse. Four of 48 layers
 is only 8 % of the router's calls, so this cannot refute 45.29's 22.5 ms on its
