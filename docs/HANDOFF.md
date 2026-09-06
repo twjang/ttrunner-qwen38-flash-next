@@ -7695,9 +7695,34 @@ device's copy, carries something small. That would make the 62 real *and*
 consistent with `pre` staying at 6.82, and it would mean the bug is
 per-device divergence, not arithmetic.
 
-Slice the comparison to one device (`[:12]`, not `[:48]`) and re-run. One run
-decides it, and it should have been the first thing checked about a verifier
-that reads a replicated tensor.
+Sliced it. **Not a verifier artifact, and the answer is worse than that:**
+
+    state err, device 0 alone      6.200e+01
+    device0-vs-device1 spread      6.210e+01
+
+Device 0 on its own is wrong by the same 62, so the comparison was never the
+problem. And the second number is the finding: **the four devices' copies of a
+replicated state diverge from each other by 62.** Replicated operands, a
+replicated program, and the same 48-core layout on every device should give four
+identical states. They do not.
+
+INVARIANT 154: check per-device agreement on any replicated tensor a
+`generic_op` writes. A replicated computation that disagrees across devices is
+reading something that is not replicated -- and no amount of reasoning about the
+arithmetic will find it, because the arithmetic is the same on all four.
+
+That reframes the whole hunt. Everything verified so far -- `decayed` via the
+output, `cb_ktm` via STAGE 7, the page ownership, the operands -- was verified
+*per device or in aggregate*, and all of it can be true while the four devices
+still disagree. What differs between devices in this program is not the maths:
+it is the buffer addresses, the L1 contents left by whatever ran before, and
+anything the kernel reads that was not built with `ReplicateTensorToMesh`.
+
+**Next, in order:** dump the same state slice from each device separately and
+find *which* elements disagree -- if it is a whole head, a whole tile-row, or
+scattered, each points somewhere different. Then check every operand the program
+touches for replication, including `_recur_col_mask`'s tile and `_recur_out`'s
+cached output, both of which are built here rather than coming from the model.
 
 **`cb_dec` cannot be probed with STAGE 5, and does not need to be.** STAGE 5
 writes `decayed` out *as* the state, so the state becomes `state * g_exp` every

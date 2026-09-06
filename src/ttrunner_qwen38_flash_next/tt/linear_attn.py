@@ -122,6 +122,18 @@ def _verify(state, q, k, v, g_exp, beta, got):
                                 float(decayed_h.abs().max()))
         w2["g_min"] = min(w2.get("g_min", 1e9), float(G.min()))
         w2["g_max"] = max(w2.get("g_max", 0.0), float(G.max()))
+        # `ConcatMeshToTensor` returns 4 devices x 12 heads = 48 rows for a
+        # *replicated* state, and comparing all 48 compares every device's copy
+        # against every other's. Report one device alone as well: if the 48-row
+        # error is huge and the 12-row error is small, the fault is per-device
+        # divergence, not arithmetic (handoff 45.38).
+        H1 = sa.shape[0] // 4 if sa.shape[0] >= 4 else sa.shape[0]
+        w2["dev0"] = max(w2.get("dev0", 0.0),
+                         float((sa[:H1].to(torch.float64)
+                                - sb[:H1].to(torch.float64)).abs().max()))
+        w2["spread"] = max(w2.get("spread", 0.0),
+                           float((sa[:H1].to(torch.float64)
+                                  - sa[H1:2 * H1].to(torch.float64)).abs().max()))
     w = _VERIFY_WORST
     w["out"] = max(w["out"], do)
     w["state"] = max(w["state"], ds)
@@ -137,7 +149,9 @@ def _verify(state, q, k, v, g_exp, beta, got):
                   f"|host state| {w['mag_host']:.3e}\n"
                   f"RESULT   |pre state| {w['mag_pre']:.3e}   "
                   f"|host decayed| {w['mag_decayed']:.3e}   "
-                  f"g_exp in [{w['g_min']:.4f}, {w['g_max']:.4f}]",
+                  f"g_exp in [{w['g_min']:.4f}, {w['g_max']:.4f}]\n"
+                  f"RESULT   state err device0 only {w['dev0']:.3e}   "
+                  f"device0-vs-device1 spread {w['spread']:.3e}",
                   flush=True)
 
 
