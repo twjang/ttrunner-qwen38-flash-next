@@ -6613,6 +6613,52 @@ than three, so the wire *is* doing measurable work on this path -- the 2.2 ms is
 not pure dispatch latency, and a hand-rolled reduce inherits whatever part of it
 is bytes on the wire.
 
+### 45.21 The fabric probe runs: a packet from a `generic_op` is 3x cheaper than the op it would replace
+
+45.19 left the fabric all-reduce as the only surviving lever, and it was blocked
+on a question nobody had answered on hardware: **can a `generic_op` send a
+chip-to-chip packet at all, and is it cheap enough to be worth the build?**
+`scripts/dev/fabric_probe.py` and `scripts/kernels/fabprobe.cpp` answer both.
+
+Chip 0 sends 5120 B to chip 1 and fused-atomic-incs a semaphore there; chip 1
+waits on it; chips 2 and 3 run the same kernel with ROLE_IDLE. Measured in one
+process against `ttnn.all_reduce` on the same 2560-wide row:
+
+    launch only (control)      70.19 us
+    one hop, 5120 B            69.21 us
+    ttnn.all_reduce 2560w     209.48 us      -> 3.03x
+
+**Read the ratio, not the difference.** An eager `generic_op` launch is ~70 us of
+dispatch, so `hop - control` came out at **-0.98 us** -- the hop is invisible
+inside the launch. That is invariant 134's trap in its natural habitat, and the
+way out is that both arms carry the same dispatch, so it cancels in the ratio.
+
+Five API details cost one run each and are worth writing down, because every one
+of them is a five-minute fix that looks like a wall:
+
+| symptom | fix |
+|---|---|
+| `MeshDevice has no get_devices` | this build answers `worker_core_from_logical_core` on the mesh itself; `ops.py` already carries the `hasattr` fallback |
+| `std::bad_cast` from `MeshProgramDescriptor(dict)` | key it by `MeshCoordinateRange(at, at)`, not `MeshCoordinate` |
+| no matching ctor for `NocUnicastAtomicIncFusedCommandHeader` | `(noc_address, semaphore_noc_address, val, flush)` -- four fields, not five |
+| `fabric_unicast_noc_fused_unicast_with_atomic_inc` not declared | `using namespace tt::tt_fabric::linear::experimental;` |
+| an `if constexpr` branch that is never taken still failed to compile | in a non-template function the discarded branch is still fully checked |
+
+And the one that mattered most: **the includes resolve from `scripts/kernels/`
+with no `compiler_include_paths` at all**, exactly as the audit predicted from
+`build.cpp:302-311`. The kernel compiled to line 63 on its first attempt.
+
+INVARIANT 135: a `generic_op` can send on the fabric. `setup_fabric_connection`
+returns precisely the argument block
+`WorkerToFabricEdmSender::build_from_args<TENSIX>` consumes, spliced onto the
+sender kernel's runtime args; `MeshProgramDescriptor` gives the per-chip programs
+that a line topology needs because chip 0 has only a forward neighbour.
+
+What this does **not** say: a 4-chip reduce is not one packet. 3.03x is the
+optimistic bound, the probe is eager rather than traced, and 45.14 is the
+standing warning that adding `generic_op` programs to the traced step
+destabilises it. The build is justified; it is not de-risked.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
@@ -6651,10 +6697,12 @@ What is left, with what each is actually worth:
    (45.14) and the one mechanism found does not explain it (45.16). It caps all
    future generic_op work. `TT_METAL_WATCHER` aborts here, so it can only be
    bisected -- and the base rate is ~12 %, so every verdict needs four runs.
-3. **The fabric all-reduce** -- now priced at 45.19: the 84 wide reduces cost
-   **2.2 ms** in model, of which a single-launch line reduce should recover
-   ~1.5. Largest identified item left, and the only one on this list measured in
-   the model rather than in isolation.
+3. **The fabric all-reduce** -- priced at 45.19 (the 84 wide reduces cost
+   **2.2 ms** in model, ~1.5 recoverable) and its feasibility settled at 45.21
+   (a packet from a `generic_op` is **3.03x** cheaper than the op it replaces,
+   measured, with the five API gotchas written down). Largest identified item
+   left and the only one measured in the model rather than in isolation. The
+   probe is the scaffold: extend it from one packet to a 4-chip line reduce.
 4. **`decode_step` as one kernel**, ~0.45 ms corrected, in the largest component.
 
 And what is closed, so nobody re-opens it: byte reduction (45.7), the `attn_qkv`
