@@ -8072,6 +8072,42 @@ dominates completely. **A 4-chip line reduce can therefore be a chain rather
 than a tree**, which is much the simpler build: each chip forwards to its
 neighbour and distance costs nothing.
 
+### 45.41 The two-chip reduce runs and is wrong -- and the probe never checked
+
+Built the accumulate half (`scripts/kernels/fabreduce{,_reader,_compute}.cpp`,
+`scripts/dev/fabric_reduce_check.py`): chip 0 sends its partial to chip 1, chip
+1 waits on the fused atomic-inc, adds it to its own, writes the result. It
+builds, runs end to end, and the arithmetic is **wrong**:
+
+    chip1 out vs (p0 + p1): max abs err 4.1021e+00
+    |want| 5.4485e+00   |have| 4.3438e+00
+
+Not garbage, not a hang -- a real tensor of the right shape holding the wrong
+numbers, which is the same shape of failure as 45.27 and the reason this script
+checks the sum before it ever takes a timing.
+
+**The cause is inherited from `fabric_probe.py`, which never verified its
+payload.** Both pass `src.buffer_address()` as the send's source and
+`scratch.buffer_address()` as its destination -- but those are **DRAM**
+addresses, and `fabric_unicast_noc_fused_unicast_with_atomic_inc` takes an
+**L1** source and a NOC address built from a worker core. The probe moved
+`PAYLOAD` bytes of whatever happened to sit at that L1 offset and timed it,
+which is fine for measuring a hop and is *not* evidence that a packet delivers
+what you asked it to.
+
+INVARIANT 160: `fabric_probe.py`'s 3.03x (and 45.40's 2.83x) time a send whose
+payload was never checked. The hop cost stands -- bytes did move -- but nothing
+in this document has yet demonstrated **correct delivery** over the fabric. Do
+not carry those ratios into a design review as though they had.
+
+**The real design problem this exposes**, and it is the next thing to solve:
+a fabric packet lands in the *receiver's L1*, so the sender needs the receiver's
+CB base address at program-build time. The Python side does not expose CB
+addresses, so the chain reduce needs either a fixed L1 scratch region agreed by
+both ends, or the address passed in as a runtime arg discovered on device. Until
+that is settled the reduce cannot deliver into a buffer the compute kernel
+reads, which is exactly where this attempt stopped.
+
 INVARIANT 159 (a sixth fabric gotcha, to go with 45.21's five):
 `setup_fabric_connection` opens a connection to the **adjacent** node, and the
 distance a packet travels is the send's `num_hops`. Passing
