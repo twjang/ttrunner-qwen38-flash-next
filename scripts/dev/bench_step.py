@@ -17,7 +17,14 @@ from ttrunner_qwen38_flash_next.tt.bench import benchmark_step
 ITERS = int(sys.argv[1]) if len(sys.argv) > 1 else 25
 SEQ = int(sys.argv[2]) if len(sys.argv) > 2 else 262144
 mesh, cfg, m = open_model(max_seq_len=SEQ)
-print(f'RESULT max_seq_len {SEQ}', flush=True)
+# Invariant 141/145: `selection_active` defaults True, which is NOT what the
+# engine runs below `indexer_budget` -- and below the budget the selection is a
+# provable no-op that still pays ~22 ms of topk. A timing number has to say
+# which regime it is in.
+import os  # noqa: E402
+if os.environ.get("TTRUNNER_SELECTION") == "0":
+    m.selection_active = False
+print(f'RESULT max_seq_len {SEQ}  selection {m.selection_active}', flush=True)
 
 state = m.new_state(batch=1)
 eager = benchmark_step(m, state, 1000, iters=ITERS)

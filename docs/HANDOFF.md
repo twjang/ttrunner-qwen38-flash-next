@@ -7006,6 +7006,20 @@ clears it. Below 2048 that is ~22 ms of provably-useless `topk`. Set the flag to
 match the position being modelled, or state which regime a number belongs to --
 a 32 and a 105 in this document can both be right.
 
+**Confirmed apples-to-apples**, one harness, one `max_seq_len`, only the flag
+changing (`bench_step.py 25 8192`, traced, batch 1):
+
+| `selection_active` | median | min | tok/s |
+|---|--:|--:|--:|
+| False (positions 0..2047) | **32.3 ms** | 31.5 | 31.0 |
+| True (positions >= 2048) | **105.8 ms** | 105.0 | 9.5 |
+
+So the 32 ms this section has been optimising and the 105 ms `bench_step` was
+reporting are the same model at the same sequence length, separated only by
+`selection_active` -- the harness disagreement of the table above, closed. The
+selection costs **73.5 ms a token**, 69 % of the long-context step, of which
+engine.py:681 attributes 22.3 ms to `ttnn.topk` alone.
+
 The consequence for the goal is worth being blunt about. The 7.9 ms target is a
 short-context, batch-1 figure, so the ~32 ms regime is the comparable one and
 the road in section 46 stands. But **real long-context decoding is the 105 ms
