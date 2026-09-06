@@ -7500,11 +7500,45 @@ is a *dot product* in row 0 and garbage in rows 1..31 -- which is exactly an
 infinite state, exactly a state that does not change when the outer product is
 zeroed, and exactly a column-0 mask that keeps nothing.
 
-INVARIANT 151: `matmul_tiles` reads a tile's **contents**, and a ttnn shape
-change is not a promise about them. Before treating tile (i,0) of a transposed
-tensor as a column, verify it on device -- `to_torch` one tile and look. The
-comment in `recur_reader.cpp` reasoned from the page *index* to the page
-*contents* and was wrong for eight sessions of work built on top of it.
+**Checked on device, and this is wrong.** `ttnn.transpose` *does* materialise
+it. Feeding `k[0,0,0,:] = 1..128` and reading the result back:
+
+    kt.shape            [12, 1, 128, 1]
+    kt[0,0,:8,0]        [1, 2, 3, 4, 5, 6, 7, 8]
+    kt row 0 sum        1.0
+    kt column 0 sum     8256.0          = sum(1..128)
+
+The data is exactly where the kernel expects it. So the transpose is not the
+bug, `recur_reader.cpp`'s comment is correct, and the paragraph above is
+retracted -- it was a hypothesis that fitted three numbers and it is false.
+
+INVARIANT 151: check a layout claim on device with `to_torch` **before** writing
+it down as a cause. This section reasoned from three consistent measurements to
+a mechanism, committed it, and refuted it with a five-line probe that could have
+been run first. The measurements were right; the story attached to them was not.
+
+**What remains, stated precisely.** All of these are established:
+
+* the verifier is exact (control 0.000e+00 both columns);
+* the fused **output** matches the op chain at 9.613e-04 in every configuration;
+* the fused **state** is `inf` with an identity mask and 6.200e+01 with either a
+  column-0 mask or an all-zeros mask;
+* `kt` genuinely holds its data in column 0;
+* the mask multiply is faithful (identity reproduces the unmasked kernel exactly).
+
+Those last three are hard to hold together: if `kt[a,0]` is the real data and the
+mask preserves column 0, the column-0 arm should differ from the all-zeros arm,
+and it does not. Either `mul_binary_tile` is not doing what the identity case
+suggests for a non-constant mask, or the mask tile's column 0 does not align
+with `kt`'s inside the tile's face layout, or the outer product's contribution
+is genuinely negligible against a state error that comes from somewhere else
+entirely -- in which case 62.0 is not the outer product's magnitude and the
+all-zeros arm proves nothing.
+
+**Next probe, and run it before any more theory:** `to_torch` the `cb_ktm`
+contents by writing them to a scratch output tensor for one call, and look at
+where the data is after the mask multiply. Every mechanism above predicts a
+different tile.
 
 **Next step**, and it is small: read one `kt` tile back with `to_torch` and see
 where the data sits. If it is in row 0, the fix is either `transpose_wh_tile` in
