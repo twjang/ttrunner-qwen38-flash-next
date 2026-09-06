@@ -47,23 +47,27 @@ def build(mesh, roles, src, scratch, out):
             kernels=[], semaphores=[
                 ttnn.SemaphoreDescriptor(id=0, core_ranges=crs, initial_value=0)],
             cbs=[
-                ttnn.CBDescriptor(total_size=2 * page, core_ranges=crs,
+                # NT tiles, not 2: the sender ships the whole block in one
+                # packet from `cb_mine`, and the packet lands in `cb_theirs`.
+                ttnn.CBDescriptor(total_size=NT * page, core_ranges=crs,
                                   format_descriptors=[ttnn.CBFormatDescriptor(
                                       buffer_index=i, data_format=src.dtype,
                                       page_size=page)])
                 for i in (0, 1, 16)])
         w_rt, r_rt = [0], [0, 0, 0]
         if role == 1:
+            r_rt = [src.buffer_address(), 0]
             # Mutates pd; returns the block build_from_args consumes. Connect to
             # the ADJACENT node -- distance is num_hops (invariant 159).
             fargs = ttnn.setup_fabric_connection(
                 fab.FabricNodeId(mesh_id, chip), fab.FabricNodeId(mesh_id, chip + 1),
                 0, pd, WORKER, ttnn.CoreType.WORKER)
-            w_rt = [src.buffer_address(), phys.x, phys.y, scratch.buffer_address(),
-                    phys.x, phys.y] + list(fargs)
+            # src/dst L1 addresses are taken inside the kernel now; these
+              # slots stay for the NOC coordinates and the fabric block.
+            w_rt = [0, phys.x, phys.y, 0, phys.x, phys.y] + list(fargs)
         elif role == 2:
             w_rt = [out.buffer_address()]
-            r_rt = [src.buffer_address(), scratch.buffer_address(), 1]
+            r_rt = [src.buffer_address(), 1]
 
         def kd(name, ct, rt, cfg):
             return ttnn.KernelDescriptor(
@@ -74,7 +78,7 @@ def build(mesh, roles, src, scratch, out):
                 runtime_args=[(WORKER, rt)], config=cfg)
 
         pd.kernels = [
-            kd("fabreduce_reader.cpp", [role, nbytes, 0, NT] + a_src + a_scr,
+            kd("fabreduce_reader.cpp", [role, NT, 0] + a_src,
                r_rt, ttnn.ReaderConfigDescriptor()),
             kd("fabreduce_compute.cpp", [role, NT], [0],
                ttnn.ComputeConfigDescriptor()),

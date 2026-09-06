@@ -58,10 +58,17 @@ void kernel_main() {
         }
         return;
     } else {
-        const uint32_t src_l1 = get_arg_val<uint32_t>(0);
+        // **L1, not DRAM** (45.41, invariant 160). The reader has streamed this
+        // chip's partial into `cb_mine`, so wait for it and send from there; and
+        // aim at `cb_theirs`' address on *this* core, which is the same address
+        // on the receiver because every chip runs the same CB list.
+        constexpr uint32_t NT_ = get_compile_time_arg_val(3);
+        constexpr uint32_t cb_mine = 0, cb_theirs = 1;
+        cb_wait_front(cb_mine, NT_);
+        const uint32_t src_l1 = get_read_ptr(cb_mine);
+        const uint32_t dst_l1 = get_write_ptr(cb_theirs);
         const uint32_t dst_x = get_arg_val<uint32_t>(1);
         const uint32_t dst_y = get_arg_val<uint32_t>(2);
-        const uint32_t dst_l1 = get_arg_val<uint32_t>(3);
         const uint32_t sem_x = get_arg_val<uint32_t>(4);
         const uint32_t sem_y = get_arg_val<uint32_t>(5);
 

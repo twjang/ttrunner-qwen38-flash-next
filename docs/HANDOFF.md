@@ -8100,13 +8100,48 @@ payload was never checked. The hop cost stands -- bytes did move -- but nothing
 in this document has yet demonstrated **correct delivery** over the fabric. Do
 not carry those ratios into a design review as though they had.
 
-**The real design problem this exposes**, and it is the next thing to solve:
-a fabric packet lands in the *receiver's L1*, so the sender needs the receiver's
-CB base address at program-build time. The Python side does not expose CB
-addresses, so the chain reduce needs either a fixed L1 scratch region agreed by
-both ends, or the address passed in as a runtime arg discovered on device. Until
-that is settled the reduce cannot deliver into a buffer the compute kernel
-reads, which is exactly where this attempt stopped.
+### 45.42 A correct fabric reduce, on two chips
+
+Solved it, and the solution needs no address from Python: **every chip runs the
+same program with the same CB list, so the allocator puts a given CB at the same
+L1 address on all of them.** The sender therefore aims at
+`get_write_ptr(cb_theirs)` *on its own core* and hits the receiver's. Combined
+with reading its partial DRAM -> `cb_mine` first so the send has a real L1
+source, that is the whole fix:
+
+    chip1 out vs (p0 + p1): max abs err 2.9982e-02
+    |want| 5.4485e+00   |have| 5.4375e+00
+    CORRECT
+
+3.0e-02 on values of magnitude 5.4 is bfloat16 rounding (~0.5 %), which is what
+a bf16 accumulate should give.
+
+**This is the first demonstration in this document that a fabric packet delivers
+what it was asked to** -- invariant 160 was written an hour earlier to say
+nothing had shown that yet. The mechanism for item 3 is now proven end to end:
+send, fused atomic-inc, wait, accumulate, write, verified against torch.
+
+`scripts/dev/fabric_reduce_check.py` and
+`scripts/kernels/fabreduce{,_reader,_compute}.cpp`. Nothing is wired into the
+model; this is a standalone correctness harness.
+
+INVARIANT 161: a `generic_op` running the same CB list on every chip can address
+a peer's circular buffer by its own pointer to it. That removes the only thing
+that looked like it needed a cross-device address exchange, and it is what makes
+a multi-chip `generic_op` collective practical at all.
+
+**What remains for item 3**, in order:
+
+1. **Extend 2 chips to 4.** The chain is chip d forwarding to d+1 with the same
+   three kernels; roles become `[send, fwd, fwd, last]` where `fwd` is today's
+   accumulator followed by today's sender. Then the total comes back down --
+   45.40 says distance is free, so three unicasts from chip 3 with
+   `num_hops` 1, 2, 3 is fine and simpler than a multicast.
+2. **Wire it into `ops.all_reduce`** behind an env flag, and gate on
+   `device_quality.py` in **both** regimes (invariant 145) before any timing is
+   believed.
+3. **Measure paired in the model** with `ab_step.py`. The number to beat is
+   26 us a reduce (45.19); 45.31 puts all collectives at 3.86 ms.
 
 INVARIANT 159 (a sixth fabric gotcha, to go with 45.21's five):
 `setup_fabric_connection` opens a connection to the **adjacent** node, and the
