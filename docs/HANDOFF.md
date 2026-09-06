@@ -7342,6 +7342,76 @@ Ranked, what is left in the 32.65 ms:
     shexp      1.18
     rest       ~3      norms, embedding, head, glue
 
+### 45.32 FOUND: the outer product sums 32 columns of padding
+
+45.27 left the fused recurrence right at seq 2049 and wrong at 2047 with five
+hypotheses dead. The measurement that settled it reruns the **op chain on a copy
+of the same pre-call state**, inside the model, and compares
+(`TT_RECUR_VERIFY=1`, `linear_attn._verify`). Over 360 calls:
+
+| config | worst `out` | worst `state` |
+|---|--:|--:|
+| seq 2047 (broken model) | 9.613e-04 | **inf** |
+| seq 2049 (working model) | 9.613e-04 | 2.539e-02 |
+
+**The output error is identical to four digits in both.** Only the state differs,
+and in the failing configuration it is infinite. So the kernel computes the right
+answer and writes a wrong state -- which is exactly why a one-shot check passes
+(invariant 142 was right about the shape of the risk, wrong that per-step error
+was the mechanism).
+
+**The cause.** The state update is written as a matmul:
+
+```cpp
+matmul_tiles(cb_kt, cb_delta, i, 0, 0);   // [32,1] @ [1,32] = outer product
+```
+
+`kt[i]` is a column tile whose only real data is column 0, `delta` a row tile
+whose only real data is row 0, and the comment above it says the zeros in both
+make `sum_c kt[a,c] * delta[c,b]` collapse to `kt[a,0] * delta[0,b]`. **That is
+an assumption about padding, and it is load-bearing.** `matmul_tiles` sums over
+all 32 values of `c`. If the pad columns of `kt` or the pad rows of `delta` hold
+anything but zero, every one of those products enters the state.
+
+The output never touches them: `out = q . decayed + (q . k) * delta` is a
+reduction over real data plus a *scalar* broadcast, so it is pad-insensitive.
+One expression in the kernel reads the padding and it is the one that feeds
+forward.
+
+This accounts for every observation at once:
+
+* **standalone passes** -- `recur_seq_check.py` builds its operands with
+  `ttnn.from_torch(torch.randn(...))`, which zero-pads. Its state error is
+  4.427e-04.
+* **the model fails** -- `q/k/v/g/beta` arrive via `typecast`, and `kt` via
+  `ttnn.transpose`, on recycled buffers whose pad regions hold whatever was
+  there before.
+* **it tracks `_indexer_select`** -- that is 12 layers' worth of allocations a
+  step. Run it and the pads happen to hold small values (2.5e-02 of state
+  error); skip it and they hold something that overflows to inf.
+* **deterministic, sync-independent, grid-independent, cumulative in layers, and
+  invisible to `traced_vs_eager`** -- all follow.
+
+INVARIANT 150: `matmul_tiles` contracts the **full 32** of a tile. Using it as an
+outer product of a column against a row is only correct if the operands' padding
+is zero, and nothing in ttnn guarantees that for a tensor produced by
+`typecast`, `transpose` or a slice. Never let a kernel's correctness rest on pad
+contents: zero them yourself, or use an op that does not contract over them.
+
+**The fix, in preference order.** (1) Zero the pad explicitly -- the reader owns
+`cb_kt` and can clear the tile before placing the real column; `delta` is
+computed in-kernel and would need masking to row 0 after the
+`mul_tiles_bcast_scalar`. (2) Replace the outer product with a row/column
+broadcast multiply, which contracts nothing -- but the kernel already uses
+`BroadcastType::SCALAR` and invariant 108 allows one broadcast type per compute
+kernel, so that is a restructure, not an edit. (3) Guarantee zero pads upstream,
+which is the weakest option: it makes the kernel's correctness depend on every
+caller forever.
+
+Fix (1) is the one to try, and `TT_RECUR_VERIFY=1` is now the gate for it: the
+state column must come back at ~1e-03, not inf, **at seq 2047**, before any
+timing number from this kernel means anything.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite

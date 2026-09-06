@@ -50,6 +50,44 @@ def _tiles(t) -> int:
 
 
 _RECUR_OUT: dict = {}
+_VERIFY_WORST = {"out": 0.0, "state": 0.0, "n": 0}
+
+
+def _verify(state, q, k, v, g_exp, beta, got):
+    """TT_RECUR_VERIFY=1: rerun the op chain on the *same* inputs and compare.
+
+    Handoff 45.27: the fused recurrence is right at seq 2049 and wrong at 2047
+    with everything else identical, and five hypotheses for that are dead. This
+    settles the remaining question -- whether the kernel produces wrong numbers
+    in the model, or produces right ones that something else then corrupts.
+
+    The op chain runs on a *copy* of the pre-call state, so it does not disturb
+    the real one. Called after the fused path has already written `state`, so
+    the copy has to be taken before -- see the caller.
+    """
+    import torch
+    ref_state = _VERIFY_PRE.pop("state", None)
+    if ref_state is None:
+        return
+    ref_out = decode_step(q, k, v, g_exp, beta, ref_state, _no_fuse=True)
+    a = ttnn.to_torch(got, mesh_composer=ttnn.ConcatMeshToTensor(got.device(), dim=0))
+    b = ttnn.to_torch(ref_out, mesh_composer=ttnn.ConcatMeshToTensor(ref_out.device(), dim=0))
+    n = min(a.shape[0], b.shape[0])
+    do = float((a[:n].float() - b[:n].float()).abs().max())
+    sa = ttnn.to_torch(state, mesh_composer=ttnn.ConcatMeshToTensor(state.device(), dim=0))
+    sb = ttnn.to_torch(ref_state, mesh_composer=ttnn.ConcatMeshToTensor(ref_state.device(), dim=0))
+    m = min(sa.shape[0], sb.shape[0])
+    ds = float((sa[:m].float() - sb[:m].float()).abs().max())
+    w = _VERIFY_WORST
+    w["out"] = max(w["out"], do)
+    w["state"] = max(w["state"], ds)
+    w["n"] += 1
+    if w["n"] % 360 == 0:
+        print(f"RESULT verify after {w['n']} calls: worst out {w['out']:.3e}  "
+              f"worst state {w['state']:.3e}", flush=True)
+
+
+_VERIFY_PRE: dict = {}
 
 
 def _recur_out(state, v):
@@ -58,6 +96,17 @@ def _recur_out(state, v):
     Kept per (state, shape) like every other `generic_op` output here: a trace
     replays a recorded graph, so a buffer it touches must not move.
     """
+    # TEMPORARY probe (handoff 45.27): TT_RECUR_FRESH=1 allocates a new output
+    # every call instead of reusing the cached one. Unsafe in a trace and slow,
+    # but `device_quality.py` is eager -- and if the seq-2047 corruption is two
+    # of these buffers aliasing, it disappears here.
+    import os as _os
+    if os.environ.get("TT_RECUR_FRESH") == "1":
+        import torch as _t
+        return ttnn.from_torch(
+            _t.zeros(*[int(d) for d in v.shape]), dtype=v.dtype,
+            layout=ttnn.TILE_LAYOUT, device=v.device(),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(v.device()))
     key = (id(state), tuple(v.shape), str(v.dtype))
     got = _RECUR_OUT.get(key)
     if got is None:
@@ -77,6 +126,7 @@ def decode_step(
     g_exp: ttnn.Tensor,
     beta: ttnn.Tensor,
     state: ttnn.Tensor,
+    _no_fuse: bool = False,
 ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
     """One recurrent step.
 
@@ -105,7 +155,11 @@ def decode_step(
     # lands inside a trace capture, which is the "allocating device buffers is
     # unsafe" hazard. In the model the state is float32 and q/k/v arrive
     # bfloat16, so the decline is the common path, not the rare one.
-    if not ops._NO_FUSED_RECUR:
+    if _no_fuse:
+        pass
+    elif not ops._NO_FUSED_RECUR:
+        if os.environ.get("TT_RECUR_VERIFY") == "1":
+            _VERIFY_PRE["state"] = ttnn.clone(state)
         # The model hands this bfloat16 q/k/v/g/beta against a float32 state, and
         # one compute kernel configures its unpacker from one circular buffer
         # (invariant 76), so they have to agree. Casting here is the *measurable*
@@ -130,6 +184,8 @@ def decode_step(
             # dtypes, not a narrowing pack.
             _recur_out(state, fv))
         if fused_all is not None:
+            if os.environ.get("TT_RECUR_VERIFY") == "1":
+                _verify(state, q, k, v, g_exp, beta, fused_all)
             return fused_all
 
     decayed = ttnn.multiply(state, g_exp)
