@@ -49,6 +49,27 @@ def _tiles(t) -> int:
     return n * max(1, (sh[-2] + 31) // 32) * max(1, (sh[-1] + 31) // 32)
 
 
+_RECUR_OUT: dict = {}
+
+
+def _recur_out(state, v):
+    """The fused recurrence writes its output into a buffer of its own.
+
+    Kept per (state, shape) like every other `generic_op` output here: a trace
+    replays a recorded graph, so a buffer it touches must not move.
+    """
+    key = (id(state), tuple(v.shape), str(v.dtype))
+    got = _RECUR_OUT.get(key)
+    if got is None:
+        import torch
+        got = ttnn.from_torch(
+            torch.zeros(*[int(d) for d in v.shape]), dtype=v.dtype,
+            layout=ttnn.TILE_LAYOUT, device=v.device(),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(v.device()))
+        _RECUR_OUT[key] = got
+    return got
+
+
 def decode_step(
     q: ttnn.Tensor,
     k: ttnn.Tensor,
@@ -73,6 +94,25 @@ def decode_step(
 
     Returns the output; the new state is in `state`.
     """
+    # The whole recurrence in one launch when the shapes and dtypes allow: it
+    # reads the state once and writes it once, where everything below makes five
+    # passes over it. 2.95 ms a token (handoff 45.23), and `recur_check.py` puts
+    # it at 1.09e-03 from float64 against the chain's 8.26e-04.
+    # The dtype check comes **first**, before the transpose and before
+    # `_recur_out` allocates: Python evaluates arguments eagerly, so calling
+    # `fused_recurrence(..., ttnn.transpose(k), _recur_out(...))` pays both even
+    # when the guard inside declines -- and `_recur_out`'s first allocation then
+    # lands inside a trace capture, which is the "allocating device buffers is
+    # unsafe" hazard. In the model the state is float32 and q/k/v arrive
+    # bfloat16, so the decline is the common path, not the rare one.
+    if not ops._NO_FUSED_RECUR and all(
+            t.dtype == state.dtype for t in (q, k, v, g_exp, beta)):
+        fused_all = ops.fused_recurrence(
+            state, q, k, ttnn.transpose(k, -2, -1), v, g_exp, beta,
+            _recur_out(state, v))
+        if fused_all is not None:
+            return fused_all
+
     decayed = ttnn.multiply(state, g_exp)
 
     # `k @ decayed` and `q @ decayed` are two reads of the same ~100 MB state at

@@ -6785,6 +6785,51 @@ which is the half a fused version is most likely to get wrong.
 INVARIANT 137: DeltaNet's cost is the recurrence, not its projections. 2.95 of
 9.47, at eight times its byte time, in six launches over a state that fits in L1.
 
+### 45.24 The fused recurrence: built, correct on device, one step from engaging
+
+`scripts/kernels/recur_{reader,compute,writer}.cpp` and `ops.fused_recurrence`
+do the whole delta rule in **one launch**, reading the 786 KB state once and
+writing it once where the chain makes five passes. Against float64 on the
+operands the device saw (`recur_check.py`):
+
+    decode_step   out 8.255e-04   state 3.527e-04
+    fused         out 1.092e-03   state 9.358e-04
+
+Both halves, same error order -- what a different summation order should give.
+Wired into `decode_step` behind `TT_FUSED_RECUR=1`; with it off,
+`traced_vs_eager` still MATCHes token for token in 28 s.
+
+**It does not engage yet.** The model hands `decode_step` bfloat16 q/k/v/g/beta
+and a float32 state, and the guard declines rather than mix dtypes through one
+unpacker (invariant 76). Making it engage means `fused_qkv_heads` and
+`fused_delta_scalars` emitting float32 -- 48 tiles each, so the bytes are
+nothing, and model.py:928 already records that casting them "changes nothing
+measurable". That is the next step, and it is the only one left before this can
+be timed against the 2.95 ms it targets.
+
+Four bugs, each found by bisecting the kernel (invariant 109) and each a
+one-line difference from a kernel already working here:
+
+| symptom | cause |
+|---|---|
+| `out` wrong by 5.4e-01 | three-arg `matmul_init`; `ksgemv_compute` uses two |
+| write-back hung | four FPU<->SFPU transitions in a loop; every working kernel here makes that transition once |
+| write-back still hung | `cb_upd` reused after a push/pop, so an indexed `pack_tile` addressed a wrapped buffer |
+| write-back still hung | **the reader never read `kt`** -- the compute kernel waited on a buffer nothing filled |
+
+The last one is the clearest argument for the method: stages 0 through 5 never
+touch `cb_kt` and all ran; only stage 6 waits on it and only stage 6 hung. The
+bisection pointed at the bug without a single hypothesis about the surroundings.
+
+INVARIANT 138: a `generic_op` reader must fill every circular buffer its compute
+kernel waits on, and a missing read looks exactly like a hardware hang. Before
+theorising, list the CBs the compute waits on and check each has a push.
+
+And one save worth keeping: stage 1 "hung" on its first run and I began
+theorising about op mixing; stages 2 and 3 then ran clean, so stage 1 had been
+the ~12 % base-rate flake (45.14). Without that rate measured the same night, the
+next hours would have gone into a phantom. Invariant 128, earning itself back.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
@@ -6811,9 +6856,10 @@ finishes **8 times out of 8**. Measurement is cheap; it was the cards.
 
 What is left, with what each is actually worth:
 
-1. **Fuse `decode_step`** (45.23). 2.95 ms measured, single-chip, no fabric and
-   no quality gate -- five passes over an L1-sized state become two. The best
-   remaining item on both size and risk.
+1. **Land the fused `decode_step`** -- built and correct on device (45.24), one
+   step from engaging: `fused_qkv_heads` and `fused_delta_scalars` must emit
+   float32 so the guard stops declining. Then time it against the 2.95 ms it
+   targets, and gate it with `device_quality.py`.
 2. **`TT_GG_COLS=1`**, an untried item with a mechanism and a component worth
    attacking: it doubles the cores on the MoE's two largest
    kernels inside 5.17 ms. It hangs 3-of-3 today and 45.16 shows the idle-core
