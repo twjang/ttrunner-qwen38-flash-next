@@ -7226,6 +7226,60 @@ Call sites, for whoever picks this up (`/tmp/site_dump.json` from the census):
 and `slice` into `fused_group_sum`, which is two ops and therefore below
 invariant 91's threshold.
 
+### 45.30 Rejected: stubbing the linears to price them. And a retraction.
+
+45.29 says 460 `ttnn.linear` calls hold most of the 22.5 ms remainder, while
+45.14 says `ksgemv` -- which targets exactly those -- buys nothing. The device
+profiler would settle it, but this wheel is not a Tracy build (`TT_METAL_DEVICE_
+PROFILER requires a Tracy-enabled build`), so I tried to ablate instead:
+`scripts/dev/linear_price.py` replaces every `fast_linear` with a cached tensor
+of the right shape, and the delta is what the matmuls cost where they live.
+
+**It does not work.** Three variants, all killed by a 700 s timeout against a
+baseline that steps in about a minute:
+
+| variant | outcome |
+|---|---|
+| traced, zero output | allocates inside the capture ("Allocating device buffers is unsafe due to the existence of an active trace"), hung |
+| eager, zero output | hung |
+| eager, fixed random output | hung |
+
+The first has a known cause and a partial fix -- prime the cache on an eager step
+before the decoder captures -- which reduced but did not remove the allocations,
+because the captured graph asks for shapes the eager step never produces.
+
+The second has a *model* cause worth recording on its own. The router is a
+`fast_linear` too, and `moe_block` selects experts by thresholding at the k-th
+largest probability, which **admits ties** (moe.py:186). Zeroed logits make all
+512 experts tie at the threshold, so the expert path runs on every one of them.
+The stub does not make the step cheaper, it makes it enormous.
+
+INVARIANT 147: do not ablate an op by returning zeros in this model. The MoE
+routes by a tie-admitting threshold, so a constant logit vector selects **all
+512** experts rather than 10. Any stub upstream of the router has to produce a
+non-degenerate spread -- and a fixed random draw was still not enough to make
+this one finish, so the whole technique is closed here, not merely the zeros.
+
+**And a retraction of something I wrote from the one arm that did finish.** The
+eager baseline in `linear_price.py` reported 32.01 ms, next to the traced 32.65,
+and I took that to mean tracing buys nothing and the dispatch term is near zero.
+It is wrong. `bench_step.py` in a single process, `max_seq_len 512`,
+`selection_active` False, measures both:
+
+    eager   545.98 ms   (1.8 tok/s)
+    traced   32.0  ms   (31.3 tok/s)
+
+**Seventeen times.** So the trace is doing an enormous amount of work, the
+dispatch term in the *eager* program is most of it, and `linear_price.py`'s
+"eager" figure of 32.01 ms is measuring something other than an eager step --
+whatever it is, do not build on it. The number to trust is traced, and it is
+now confirmed at three sequence lengths: 32.0 (512), 32.65 (4096), 32.3 (8192).
+
+INVARIANT 148: measure both arms **in one process** before comparing them. This
+section assembled an eager number from one harness and a traced number from
+another, got 32.01 against 32.65, and concluded the trace was worthless. One
+process says 546 against 32.0. Two harnesses are two experiments.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
