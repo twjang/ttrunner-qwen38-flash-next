@@ -6704,6 +6704,49 @@ gone before it was ever priced. And the accounting in 44.2 has to lose its floor
 term, which means the step is more concentrated in the layers than this file has
 been assuming, not less.
 
+### 45.23 The DeltaNet recurrence is 2.95 ms -- the best lever left, and it is single-chip
+
+44.4 measured the convolution and the head split at zero and left the rest of
+DeltaNet's 9.47 ms unattributed. Each remaining piece stubbed alone, paired
+against the baseline:
+
+| stubbed | rep 1 | rep 2 | cost |
+|---|--:|--:|--:|
+| `decode_step` (the recurrence) | 32.31 -> 29.39 | 32.50 -> 29.51 | **2.92 / 2.99** |
+| `fused_delta_scalars` | 31.86 | | 0.45 |
+| `fused_delta_tail` | 32.08 | | 0.23 |
+| the convolution | -- | | 0 (44.4) |
+| the q/k/v head split | -- | | 0 (44.4) |
+
+**The recurrence is 2.95 ms**, two paired reps agreeing to 0.07. That is 81 us a
+layer against ~10 us of state traffic -- an eight-fold gap, and the largest
+non-collective cost in the model.
+
+What it does, per layer, at batch 1 (`linear_attn.py:decode_step`, state
+[12, 1, 128, 128] float32 = 786 KB):
+
+    decayed = state * g_exp          read 786 KB, write 786
+    predicted = k @ decayed          read 786
+    q_decayed = q @ decayed          read 786
+    fused_delta_out                  one launch
+    update = kt * delta              the outer product
+    add(decayed, update) -> state    read 786 + 393, write 786
+
+Six or seven launches and five passes over the state where **two would do** --
+one that reads the state and produces both matmul rows, one that writes it back.
+786 KB over 110 cores is 7.1 KB a core against 1.5 MB of L1, so the state fits
+and never needs to leave.
+
+This is now the top item, ahead of the fabric all-reduce, on both size and risk:
+2.95 ms against a 2.2 ms pot, and it is a **single-chip compute kernel** -- the
+kind this project has shipped nine times -- with no cross-device semaphores, no
+fabric, and no reduction-order quality gate. The audit's estimate for it (0.45 ms,
+verified down from 1.0) priced the *launch* saving; it did not know the
+recurrence's total was 2.95.
+
+INVARIANT 137: DeltaNet's cost is the recurrence, not its projections. 2.95 of
+9.47, at eight times its byte time, in six launches over a state that fits in L1.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
@@ -6730,8 +6773,11 @@ finishes **8 times out of 8**. Measurement is cheap; it was the cards.
 
 What is left, with what each is actually worth:
 
-1. **`TT_GG_COLS=1`**, the only untried item left with a mechanism and a
-   component worth attacking: it doubles the cores on the MoE's two largest
+1. **Fuse `decode_step`** (45.23). 2.95 ms measured, single-chip, no fabric and
+   no quality gate -- five passes over an L1-sized state become two. The best
+   remaining item on both size and risk.
+2. **`TT_GG_COLS=1`**, an untried item with a mechanism and a component worth
+   attacking: it doubles the cores on the MoE's two largest
    kernels inside 5.17 ms. It hangs 3-of-3 today and 45.16 shows the idle-core
    guard is *not* the reason, so this needs its own bisection. Note 45.18 before
    pricing it: its case rests on the same isolated arithmetic that gave the
