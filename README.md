@@ -191,7 +191,9 @@ second measurably closer to an exact float64 reference than what it replaced.
 Before that, 229 ms pre-`014`, when the model was wrong. With QSA's sparse
 selection on -- contexts in `(2048, 65536]` -- a step was 297.5 ms at 8192 tokens
 against 236.1 dense; the extra is almost all `ttnn.topk` at k=512, see
-`docs/iterations/015`.)
+`docs/iterations/015`. That diagnosis was right and the cost is now mostly gone:
+`HANDOFF.md` 45.44 restricts the search to the blocks that can actually be
+selected, which is **-44 ms**.)
 
 ### Pointing an agent harness at it
 
@@ -295,6 +297,17 @@ src/ttrunner_qwen38_flash_next/
                 bench.py       per-section timing
   server/     OpenAI-compatible FastAPI app (backend-agnostic)
 scripts/      codebook generation, Telegram progress notifier
+  dev/        the measurement harnesses. The ones to reach for first:
+                bench_step.py           batch-1 step, eager and traced
+                                        (TTRUNNER_SELECTION=0 for the
+                                        below-budget regime; pass a seq length,
+                                        the default 262144 is not what you want)
+                device_quality.py       next-token accuracy on real prose --
+                                        the correctness gate, run it in BOTH
+                                        regimes before believing a timing
+                cumulative_ablation.py  what each component costs
+                step_op_census.py       every ttnn call a step issues, by name
+                                        and call site, with bytes
 tests/        235 tests
 docs/PRINCIPLES.md  the machine, the principles, the pitfalls -- read this first
 docs/HANDOFF.md     the chronological log behind it
@@ -345,6 +358,11 @@ itself rather than against another implementation
 |---|---|---|---|---|
 | device, decode | **83.0 %** | 97.9 % | 0.682 | 1.98 |
 | device, QSA selection on | 83.0 % | 97.9 % | 0.682 | 1.98 |
+
+Re-checked after `HANDOFF.md` 45.44 narrowed the selection's search: A/B'd in one
+binary over 64 stepped tokens at `max_seq_len` 2049, the old full-range `topk`
+and the new eligible-prefix one score **50/63 top-1, 61/63 top-5, NLL 0.794** --
+identical to the digit -- and `traced_vs_eager` matches token for token.
 | float32 CPU reference | 80.9 % | 97.9 % | 0.703 | 2.00 |
 
 Chunked prefill is judged separately, against a decode control over the *same*
