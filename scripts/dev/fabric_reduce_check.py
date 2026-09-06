@@ -140,6 +140,17 @@ def main() -> None:
               "two chips,  chip1 = p0+p1")
         # The forward half of the 4-chip chain: 0 -> 1 -> 2 -> 3, each middle
         # chip adding its own partial and passing the running sum on.
+        # Three chips first: 0 -> 1 -> 3, one forwarder. If this passes and the
+        # four-chip chain does not, the fault is the second forwarder rather
+        # than the forwarder role itself -- which is the bisection 45.43 asks
+        # for.
+        r3 = [0, 0, 0, 0]
+        r3[RING[0]] = 1
+        r3[RING[1]] = 3
+        r3[RING[2]] = 2
+        check(r3, RING[2], (parts[0] + parts[1] + parts[3]).to(torch.float32),
+              f"three chips {RING[:3]}, chip{RING[2]} = p0+p1+p3")
+
         # Roles are indexed by chip, and the chain walks RING = 0 -> 1 -> 3 -> 2,
         # so chip 2 is the one that ends up holding the total.
         roles = [0, 0, 0, 0]

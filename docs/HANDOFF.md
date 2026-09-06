@@ -8147,7 +8147,9 @@ and neither describes the wiring. Any multi-chip `generic_op` has to walk the
 ring; the natural `chip -> chip + 1` is wrong on two of its four steps.
 
 With the chain rewired to `0 -> 1 -> 3 -> 2` the program builds and then
-**deadlocks** (400 s timeout, no output). The two-chip arm is kept in the same
+**deadlocks** (400 s timeout, no output). Bisected: a **three**-chip chain
+(`0 -> 1 -> 3`, one forwarder) deadlocks too, so the fault is the forwarder role
+itself rather than the second hop of it. The two-chip arm is kept in the same
 script as a regression and still passes at 2.9982e-02, so the mechanism itself
 is intact; what fails is something in the three-hop pipeline.
 
