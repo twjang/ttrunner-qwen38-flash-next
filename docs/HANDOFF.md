@@ -8028,25 +8028,38 @@ finishes **8 times out of 8**. Measurement is cheap; it was the cards.
 
 What is left, with what each is actually worth:
 
-1. **Land the fused `decode_step`** -- built, correct on device, and measured at
-   **-0.88 ms** in its handicapped form (45.24, 45.25). Make `fused_qkv_heads`
-   and `fused_delta_scalars` emit the state's dtype: that removes five casts a
-   layer *and* stops `reinject` declining, and it is the whole remaining gap
-   between -0.88 and the 2.95 ms the fusion targets. Then gate with
-   `device_quality.py` and flip the default.
-2. **`TT_GG_COLS=1`**, an untried item with a mechanism and a component worth
-   attacking: it doubles the cores on the MoE's two largest
-   kernels inside 5.17 ms. It hangs 3-of-3 today and 45.16 shows the idle-core
-   guard is *not* the reason, so this needs its own bisection. Note 45.18 before
-   pricing it: its case rests on the same isolated arithmetic that gave the
-   k-split the wrong sign, so measure it paired in the model before believing
-   any estimate of what it is worth.
-2. **The traced-step instability**, as a correctness item. Enabling `generic_op`
+1. ~~**Land the fused `decode_step`**~~ -- **withdrawn, see 45.27-45.38.** The
+   kernel is wrong in the regime the engine actually decodes in (52.4 % top-1
+   against the op chain's 79.4 %), the -0.88 ms was measured with
+   `selection_active` left True, and the upstream-dtype plan this item describes
+   is impossible: `fused_qkv_heads` cannot emit float32 because its operands
+   must share a page size (45.25a). The bug is narrowed to the state write with
+   the output verified correct, six mechanisms eliminated and four failed
+   standalone reproductions. **Do not restart this without a fast reproduction
+   first** -- every probe currently costs a 7-minute `device_quality.py` run.
+   And note what it is worth even if fixed: 45.31 measures the whole DeltaNet
+   block at 8.36 ms, of which the recurrence is ~2.95, so this is a third of one
+   component rather than the headline it reads as here.
+2. ~~**`TT_GG_COLS=1`**~~ -- closed by 45.15 ("Rejected"), and this entry was
+   already stale when written.
+2. **The traced-step instability** -- now diagnosed, and it is the gating item
+   for anything `generic_op`. 45.39: `ksgemv` at the `router` site hangs 3/3
+   where the baseline runs 3/3, the threshold is **(4, 16] programs in one
+   capture**, and the cause is **L1**: one router program reserves 81920 B a
+   core, so sixteen is 83 % of the 1572864 B available. Nearly all of it is
+   `cb0`/`cb1`, sized for the whole k-chunk instead of a pipeline depth; the
+   chunking fix is specified in 45.39 and takes a program to ~30 KB. **But
+   measure before building**: where `ksgemv` already runs it gives 33.02 ms
+   against a 31.4-32.7 baseline -- no gain -- so this most likely buys a
+   rigorous null rather than time. Remaining as a correctness item: Enabling `generic_op`
    call sites destabilises the capture in proportion to how many are added
    (45.14) and the one mechanism found does not explain it (45.16). It caps all
    future generic_op work. `TT_METAL_WATCHER` aborts here, so it can only be
    bisected -- and the base rate is ~12 %, so every verdict needs four runs.
-3. **The fabric all-reduce** -- priced at 45.19 (the 84 wide reduces cost
+3. **The fabric all-reduce -- now the top item, and the only one with an
+   unspent mechanism.** 45.31 measures the collectives at **3.86 ms** in the
+   current step, which corroborates the 2.2 ms priced for the wide reduces
+   alone. Priced at 45.19 (the 84 wide reduces cost
    **2.2 ms** in model, ~1.5 recoverable) and its feasibility settled at 45.21
    (a packet from a `generic_op` is **3.03x** cheaper than the op it replaces,
    measured, with the five API gotchas written down). Largest identified item
