@@ -2200,6 +2200,16 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
             format_descriptors=[ttnn.CBFormatDescriptor(
                 buffer_index=16, data_format=out.dtype, page_size=acc["o"][1])]),
     ]
+    if os.environ.get("TT_KSG_FOOTPRINT") == "1":
+        # Handoff 45.39 / invariant 157: the hang is a capacity failure with a
+        # threshold in (4, 16] programs. L1 is 1572864 B a core, so print what
+        # one program reserves there and the arithmetic becomes checkable.
+        tot = (cap * acc["a"][1] + cap * acc["w"][1] + part_page
+               + groups * part_page + 2 * acc["o"][1])
+        print(f"RESULT ksgemv footprint: cap {cap} groups {groups} "
+              f"a_page {acc['a'][1]} w_page {acc['w'][1]} o_page {acc['o'][1]} "
+              f"-> {tot} B a core  ({1572864 // max(tot, 1)} fit in 1.5 MB L1)",
+              flush=True)
     return ttnn.ProgramDescriptor(kernels=[
         kern("ksgemv_reader.cpp",
              [nt, acc["a"][1], acc["w"][1], 1 if _KSG_NOMCAST else cores_pg]

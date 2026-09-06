@@ -7939,11 +7939,36 @@ allocated per program -- five CBs and `max(2, _KSG_SEM+1)` semaphores over the
 whole 110-core grid, every one of them replicated per program in the trace.
 
 INVARIANT 157: `ksgemv`'s trace hang is a **capacity** failure, not a logic one.
-One program runs, four run, sixteen do not. Whatever is exhausted scales with
-programs x (CBs + semaphores) x cores, so the fix is either fewer programs
-(share one descriptor across layers -- the weights differ, but the *shape* does
-not) or a smaller per-program footprint. Bisecting the kernel logic will not
+One program runs, four run, sixteen do not. Bisecting the kernel logic will not
 find it.
+
+**And the capacity is L1, with arithmetic that matches the measured threshold.**
+`TT_KSG_FOOTPRINT=1` prints what one program reserves per core:
+
+| site shape | `cap` | `groups` | bytes a core | fit in 1.5 MB L1 |
+|---|--:|--:|--:|--:|
+| router | 16 | 5 | **81920** | 19 |
+| `hc_down` | 8 | 10 | 51712 | 30 |
+
+Sixteen router programs is **1.31 MB of the 1572864 B L1 -- 83 %** -- leaving
+260 KB for every other op's circular buffers in the same capture. Four is
+328 KB and comfortable. The measured edge, runs at 4 and hangs at 16, sits
+exactly where that arithmetic puts it.
+
+Nearly all of it is two buffers: `cb0` and `cb1` are sized `cap x page`, i.e.
+the reader reserves the **whole k-chunk** of activation and weight up front --
+32 KB + 32 KB of the 80 KB at the router. They are streamed, not held, so
+double-buffering two tiles each instead of sixteen would take the program to
+about 30 KB and let ~50 fit. That is the fix, it is a reader change rather than
+a redesign, and it has a number attached: 48 router programs at 30 KB is 1.4 MB,
+still tight, so the same change is what makes the *whole* site usable rather
+than merely raising the ceiling a little.
+
+INVARIANT 158: a `generic_op`'s circular buffers are charged **per program in
+the capture**, not per execution. Programs run one at a time, so sizing a CB for
+the largest chunk it will ever stream looks free and is not: multiply it by every
+copy of that program in the trace. Size streaming CBs for the pipeline depth,
+not the payload.
 
 **And it still buys nothing where it runs.** Four sites gave 33.02 ms against a
 baseline of 31.4-32.7 -- no gain, if anything slightly worse. Four of 48 layers
