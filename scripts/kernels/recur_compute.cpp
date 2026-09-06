@@ -301,6 +301,15 @@ void kernel_main() {
     cb_push_back(cb_ktm, DKT);
     cb_wait_front(cb_ktm, DKT);
 
+    // STAGE 7 is a probe, not a stage of the computation: it writes the masked
+    // `kt` tiles out as the new state, so a `to_torch` of the state shows all 32
+    // columns of what the kernel actually reads. The state is [Dk, Dv] and fully
+    // real, so nothing is dropped the way `to_torch` drops a [Dk, 1]'s padding.
+    if constexpr (STAGE == 7) {
+        finish(cb_v, cb_ktm, cb_out, cb_snew, DKT);
+        return;
+    }
+
     matmul_init(cb_ktm, cb_delta);
     cb_reserve_back(cb_op, DKT);
     for (uint32_t i = 0; i < DKT; ++i) {

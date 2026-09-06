@@ -97,6 +97,31 @@ def _verify(state, q, k, v, g_exp, beta, got):
 
 
 _VERIFY_PRE: dict = {}
+_DUMPED = False
+
+
+def _dump_pads(fq, fk, fv, state):
+    """One-shot: what is actually in the pad regions the kernel contracts over?
+
+    Handoff 45.34. `kt` is `[BH, 1, Dk, 1]`, so a tile's real data is column 0
+    and columns 1..31 are padding; the state's outer product contracts all 32.
+    `to_torch` de-tilizes and drops the pad, so this reads the *padded* view by
+    asking for the tile's full width.
+    """
+    global _DUMPED
+    _DUMPED = True
+    kt = ttnn.transpose(fk, -2, -1)
+    for name, t in (("fk", fk), ("fv", fv), ("kt", kt)):
+        try:
+            a = ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(t.device(), dim=0))
+            print(f"RESULT dump {name}: shape {list(t.shape)} -> torch {list(a.shape)}  "
+                  f"absmax {float(a.abs().max()):.4e}  "
+                  f"finite {bool(a.isfinite().all())}", flush=True)
+        except Exception as exc:                                    # noqa: BLE001
+            print(f"RESULT dump {name}: {type(exc).__name__}: {exc}", flush=True)
+    a = ttnn.to_torch(state, mesh_composer=ttnn.ConcatMeshToTensor(state.device(), dim=0))
+    print(f"RESULT dump state: absmax {float(a.abs().max()):.4e}  "
+          f"finite {bool(a.isfinite().all())}", flush=True)
 
 
 def _recur_out(state, v):
@@ -183,6 +208,8 @@ def decode_step(
         fq, fk, fv, fg, fb = (
             t if t.dtype == state.dtype else ttnn.typecast(t, state.dtype)
             for t in (q, k, v, g_exp, beta))
+        if os.environ.get("TT_RECUR_DUMP") == "1" and not _DUMPED:
+            _dump_pads(fq, fk, fv, state)
         fused_all = ops.fused_recurrence(
             state, fq, fk, ttnn.transpose(fk, -2, -1), fv, fg, fb,
             # `fv`, so the output CB is the state's dtype. Allocating it from

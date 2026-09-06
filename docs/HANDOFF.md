@@ -7535,10 +7535,57 @@ is genuinely negligible against a state error that comes from somewhere else
 entirely -- in which case 62.0 is not the outer product's magnitude and the
 all-zeros arm proves nothing.
 
-**Next probe, and run it before any more theory:** `to_torch` the `cb_ktm`
-contents by writing them to a scratch output tensor for one call, and look at
-where the data is after the mask multiply. Every mechanism above predicts a
-different tile.
+### 45.35 `cb_ktm` is exactly right, and the state is still wrong
+
+Ran that probe. `STAGE 7` (a probe, not a stage) writes the masked `kt` tiles out
+as the new state, and the state is `[Dk, Dv]` and fully real, so a `to_torch` of
+it shows all 32 columns of what the kernel actually holds -- which a `to_torch`
+of `kt` itself cannot, because de-tilizing drops the padding. In the model, at
+seq 2047:
+
+    col 0    absmax  4.7266e-01      real data, present
+    cols 1-31 absmax 0.0000e+00      exactly zero
+    finite   True
+
+**`cb_ktm` is precisely what the outer product needs**: `kt`'s column 0 and
+nothing else. And with that operand the state error is still 6.200e+01 --
+identical to the all-zeros mask.
+
+So the padding account is finished. If the outer product's inputs are exact and
+its result still leaves the state indistinguishable from having no outer product
+at all, then **the outer product is not where the state goes wrong**, and 45.32's
+mechanism -- which explained the `inf` -- does not explain the 62. The one thing
+the mask demonstrably fixed is the infinity, and that much stands: an identity
+mask brings it straight back.
+
+Where that leaves it, as a list of established facts rather than a story:
+
+* the verifier is exact (op chain against itself: 0.000e+00 on both columns);
+* the fused **output** matches the op chain at 9.613e-04 in every configuration
+  tried, including every broken one;
+* the fused **state** is `inf` with an identity mask, 6.200e+01 with a column-0
+  mask, and 6.200e+01 with an all-zeros mask;
+* `cb_ktm` under the column-0 mask is exactly `kt`'s column 0, verified on
+  device;
+* `ttnn.transpose` materialises `kt` correctly, verified on device;
+* the operands reaching the kernel are finite and sane (`fk` 9.88e-01, `fv`
+  4.38e+00);
+* the failure tracks whether `_indexer_select` runs, and nothing else found so
+  far.
+
+**The next thing to look at is the other half of the write-back**, which no probe
+has touched: `cb_dec`. The state is `decayed + outer`, `decayed` comes from
+`mul_tiles_bcast_scalar(cb_s, cb_g, ...)`, and if *it* is wrong by ~62 then every
+observation above follows -- the outer product would be irrelevant to the error,
+masking it would change nothing, and the output would still be fine only if
+`q . decayed` happens to stay small. Dump `cb_dec` the same way (a STAGE that
+writes it as the state already exists: `STAGE < 2`), and compare it against
+`state * g_exp` computed on the host. That is one run.
+
+INVARIANT 152: when a fused kernel's output is right and its state is wrong,
+probe **every** term of the state expression before believing any one of them.
+This section spent four rounds on the outer product because it was the
+interesting term, and the arithmetic never required that it be the guilty one.
 
 **Next step**, and it is small: read one `kt` tile back with `to_torch` and see
 where the data sits. If it is in row 0, the fix is either `transpose_wh_tile` in
