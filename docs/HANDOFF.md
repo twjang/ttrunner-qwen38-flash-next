@@ -6744,6 +6744,44 @@ fabric, and no reduction-order quality gate. The audit's estimate for it (0.45 m
 verified down from 1.0) priced the *launch* saving; it did not know the
 recurrence's total was 2.95.
 
+#### The design, worked out against the invariants
+
+Two things make a single fused kernel legal, and neither is obvious:
+
+**One core per (head, output-tile), and every core is independent.** Take core
+`(h, j)`, owning output column-tile `j` of head `h`. It reads `state[h, 0..3, j]`
+(4 tiles), `q[h, ·]` and `k[h, ·]` (4 each), `v[h, j]`, and the two scalars. Then
+
+    decayed[i]   = state[h,i,j] * g_exp[h]
+    predicted    = sum_i  k[h,i] @ decayed[i]        <- reduction over i, local
+    q_decayed    = sum_i  q[h,i] @ decayed[i]        <- local
+    qk           = sum_i  reduce(q[h,i] * k[h,i])    <- shared across j, but 4
+                                                        tiles, so recompute it
+    delta        = (v[h,j] - predicted) * beta[h]
+    out[h,j]     = q_decayed + qk * delta
+    state[h,i,j] = decayed[i] + k[h,i] (x) delta
+
+Every term is computable from what that core already holds. **No cross-core
+communication, no semaphores** -- which also sidesteps 45.10's idle-core defect
+entirely. 12 heads x 4 tiles = 48 cores, against the 12 the per-head kernels use
+today.
+
+**The outer product must be a `matmul_tiles`, not a broadcast.** `kᵀ (x) delta`
+is a column times a row, which wants `bcast_cols` *and* `bcast_rows` -- and
+invariant 108 says two broadcast types in one compute kernel hang, whatever the
+init. Written as `matmul_tiles` of `[32,1] @ [1,32]` it is the same product with
+no broadcast at all, leaving **scalar** as the only broadcast type in the kernel
+(`g_exp`, `beta`, `qk`). Section 12's note that this matmul is "the worst shape a
+matmul has, 21.05 us" was about a standalone launch on DRAM operands; here both
+tiles are already in L1 and it is one FPU op.
+
+Invariant 87 still applies: the matmuls and the SFPU work take separate
+`tile_regs_acquire` windows.
+
+The gate already exists -- `decode_step_check.py` compares against float64 on the
+bfloat16-rounded operands and checks **both** the output and the updated state,
+which is the half a fused version is most likely to get wrong.
+
 INVARIANT 137: DeltaNet's cost is the recurrence, not its projections. 2.95 of
 9.47, at eight times its byte time, in six launches over a state that fits in L1.
 
