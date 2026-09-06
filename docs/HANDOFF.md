@@ -7718,11 +7718,41 @@ still disagree. What differs between devices in this program is not the maths:
 it is the buffer addresses, the L1 contents left by whatever ran before, and
 anything the kernel reads that was not built with `ReplicateTensorToMesh`.
 
-**Next, in order:** dump the same state slice from each device separately and
-find *which* elements disagree -- if it is a whole head, a whole tile-row, or
-scattered, each points somewhere different. Then check every operand the program
-touches for replication, including `_recur_col_mask`'s tile and `_recur_out`'s
-cached output, both of which are built here rather than coming from the model.
+**The baked address is not it.** `_recur_program` puts a single
+`buffer_address()` into the runtime args, so if a replicated tensor's per-device
+buffers sat at different addresses, three devices would read and write the wrong
+memory and the damage would differ per device -- the exact signature. Audited all
+six operands in the model's own allocation order:
+
+    state 0xb99ca280 x4    fk 0xb99f4a80 x4    fv  0xb99faa80 x4
+    kt    0xb9a00a80 x4    out 0xb9a06a80 x4   mask 0xb99a1b80 x4
+
+All four devices agree on every one. Hypothesis dead.
+
+**So every input is bit-identical across devices and the program is identical,
+and the output still diverges.** The only thing left that can differ per device
+is L1 the kernel *reads without having written* -- leftovers from whatever ran on
+that core before, which are per-device by nature.
+
+The specific suspect that fits every measurement: `tile_regs_acquire()` does not
+zero the destination registers, and the outer-product loop packs `dst0`
+immediately after a single `matmul_tiles(cb_ktm, cb_delta, i, 0, 0)`. If
+`matmul_tiles` *accumulates* into `dst` -- which is exactly why the `predicted`
+loop can issue four of them in one acquire window and get a sum -- then each
+outer product lands on top of whatever that core's `dst0` held, and that is
+per-device, deterministic, larger than the computation, and completely
+unaffected by masking `kt`. Every one of those is something 45.32 through 45.38
+measured.
+
+**The test is small:** force `dst0` to a known zero before the matmul (copy a
+zero tile into it, or restructure the loop to accumulate deliberately the way the
+`predicted` loop does) and re-run `TT_RECUR_VERIFY=1` at seq 2047. If the state
+column drops to ~1e-03, that is the bug and it has been there since 45.24.
+
+INVARIANT 155: `matmul_tiles` accumulates into `dst`. A loop that acquires,
+issues one `matmul_tiles`, and packs is only correct if `dst` starts at zero, and
+`tile_regs_acquire` is not documented here to guarantee that. Seed it, or
+structure the loop so the accumulation is the one you want.
 
 **`cb_dec` cannot be probed with STAGE 5, and does not need to be.** STAGE 5
 writes `decayed` out *as* the state, so the state becomes `state * g_exp` every

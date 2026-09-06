@@ -181,6 +181,22 @@ def _dump_pads(fq, fk, fv, state):
     a = ttnn.to_torch(state, mesh_composer=ttnn.ConcatMeshToTensor(state.device(), dim=0))
     print(f"RESULT dump state: absmax {float(a.abs().max()):.4e}  "
           f"finite {bool(a.isfinite().all())}", flush=True)
+    # `_recur_program` bakes ONE `buffer_address()` into the runtime args. If a
+    # tensor's per-device buffers sit at different addresses, three of the four
+    # devices read and write the wrong memory -- and the damage differs per
+    # device, which is exactly what 45.38 measured. Freshly allocated replicated
+    # tensors agree; the question is whether the model's allocation order keeps
+    # that true.
+    out = _recur_out(state, fv)
+    mask = ops._recur_col_mask(state)
+    for name, t in (("state", state), ("fk", fk), ("fv", fv), ("kt", kt),
+                    ("out", out), ("mask", mask)):
+        try:
+            addrs = [hex(d.buffer_address()) for d in ttnn.get_device_tensors(t)]
+            tag = "ALL-EQUAL" if len(set(addrs)) == 1 else "*** DIFFER ***"
+            print(f"RESULT addr {name:6s} {addrs} {tag}", flush=True)
+        except Exception as exc:                                    # noqa: BLE001
+            print(f"RESULT addr {name}: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _recur_out(state, v):
