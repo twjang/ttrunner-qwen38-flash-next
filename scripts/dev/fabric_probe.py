@@ -32,7 +32,7 @@ REPS = 200
 WORKER = ttnn.CoreCoord(0, 0)
 
 
-def build(mesh, role_by_chip, src, dst):
+def build(mesh, role_by_chip, src, dst, hops=1):
     """A MeshProgramDescriptor: one ProgramDescriptor per chip."""
     # This build's MeshDevice has no `get_devices`; ops.py carries the same
     # hasattr fallback, so the mesh itself answers the coordinate query.
@@ -55,6 +55,12 @@ def build(mesh, role_by_chip, src, dst):
             # setup_fabric_connection MUTATES pd (appends its semaphores) and
             # returns the argument block the kernel's build_from_args consumes.
             fargs = ttnn.setup_fabric_connection(
+                # **The connection is always to the adjacent EDM**; distance is
+                # carried by the packet's `num_hops`, not by the node pair.
+                # Passing `chip + hops` as the destination works for 1 and 2 and
+                # then dies at 3 with
+                # `TT_FATAL fabric.cpp:161 forwarding_direction.has_value()` --
+                # there is no direct route object for a non-neighbour.
                 fab.FabricNodeId(mesh_id, chip), fab.FabricNodeId(mesh_id, chip + 1),
                 0, pd, WORKER, ttnn.CoreType.WORKER)
             rt = [src.buffer_address(), phys.x, phys.y, dst.buffer_address(),
@@ -65,7 +71,7 @@ def build(mesh, role_by_chip, src, dst):
             kernel_source=str(KDIR / "fabprobe.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=crs,
-            compile_time_args=[role, PAYLOAD, 0],
+            compile_time_args=[role, PAYLOAD, 0, hops],
             defines=list(defines.items()),
             runtime_args=[(WORKER, rt)],
             config=ttnn.WriterConfigDescriptor())
@@ -112,6 +118,24 @@ def main() -> None:
         # same process: both then carry the same dispatch and it cancels.
         idle = time_it(mesh, io, build(mesh, [0, 0, 0, 0], src, dst), "launch only (control)")
         hop = time_it(mesh, io, build(mesh, [1, 2, 0, 0], src, dst), f"one hop, {PAYLOAD} B")
+        # Does distance cost anything? A chain reduce pays 3 hops; a tree pays 2
+        # rounds of 1. If cost is flat in `hops` the chain is fine and much
+        # simpler. Roles place the receiver at the far end of the line.
+        two = time_it(mesh, io, build(mesh, [1, 0, 2, 0], src, dst, hops=2),
+                      f"two hops, {PAYLOAD} B")
+        three = time_it(mesh, io, build(mesh, [1, 0, 0, 2], src, dst, hops=3),
+                        f"three hops, {PAYLOAD} B")
+        # The verdict has to be read against the *noise*, not against `hop - idle`:
+        # that difference is negative here (the hop is unmeasurable), so a test
+        # scaled by it is meaningless -- the first version of this line printed
+        # "linear -- prefer a tree" off three monotonically *falling* readings.
+        span = max(idle, hop, two, three) - min(idle, hop, two, three)
+        print(f"RESULT hop slope: 1->2 {two - hop:+.1f} us, 2->3 {three - two:+.1f} us; "
+              f"spread across all four arms {span:.1f} us on an {idle:.0f} us launch",
+              flush=True)
+        print("RESULT distance is free within noise -- a 4-chip reduce can be a "
+              "chain, no tree needed" if abs(three - hop) < span else
+              "RESULT distance costs; prefer a tree", flush=True)
 
         row = ttnn.from_torch(torch.randn(1, 1, 32, 2560), dtype=ttnn.bfloat16,
                               layout=ttnn.TILE_LAYOUT, device=mesh,

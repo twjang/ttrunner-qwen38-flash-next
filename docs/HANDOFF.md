@@ -8056,6 +8056,36 @@ What is left, with what each is actually worth:
    (45.14) and the one mechanism found does not explain it (45.16). It caps all
    future generic_op work. `TT_METAL_WATCHER` aborts here, so it can only be
    bisected -- and the base rate is ~12 %, so every verdict needs four runs.
+### 45.40 Fabric distance is free; the reduce can be a chain
+
+Extended `fabric_probe.py` from one hop to a sweep, which is the cheap half of
+46.1 item 3 and settles the shape of the build before any of it is written.
+
+    launch only (control)   87.84 us
+    one hop,   5120 B       83.57 us
+    two hops,  5120 B       80.65 us
+    three hops, 5120 B      75.29 us
+
+All four are within a 12.6 us spread on an 88 us launch, and the readings *fall*
+with distance, so there is no hop cost to measure at this payload -- the launch
+dominates completely. **A 4-chip line reduce can therefore be a chain rather
+than a tree**, which is much the simpler build: each chip forwards to its
+neighbour and distance costs nothing.
+
+INVARIANT 159 (a sixth fabric gotcha, to go with 45.21's five):
+`setup_fabric_connection` opens a connection to the **adjacent** node, and the
+distance a packet travels is the send's `num_hops`. Passing
+`FabricNodeId(chip + n)` as the destination appears to work for n = 1 and 2 and
+then dies at n = 3 with `TT_FATAL fabric.cpp:161 forwarding_direction.has_value()`
+-- there is no route object for a non-neighbour. Connect to `chip + 1` always.
+
+**Read the ratio carefully.** The probe reports one packet at 83.6 us against
+`ttnn.all_reduce`'s 236.3 us, 2.83x -- but both arms are launch-dominated in
+this harness, where the model's wide reduce costs ~26 us (45.19). Invariant 89
+applies to both sides. The ratio is evidence the mechanism is sound; it is not a
+prediction of what the build saves, and 45.19's ~1.5 ms recoverable is still the
+number to beat.
+
 3. **The fabric all-reduce -- now the top item, and the only one with an
    unspent mechanism.** 45.31 measures the collectives at **3.86 ms** in the
    current step, which corroborates the 2.2 ms priced for the wide reduces

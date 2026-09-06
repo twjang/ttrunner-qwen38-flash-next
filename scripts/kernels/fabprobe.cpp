@@ -11,7 +11,10 @@
 // Time the op against an otherwise identical launch with ROLE_IDLE everywhere,
 // and the difference is one hop plus the fabric open/close.
 //
-// Compile-time args: 0 ROLE (0 idle, 1 send, 2 recv), 1 PAYLOAD, 2 SEM_ID
+// Compile-time args: 0 ROLE (0 idle, 1 send, 2 recv), 1 PAYLOAD, 2 SEM_ID,
+//                    3 HOPS -- how far along the line the packet travels.
+// Sweeping HOPS says whether a line reduce should be a chain (linear cost)
+// or a tree (fixed cost dominates). Handoff 46.1 item 3.
 // Runtime args, sender:   0 src_l1, 1 dst_noc_x, 2 dst_noc_y, 3 dst_l1,
 //                         4 sem_noc_x, 5 sem_noc_y, 6.. fabric connection args
 // Runtime args, receiver: 0 expected
@@ -30,6 +33,7 @@ void kernel_main() {
     constexpr uint32_t ROLE = get_compile_time_arg_val(0);
     constexpr uint32_t PAYLOAD = get_compile_time_arg_val(1);
     constexpr uint32_t SEM_ID = get_compile_time_arg_val(2);
+    constexpr uint32_t HOPS = get_compile_time_arg_val(3);
 
     if constexpr (ROLE == 0) {
         return;                                   // idle chips: the control arm
@@ -65,7 +69,7 @@ void kernel_main() {
         fabric_unicast_noc_fused_unicast_with_atomic_inc(
             &sender, hdr, src_l1, PAYLOAD,
             tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem, 1, true},
-            /*num_hops=*/1);
+            /*num_hops=*/HOPS);
         noc_async_writes_flushed();
         sender.close();
     }
