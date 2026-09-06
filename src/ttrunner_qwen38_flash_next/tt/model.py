@@ -109,6 +109,26 @@ class LayerState:
     ple_step: int = 0
 
 
+# TT_IDX_FULL=1 restores the old behaviour -- topk over every block, eligible or
+# not -- so the change can be A/B'd in one binary.
+_IDX_FULL = os.environ.get("TT_IDX_FULL") == "1"
+
+
+def _eligible_blocks(pos: int, ratio: int, k: int, nb: int) -> int:
+    """How many leading blocks can the selection possibly pick from?
+
+    A block j is eligible once all `ratio` of its tokens are visible, so at
+    position `pos` there are `pos // ratio + 1` candidates. Rounded up to a power
+    of two (and never below `k`, which `topk` requires, nor above `nb`) so that a
+    captured trace sees a small fixed set of shapes.
+    """
+    need = min(nb, max(k, pos // ratio + 1))
+    size = k
+    while size < need:
+        size *= 2
+    return min(size, nb)
+
+
 class TTState:
     """Decoding state for a batch of `batch` sequences advancing in lockstep.
 
@@ -1145,6 +1165,28 @@ class TTModel:
         scores = ttnn.add(scores, self._input("idx_bias", self._block_bias(positions), ttnn.float32, key=tuple(positions)))
 
         # -- select, expand to tokens, and build the mask -------------------
+        # `ttnn.topk` here costs O(nb x k): measured 637 us at nb=512, 1890 at
+        # 1024, 4388 at 2048 and 9397 at 4096, all at k=512, and linear in k as
+        # well (337 us at k=32). Twelve layers a token, so at nb=2048 it is
+        # 52.6 ms of the 73.5 ms the whole selection costs -- and at the model's
+        # full 262144 context nb is 65536, which is where the ~1.9 s step comes
+        # from. (`sorted=False` buys nothing: 638 us against 637. The sort is
+        # not the cost.)
+        #
+        # But only `p // ratio` blocks are ever eligible; the rest carry a -inf
+        # bias and can never be selected. Searching them is pure waste. Slicing
+        # the score row to the eligible prefix -- rounded up to a power of two so
+        # the captured graph takes a handful of shapes rather than one per step
+        # -- makes the search proportional to the context in use instead of the
+        # context allocated.
+        #
+        # Correct by construction: the selection only runs at `p >= budget`, so
+        # eligible = p//ratio >= budget//ratio = k, and the k winners always lie
+        # inside the prefix. The block ids topk returns are positions in the same
+        # numbering, so nothing downstream changes.
+        nb_eff = nb if _IDX_FULL else _eligible_blocks(max(positions), ratio, k, nb)
+        if nb_eff < nb:
+            scores = ttnn.slice(scores, (0, 0, 0, 0), (batch, 1, 1, nb_eff))
         blocks = ttnn.topk(scores, k, dim=-1)[1]                  # uint16 [B,1,1,k]
         if self._block_offsets is None:
             self._block_offsets = self.to_dev(

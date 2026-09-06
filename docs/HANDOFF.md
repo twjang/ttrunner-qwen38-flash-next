@@ -8002,6 +8002,59 @@ is only 8 % of the router's calls, so this cannot refute 45.29's 22.5 ms on its
 own; but it is one more reading that does not support the k-split, taken this
 time with a stable capture instead of a single run.
 
+### 45.44 SHIPPED: the indexer's topk searches blocks that cannot be selected
+
+The QSA selection costs **73.5 ms a token** (45.26), 69 % of the long-context
+step, and nothing in this document had touched it. Priced its ops at the model's
+seq-8192 shapes:
+
+| op | one call | x12 layers |
+|---|--:|--:|
+| **`ttnn.topk` k=512 of nb=2048** | **4384.8 us** | **52.62 ms** |
+| `subtract`+`multiply` on the 8192 row | 441.3 | 5.30 |
+| `scatter` into [1,1,1,8192] | 418.2 | 5.02 |
+| `multiply` base x 0 | 225.2 | 2.70 |
+| `repeat` to 24 heads | 125.2 | 1.50 |
+| `matmul` blocks@qt | 37.5 | 0.45 |
+
+**`topk` is 78 % of it**, and it is O(nb x k) -- linear in both, measured:
+
+    nb  512 -> 637 us   1024 -> 1890   2048 -> 4388   4096 -> 9397   (k=512)
+    k    32 -> 337 us    128 -> 1250    256 -> 2365    512 -> 4388   (nb=2048)
+
+`sorted=False` buys **nothing** (638 us against 637), so the sort is not the
+cost; it is the search.
+
+**And most of that search cannot return anything.** A block is eligible only
+once all `ratio` of its tokens are visible, so at position p there are
+`p // ratio + 1` candidates and every other block carries a -inf bias. The call
+none the less ran over `max_seq_len // ratio` every step. Slicing the score row
+to the eligible prefix, rounded up to a power of two so a captured trace sees a
+handful of shapes rather than one per step:
+
+    seq 8192, selection on:  105.5 ms -> 61.5 ms   (-44.0, -42 %)
+
+Correct by construction, and gated as such. The selection only runs at
+`p >= indexer_budget`, so eligible `= p//ratio >= budget//ratio = k` and the k
+winners always lie inside the prefix; `_eligible_blocks` never returns less than
+the candidate count. Measured A/B in one binary (`TT_IDX_FULL=1` restores the old
+behaviour), seq 2049, selection on, 64 stepped tokens:
+
+| | top-1 | top-5 | NLL |
+|---|--:|--:|--:|
+| full-range topk (old) | 50/63 = 79.4 % | 61/63 = 96.8 % | 0.794 |
+| eligible prefix (new) | 50/63 = 79.4 % | 61/63 = 96.8 % | 0.794 |
+
+Identical to every digit, `traced_vs_eager` MATCHes token for token, 235 tests
+pass. **On by default.**
+
+INVARIANT 163: `ttnn.topk` is O(nb x k) here -- 4.4 ms for k=512 of 2048, and
+9.4 ms of 4096. Before reaching for it, ask how many candidates can actually
+win: this call was searching 2048 blocks for 512 winners that could only ever
+come from the first `p//4`. The same arithmetic says the cost at the model's
+full 262144 context, where `nb` is 65536, is ~140 ms a layer -- which is what
+made a 262144 step measure 1961 ms against 8192's 105.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
