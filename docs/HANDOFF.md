@@ -7905,6 +7905,26 @@ biggest remaining lever, and it is a prerequisite for ever settling 45.29's
 contradiction. Do not re-close the k-split on 45.14's numbers -- they were taken
 when the site still ran.
 
+**And it is not the idle-core bug.** Worked the router's plan out by hand. Its
+weight is `[2560, 512]`, so `kt = 80` and `nt = 16`; `nt <= grid.x` is false
+(16 > 11), so `_ksgemv_plan` takes the row branch:
+
+    rows_pg = ceil(16/11) = 2      cores_pg = 2 x 11 = 22
+    groups  = min(80, 10//2) = 5   ->  5 x 22 = 110 cores
+
+and `where(g, j) = (j % 11, g*2 + j // 11)` walks every one of the 110 cores
+exactly once. So coverage is complete, every core gets `in_group = 1`, and the
+mechanism 45.10 documented -- a core outside every group taking the non-head
+path and poking group 0's head semaphore -- **cannot fire here**. The comment in
+`_ksgemv_program` even names this plan as one of the ones that runs.
+
+So the current hang is a *different* defect from the one that section closed,
+and the guard that fixed 45.10 does not cover it. That is where the next
+session should start: not by re-deriving the plan, which is correct, but by
+bisecting what 48 identical `ksgemv` programs in one capture do that one does
+not -- 45.14 already observed the instability scaling with program count, and
+that observation is the last live thread on it.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
