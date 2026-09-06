@@ -6682,6 +6682,18 @@ component stubbed -- the residual adds, `reinject`, and the ~97 slices the stubs
 themselves introduce -- which 5.4 suspected in passing and nobody measured. It is
 an artifact of the *method*, and subtracting it from anything was wrong.
 
+Where the 6.11 actually went, from reading `_layer` rather than subtracting: it
+has no scaffolding of its own -- a PLE add, two `gated_residual_mix`, the branch,
+two `reinject`, `_moe_block` -- every piece is a named component. So the residue
+is (a) the 48 MoE `all_reduce` calls and adds, which live in `_moe_block`
+*outside* `moe.moe_block` and were therefore never attributed to any component
+(real work, and already inside 45.19's 2.2 ms), (b) the ~97 slices the stubs
+themselves introduce, which exist in no real run, and (c) the 0.47.
+
+No further arithmetic on those deltas: cumulative-ablation numbers are marginal
+costs in a fixed order, not additive components, and invariant 100 is exactly
+about subtracting them.
+
 INVARIANT 136: a cumulative ablation's residue is not a component. Stubbing
 every named piece leaves the scaffolding that called them, and here that
 scaffolding was mistaken for a 6 ms fixed cost. If a decomposition has an
