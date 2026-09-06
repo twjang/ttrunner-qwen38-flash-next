@@ -42,6 +42,32 @@ void kernel_main() {
 
     if constexpr (ROLE == 0) {
         return;
+    } else if constexpr (ROLE == 3) {
+        // Forwarder: the compute kernel has put `mine + theirs` in `cb_out`;
+        // ship that onward instead of this chip's raw partial. Same L1-to-L1
+        // addressing as the sender (invariant 161).
+        constexpr uint32_t NT_ = get_compile_time_arg_val(3);
+        constexpr uint32_t cb_out_ = 16, cb_theirs_ = 1;
+        cb_wait_front(cb_out_, NT_);
+        const uint32_t dst_x = get_arg_val<uint32_t>(1);
+        const uint32_t dst_y = get_arg_val<uint32_t>(2);
+        const uint32_t sem_x = get_arg_val<uint32_t>(4);
+        const uint32_t sem_y = get_arg_val<uint32_t>(5);
+        size_t arg_idx = 6;
+        auto sender =
+            tt::tt_fabric::WorkerToFabricEdmSender::build_from_args<ProgrammableCoreType::TENSIX>(arg_idx);
+        volatile PACKET_HEADER_TYPE* hdr = PacketHeaderPool::allocate_header();
+        const uint64_t dst = get_noc_addr(dst_x, dst_y, get_write_ptr(cb_theirs_));
+        const uint64_t sem = get_noc_addr(sem_x, sem_y, (uint32_t)get_semaphore(SEM_ID));
+        sender.open();
+        fabric_unicast_noc_fused_unicast_with_atomic_inc(
+            &sender, hdr, get_read_ptr(cb_out_), BYTES,
+            tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem, 1, true},
+            /*num_hops=*/HOPS);
+        noc_async_writes_flushed();
+        sender.close();
+        cb_pop_front(cb_out_, NT_);
+        return;
     } else if constexpr (ROLE == 2) {
         // Accumulator: drain the summed tiles the compute kernel produced.
         constexpr uint32_t NT = get_compile_time_arg_val(3);

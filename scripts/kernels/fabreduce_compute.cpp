@@ -24,8 +24,8 @@ void kernel_main() {
     constexpr uint32_t cb_mine = 0, cb_theirs = 1, cb_out = 16;
 
     compute_kernel_hw_startup(cb_mine, cb_theirs, cb_out);
-    if constexpr (ROLE != 2) {
-        return;
+    if constexpr (ROLE != 2 && ROLE != 3) {
+        return;   // idle and the pure sender have nothing to add
     }
     init_sfpu(cb_mine, cb_out);
     for (uint32_t i = 0; i < NT; ++i) {

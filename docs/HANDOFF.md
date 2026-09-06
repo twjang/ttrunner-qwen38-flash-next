@@ -8130,6 +8130,35 @@ a peer's circular buffer by its own pointer to it. That removes the only thing
 that looked like it needed a cross-device address exchange, and it is what makes
 a multi-chip `generic_op` collective practical at all.
 
+### 45.43 The 1x4 mesh is a **ring**, and the four-chip chain deadlocks
+
+Extending the chain to four chips failed immediately with
+
+    TT_FATAL: Could not find any forwarding direction from (M0, D1) to (M0, D2)
+
+so I probed all twelve ordered pairs with `setup_fabric_connection`:
+
+    D0 -> [1, 2]    D1 -> [0, 3]    D2 -> [0, 3]    D3 -> [1, 2]
+
+INVARIANT 162: the four devices are wired as a **ring**, not a line. The links
+are 0-1, 0-2, 1-3, 2-3 -- the cycle **0-1-3-2-0** -- and **D1-D2 and D0-D3 do
+not exist**. `ttnn.MeshShape(1, 4)` and `Topology::Linear` both read as a line
+and neither describes the wiring. Any multi-chip `generic_op` has to walk the
+ring; the natural `chip -> chip + 1` is wrong on two of its four steps.
+
+With the chain rewired to `0 -> 1 -> 3 -> 2` the program builds and then
+**deadlocks** (400 s timeout, no output). The two-chip arm is kept in the same
+script as a regression and still passes at 2.9982e-02, so the mechanism itself
+is intact; what fails is something in the three-hop pipeline.
+
+Where to look, given the two-chip case works: a forwarder (`ROLE 3`) both
+receives and sends, and its writer does `cb_wait_front(cb_out, NT)` while its
+reader is blocked on the semaphore -- so any chip whose upstream never signals
+holds a CB the downstream is waiting on. All four chips share **semaphore id 0**
+and each waits for exactly one increment; that is fine on a line but wants
+checking on a ring, where D0's *other* neighbour is D2, the last chip in the
+chain. A stray or mis-routed increment would land on a chip already waiting.
+
 **What remains for item 3**, in order:
 
 1. **Extend 2 chips to 4.** The chain is chip d forwarding to d+1 with the same

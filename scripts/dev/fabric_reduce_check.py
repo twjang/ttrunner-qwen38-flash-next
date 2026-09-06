@@ -29,6 +29,19 @@ NT = 8                                   # tiles; 8 x 32 x 32 bf16 = 16 KB
 WIDTH = NT * 32
 
 
+# The 1x4 mesh is a **ring**, not a line. Probed by trying
+# `setup_fabric_connection` on all twelve ordered pairs:
+#
+#     D0 -> [1, 2]    D1 -> [0, 3]    D2 -> [0, 3]    D3 -> [1, 2]
+#
+# so the links are 0-1, 0-2, 1-3, 2-3 -- the cycle 0-1-3-2-0 -- and **D1 -> D2
+# does not exist**, which is what killed the first four-chip attempt with
+# `Could not find any forwarding direction from (M0, D1) to (M0, D2)`.
+# The chain therefore has to walk the ring, not the index order.
+RING = [0, 1, 3, 2]
+NEXT = {RING[i]: RING[i + 1] for i in range(len(RING) - 1)}
+
+
 def build(mesh, roles, src, scratch, out):
     d0 = mesh.get_devices()[0] if hasattr(mesh, "get_devices") else mesh
     phys = d0.worker_core_from_logical_core(WORKER)
@@ -54,16 +67,19 @@ def build(mesh, roles, src, scratch, out):
                                       buffer_index=i, data_format=src.dtype,
                                       page_size=page)])
                 for i in (0, 1, 16)])
-        w_rt, r_rt = [0], [0, 0, 0]
-        if role == 1:
-            r_rt = [src.buffer_address(), 0]
+        w_rt, r_rt = [0], [0, 0]
+        if role in (1, 3):
+            # 1 sends its own partial; 3 receives, adds, and forwards the running
+            # sum. Both need the fabric connection, and 3 also needs the
+            # semaphore count its reader waits on.
+            r_rt = [src.buffer_address(), 1 if role == 3 else 0]
             # Mutates pd; returns the block build_from_args consumes. Connect to
             # the ADJACENT node -- distance is num_hops (invariant 159).
             fargs = ttnn.setup_fabric_connection(
-                fab.FabricNodeId(mesh_id, chip), fab.FabricNodeId(mesh_id, chip + 1),
+                fab.FabricNodeId(mesh_id, chip), fab.FabricNodeId(mesh_id, NEXT[chip]),
                 0, pd, WORKER, ttnn.CoreType.WORKER)
-            # src/dst L1 addresses are taken inside the kernel now; these
-              # slots stay for the NOC coordinates and the fabric block.
+            # src/dst L1 addresses are taken inside the kernel (invariant 161);
+            # these slots carry the NOC coordinates and the fabric block.
             w_rt = [0, phys.x, phys.y, 0, phys.x, phys.y] + list(fargs)
         elif role == 2:
             w_rt = [out.buffer_address()]
@@ -106,17 +122,33 @@ def main() -> None:
                               device=mesh, mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0))
         print(f"RESULT shapes src {list(src.shape)} page-tiles {NT}", flush=True)
 
-        ttnn.generic_op([src, scratch, out], build(mesh, [1, 2, 0, 0], src, scratch, out))
-        ttnn.synchronize_device(mesh)
+        def check(roles, sink, want, label):
+            ttnn.generic_op([src, scratch, out],
+                            build(mesh, roles, src, scratch, out))
+            ttnn.synchronize_device(mesh)
+            got = ttnn.to_torch(out, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
+            have = got[sink].to(torch.float32)
+            err = float((have - want).abs().max())
+            print(f"RESULT {label}: err {err:.4e}  |want| "
+                  f"{float(want.abs().max()):.4e} |have| "
+                  f"{float(have.abs().max()):.4e}  "
+                  + ("CORRECT" if err < 8e-2 else "WRONG"), flush=True)
 
-        got = ttnn.to_torch(out, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
-        want = (parts[0] + parts[1]).to(torch.float32)
-        have = got[1].to(torch.float32)
-        err = float((have - want).abs().max())
-        print(f"RESULT chip1 out vs (p0+p1): max abs err {err:.4e}", flush=True)
-        print(f"RESULT |want| {float(want.abs().max()):.4e}  "
-              f"|have| {float(have.abs().max()):.4e}", flush=True)
-        print("RESULT " + ("CORRECT" if err < 5e-2 else "WRONG"), flush=True)
+        # Kept as a regression: if the chain extension breaks, this must not
+        # quietly keep passing as though the mechanism still worked.
+        check([1, 2, 0, 0], 1, (parts[0] + parts[1]).to(torch.float32),
+              "two chips,  chip1 = p0+p1")
+        # The forward half of the 4-chip chain: 0 -> 1 -> 2 -> 3, each middle
+        # chip adding its own partial and passing the running sum on.
+        # Roles are indexed by chip, and the chain walks RING = 0 -> 1 -> 3 -> 2,
+        # so chip 2 is the one that ends up holding the total.
+        roles = [0, 0, 0, 0]
+        roles[RING[0]] = 1                      # send
+        roles[RING[1]] = 3                      # receive, add, forward
+        roles[RING[2]] = 3
+        roles[RING[3]] = 2                      # receive, add, write out
+        check(roles, RING[3], parts.sum(0).to(torch.float32),
+              f"four chips via ring {RING}, chip{RING[3]} = sum(p0..p3)")
     finally:
         ttnn.close_mesh_device(mesh)
 

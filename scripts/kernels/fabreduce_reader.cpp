@@ -14,6 +14,10 @@
 // runs the same program with the same CB list, so the allocator gives that CB
 // the same L1 address everywhere, and no address has to cross from Python.
 //
+// Roles: 0 idle, 1 send, 2 last (accumulate and write out),
+//        3 forward (accumulate, then send the running sum onward).
+// 2 and 3 receive identically; they differ only in what the writer does.
+//
 // Compile-time args: 0 ROLE, 1 NTILES, 2 SEM_ID, 3.. TensorAccessorArgs for src
 // Runtime args: 0 src_addr, 1 expected
 
@@ -33,7 +37,7 @@ void kernel_main() {
     constexpr auto s_ta = TensorAccessorArgs<3>();
     const auto s_acc = TensorAccessor(s_ta, src_addr);
 
-    if constexpr (ROLE == 2) {
+    if constexpr (ROLE == 2 || ROLE == 3) {
         const uint32_t expected = get_arg_val<uint32_t>(1);
         volatile tt_l1_ptr uint32_t* sem =
             reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(SEM_ID));
