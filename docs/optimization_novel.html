@@ -376,13 +376,13 @@ h3[id]{scroll-margin-top:2rem}
 <header class="masthead">
 <p class="eyebrow">Tenstorrent Blackhole · 모델 이식과 최적화</p>
 <h1>네 장의 블랙홀</h1>
-<p class="dek">Qwen3.8-Flash-Next를 128 GB 메모리에 배치하고, 단일 사용자 디코딩을 토큰당 32.08 ms까지 줄였다. 그 설계를 이해하는 데 필요한 하드웨어 원리와 정확성의 함정, 효과가 있었던 최적화를 정리했다.</p>
-<p class="byline"><span>Qwen3.8-Flash-Next · UD-IQ4_XS</span><span>4 × p150a · 128 GB</span><span>2026-09-05 · HANDOFF 42.2까지</span></p>
+<p class="dek">Qwen3.8-Flash-Next를 128 GB 메모리에 배치하고, QSA 선택을 생략하는 구간의 단일 사용자 디코딩을 토큰당 약 32 ms까지 줄였다. 그 설계를 이해하는 데 필요한 하드웨어 원리와 정확성의 함정, 효과가 있었던 최적화를 정리했다.</p>
+<p class="byline"><span>Qwen3.8-Flash-Next · UD-IQ4_XS</span><span>4 × p150a · 128 GB</span><span>2026-09-06 · HANDOFF 46까지</span></p>
 </header>
 <div class="stats" aria-label="주요 결과">
-<div class="stat"><b>32.08 ms</b><span>단일 사용자 토큰당 지연 · 최신 A/B 측정</span></div>
-<div class="stat"><b>31.2 tok/s</b><span>단일 사용자 생성 속도</span></div>
-<div class="stat"><b>32.6 ms</b><span>비교 목표 · RTX 5090</span></div>
+<div class="stat"><b>32.3 ms</b><span>배치 1 · QSA 선택 꺼짐 · 캐시 길이 8192</span></div>
+<div class="stat"><b>61.5 ms</b><span>배치 1 · QSA 선택 켜짐 · 후보 범위 최적화 적용</span></div>
+<div class="stat"><b>−0.45 ms</b><span>all-reduce 경로 변경 · 짝지은 A/B 평균</span></div>
 </div>
 <nav class="toc" aria-label="차례"><h2>차례</h2><ol><li><a href="#c-00"><span class="n">01</span><span>모델과 메모리부터 이해하기</span></a></li>
 <li><a href="#c-arch"><span class="n">02</span><span>아키텍처: 기억하고, 찾아보고, 나누어 계산하기</span></a></li>
@@ -502,6 +502,9 @@ S = S̄ + kᵀ @ 보정량
 <p>안정적인 구현은 대각 블록의 역행렬을 구하고, 블록 크기를 단계적으로 키운다. 이미 처리한 대각 블록을 D, 새로 포함한 좌하단 블록을 C라 하면 다음 식을 이용한다.</p>
 <pre><code>(D + C)⁻¹ = D⁻¹ - D⁻¹ C D⁻¹</code></pre>
 <p>이 블록 구조에서는 <code>(D⁻¹C)² = 0</code>이므로 식이 정확히 성립한다. 해당 모델의 입력에서는 거듭제곱 방식의 큰 중간값을 피하면서 역행렬 상대오차를 약 0.3% 수준으로 낮췄다. float32 dtype과 높은 연산 정밀도를 지정하더라도 CPU의 float32 행렬곱과 같은 수치 특성이 보장되는 것은 아니다.</p>
+<h3>상태를 쓰는 커널은 전체 모델에서 연속으로 검증한다</h3>
+<p>새 DeltaNet 재귀 융합 커널은 단독 검사에서는 작은 수치 오차를 보였지만, 실제 모델에서 QSA 선택을 끈 경로의 품질을 떨어뜨렸다. 같은 64토큰 평가에서 기존 연산 조합은 top-1 79.4%, NLL 0.794였고 융합은 52.4%, 4.526이었다. 현재 출력은 기준값에 가까워도 다음 스텝에 넘기는 상태가 잘못될 수 있다. 이 커널은 <code>TT_FUSED_RECUR</code> 기본값을 꺼 둔 상태이며, 잠정 측정한 가속률은 채택된 성능에 포함하지 않는다.</p>
+<aside class="trap"><p class="trap-label">주의할 점</p><p><strong>타일의 빈칸을 0이라고 가정하지 않는다.</strong> 열 벡터와 행 벡터의 외적을 타일 행렬곱으로 계산하면 축소 차원의 32칸이 모두 계산에 들어간다. 변환·전치·슬라이스를 거친 텐서의 패딩은 직접 초기화하거나 계산에서 제외해야 한다. 이번 커널에서는 패딩을 정리해 무한대 오염을 줄였지만 상태 오차가 남았다. 패딩 문제 하나를 고쳤다는 사실이 전체 재귀의 정확성을 보장하지는 않는다.</p></aside>
 <h3>어텐션: 패딩된 위치까지 마스킹한다</h3>
 <p>가산 어텐션 마스크에서 0은 점수를 그대로 통과시키고, 음의 무한대는 해당 위치를 제외한다. 타일 패딩으로 추가된 마스크 값이 0이면 실제 토큰이 없는 위치에도 softmax 확률이 배분된다. K/V를 자를 때는 물리적인 타일 폭을 고려하고, 그 폭 전체에 인과 조건과 유효 위치 조건을 적용한다.</p>
 <p>페이지드 K/V 캐시는 고정 크기 페이지와 페이지 테이블로 위치를 표현한다. 같은 캐시를 프리필과 디코드에서 공유할 수 있고, 위치를 디바이스 텐서로 전달할 수 있어 트레이스에도 적합하다. 다만 청크 시작점의 정렬, 입력 레이아웃, 인덱스 dtype은 사용하는 연산의 요구사항에 맞춰야 한다.</p>
@@ -520,10 +523,13 @@ S = S̄ + kᵀ @ 보정량
 <section class="chapter" id="c-06"><div class="chapter-head"><p class="chapter-tag">08</p><h2 class="chapter-title">QSA: 선택은 생략해도 상태는 유지한다</h2><p class="standfirst">긴 문맥에서는 선택 규칙의 정확성과 선택을 적용하는 비용을 함께 다뤄야 한다.</p></div><div class="band">
 <p><a href="#arch-qsa">QSA의 두 단계 구조</a>를 구현할 때는 인덱서 상태 갱신, 블록 선택, 본 어텐션을 구분한다. 선택을 생략해도 되는 구간과, 생략하면 안 되는 상태 갱신을 나누는 것이 첫 번째 최적화다.</p>
 <p>선택 예산보다 짧은 구간에서는 모든 유효 블록이 선택된다. 이때 점수 계산, top-k, 선택 마스크 구성을 생략해도 인과 어텐션과 결과가 같다. 그러나 인덱서의 키 투영, 링 갱신, 블록 캐시 쓰기는 계속 수행해야 한다. 예산을 넘어 처음 선택하는 순간에 과거 블록이 준비되어 있어야 하기 때문이다.</p>
-<p>선택을 켜고 끄는 조건이 파이썬 분기라면 트레이스에는 캡처 당시 경로만 남는다. 구현은 예산 경계에서 트레이스를 다시 캡처해 선택 경로로 전환했다. 이 비용은 길어지는 시퀀스마다 한 번 발생한다. 해당 측정에서는 예산 아래의 불필요한 선택을 생략해 약 146 ms였던 스텝을 111 ms로 줄였다.</p>
+<p>선택을 켜고 끄는 조건이 파이썬 분기라면 트레이스에는 캡처 당시 경로만 남는다. 구현은 예산 경계에서 트레이스를 다시 캡처해 선택 경로로 전환했다. 이 비용은 길어지는 시퀀스마다 한 번 발생한다. 최신 비교에서는 <code>max_seq_len=8192</code>와 배치 1을 고정하고 이 플래그만 바꾸었을 때 32.3 ms와 61.5 ms가 측정됐다. 따라서 최적화 뒤 선택 경로의 추가 비용은 약 29 ms다. 약 32 ms라는 수치는 모든 문맥 길이의 생성 속도를 뜻하지 않는다.</p>
+<aside class="trap"><p class="trap-label">주의할 점</p><p><strong>선택 여부는 품질 검사에도 명시한다.</strong> 선택을 켠 경로와 끈 경로는 서로 다른 그래프다. QSA 자체와 무관해 보이는 커널 변경도 두 경로에서 모두 검증한다. 하네스는 엔진의 실제 설정과 위치를 따르고, 결과에 <code>selection_active</code>, 캐시 길이, 배치를 함께 기록한다.</p></aside>
 <h3>선택된 K/V를 가져오는 방식도 측정한다</h3>
 <p>선택한 2048토큰만 작은 버퍼로 모으면 어텐션 비용을 일정하게 만들 수 있을 것처럼 보인다. 하지만 당시 ttnn의 gather는 원본 길이에 따라 비용이 증가했다. 4토큰짜리 페이지를 사용하는 방식은 타일 패딩으로 캐시가 크게 늘었다. 이 구현은 전체 캐시에 가산 마스크를 적용하는 방식을 사용했다.</p>
-<p>그 결과 긴 컨텍스트에서는 top-k와 마스크 적용이 별도 병목으로 남았다. <code>k=512</code>인 top-k의 비용은 후보 블록 수에 따라 증가한다. 어텐션이 참조하는 토큰 예산이 고정되어 있어도, 전체 디코드 시간이 항상 일정하다는 뜻은 아니다.</p>
+<p>긴 컨텍스트의 가장 큰 병목은 <code>ttnn.topk</code>였다. 이 연산은 후보 블록 수와 <code>k</code>에 모두 비례해 커졌으며, <code>k=512</code>일 때 후보 2048개는 레이어마다 약 4.4 ms, 후보 4096개는 약 9.4 ms가 걸렸다. 기존 구현은 아직 볼 수 없는 블록에 음의 무한대 점수를 주면서도 할당된 모든 블록을 검색했다.</p>
+<p>실제로 선택될 수 있는 앞부분만 잘라 검색하도록 바꾸자, 시퀀스 길이 8192의 선택 경로가 105.5 ms에서 61.5 ms로 44.0 ms 줄었다. 검색 범위는 트레이스 shape가 지나치게 늘지 않도록 2의 거듭제곱으로 올림한다. 예산을 넘은 뒤에는 유효 후보 수가 항상 <code>k</code> 이상이므로 결과는 유지된다. 64토큰 A/B에서 이전 경로와 새 경로는 top-1 79.4%, top-5 96.8%, NLL 0.794로 같았고, traced와 eager도 토큰 단위로 일치했다.</p>
+<aside class="trap"><p class="trap-label">주의할 점</p><p><strong>국소 연산 시간을 그대로 합산하지 않는다.</strong> 마스크 꼬리의 두 원소별 연산은 따로 재면 토큰당 약 5.3 ms였지만, 이를 접은 전체 스텝은 61.5 ms에서 61.3 ms로 0.2 ms만 줄었다. 이 변경은 되돌렸다. 인접 연산과 런타임이 비용을 흡수할 수 있으므로 채택 여부는 전체 그래프의 짝지은 A/B로 정한다.</p></aside>
 <aside class="trap"><p class="trap-label">주의할 점</p><p><strong>미완성 블록과 패딩을 선택 슬롯에 섞지 않는다.</strong> 미완성 블록은 상위 512개와 별도로 포함하고, 각 질의 위치를 기준으로 인과성을 적용한다. 선택 배열의 빈 항목이 유효한 토큰 0을 가리켜 기존 선택을 덮어쓰지 않도록 해야 한다.</p></aside>
 <p>또한 이 빌드의 scatter 인덱스 범위는 QSA 선택 경로를 최대 65,536토큰으로 제한했다. 모델의 최대 컨텍스트, K/V를 저장할 수 있는 길이, QSA 선택을 올바르게 수행하는 길이는 구분해서 보고해야 한다. 예산 너머에서 조밀 어텐션으로 대체한 결과를 원래 QSA 모델의 실행 성능으로 소개해서는 안 된다.</p>
 </div></section>
@@ -549,41 +555,63 @@ down:    전문가별 활성값과 가중치를 축소 축으로 연결
 <p>이 구현은 국소 측정에서 18.75 µs를 15.56 µs로 줄였고 float64 기준 오차도 유지했다. 다만 전체 스텝에서의 개선은 약 0.08 ms였다. 호출 하나를 없앤 효과와 실제 모델에서 얻는 이득은 구분해야 한다.</p>
 <h3>좁은 출력은 축소 차원도 나누어 계산한다</h3>
 <p>출력 폭을 더 넓히기 어려운 행렬곱에는 K-split GEMV를 적용했다. 축소 차원 K를 여러 코어 그룹으로 나누고, 각 그룹의 부분합을 마지막에 더하는 방식이다. 같은 활성값은 그룹의 대표 코어가 한 번 읽어 멀티캐스트하고, 부분합은 float32로 유지한다. 이렇게 하면 코어마다 패딩된 활성값을 반복해서 읽는 비용을 줄이고 누산 오차도 낮출 수 있다.</p>
-<p>실제 모델에는 <code>[2560, 352]</code> 가중치의 투영에만 적용했다. 다른 shape는 이미 튜닝된 행렬곱과 비교하면 비슷하거나 더 느렸고, 일부의 작은 이득은 측정 변동보다 작았다. 채택한 경로의 A/B 결과는 토큰당 32.66 ms에서 32.08 ms로, 기록상 약 0.58 ms 개선이었다.</p>
-<aside class="trap"><p class="trap-label">주의할 점</p><p><strong>부분합 결합은 검증된 별도 연산으로 유지한다.</strong> 이 빌드에서는 커널 안에서 <code>pack_tile</code>로 Float32 서큘러 버퍼에 값을 넣을 때 멈춤이 재현됐다. 따라서 float32 부분합의 결합은 <code>fused_group_sum</code>으로 분리하고, 커널 내부 결합 경로인 <code>TT_KSG_FOLD</code>는 비활성 상태로 남겼다.</p></aside>
+<p>새 <code>ksgemv</code>는 <code>[2560, 352]</code> 투영에 적용해 기존 A/B에서 약 0.58 ms를 줄였다. 적용 범위를 넓힌 결과는 따로 판단해야 한다. QSA의 K/V와 인덱서로 확장한 짝지은 비교에서는 평균 0.24 ms 느려졌다. 라우터로 확장한 최신 실험은 기준 경로가 세 번 모두 완료된 반면 변경 경로는 세 번 모두 멈췄다. 국소 벤치마크의 배속만으로 확장 적용을 성과에 포함할 수 없다.</p>
+<aside class="trap"><p class="trap-label">주의할 점</p><p><strong>부분합 결합은 검증된 별도 연산으로 유지한다.</strong> float32 출력 자체는 별도 커널에서 정상 동작이 확인됐다. 남은 제약은 K-split 내부에서 부분합을 결합하는 특정 경로의 멈춤이다. 부분합은 <code>fused_group_sum</code>으로 따로 더하고, <code>TT_KSG_FOLD</code>는 비활성 상태로 유지한다. 이 증상을 모든 Float32 버퍼의 제한으로 일반화하지 않는다.</p></aside>
+<h3>all-reduce는 선택되는 알고리즘까지 비교한다</h3>
+<p>같은 <code>all_reduce</code> 호출도 텐서 폭에 따라 내부 경로가 달라진다. 이 빌드의 넓은 텐서는 reduce-scatter 뒤에 all-gather를 수행한다. 이를 all-gather 한 번과 로컬 합산으로 바꾸는 복합 경로는 통신 단계를 줄이지만, 모아 놓은 중간 텐서가 네 배 커진다. 따라서 통신 횟수가 반으로 줄었다고 시간도 반으로 줄지는 않는다.</p>
+<p>실제 모델에서 다섯 쌍을 교대로 측정한 결과는 평균 0.45 ms 단축이었다. 192토큰 품질 검사에서 top-1 72.3%, top-5 90.6%, NLL 1.217을 기록했고, 반복 실행의 결정성도 유지했다. 이 경로는 기본값으로 채택했으며 <code>TT_NO_AR_COMPOSITE</code>로 기존 경로를 선택할 수 있다.</p>
 <h3>읽기·계산·쓰기 커널은 같은 작업량을 따라야 한다</h3>
 <p><code>ttnn.generic_op</code>으로 작성한 커널은 보통 읽기, 계산, 쓰기 세 부분으로 구성된다. 파이썬에서 코어 범위와 서큘러 버퍼를 지정하고, 토큰마다 변하는 전문가 인덱스는 디바이스 입력 텐서로 전달한다. 이렇게 하면 하나의 트레이스가 서로 다른 라우팅 결과를 처리할 수 있다.</p>
 <aside class="trap"><p class="trap-label">주의할 점</p><p><strong>유휴 코어도 명시적으로 처리한다.</strong> 코어 수에 맞춰 작업 계획을 패딩했다면 세 커널 모두 작업 없음 조건을 따라야 한다. 읽기만 생략하고 계산·쓰기를 계속하면 남아 있던 값을 출력 타일에 쓰거나 여러 코어가 같은 주소에서 경쟁할 수 있다. 실제 출력, 반복 실행의 결정성, 커널이 호출되었는지를 함께 확인한다.</p></aside></div></section>
 <section class="chapter" id="c-08"><div class="chapter-head"><p class="chapter-tag">10</p><h2 class="chapter-title">추측 디코딩은 초안의 채택률에 달려 있다</h2><p class="standfirst">여러 토큰을 한 번에 검증할 수 있어도, 채택된 접두사만큼만 상태를 전진시켜야 한다.</p></div><div class="band">
-<p>배치 1에서는 타일의 대부분이 비어 있다. 추측 디코딩은 값싼 초안 생성기가 제안한 여러 토큰을 한 번에 검증해 이 공간을 활용한다. 이 프로젝트는 최근 n-gram을 프롬프트에서 찾아 뒤따르는 토큰을 제안하는 prompt-lookup을 사용했다. 문맥을 다시 인용하는 작업에는 잘 맞지만, 새로운 내용을 쓰는 산문에서는 채택률이 낮다.</p>
+<p>현재 성능 목표는 한 시퀀스의 배치 1 디코드다. 여러 행으로 검증하는 추측 디코딩은 별도의 기능으로 다룬다. 배치 1에서는 타일의 대부분이 비어 있다. 추측 디코딩은 값싼 초안 생성기가 제안한 여러 토큰을 한 번에 검증해 이 공간을 활용한다. 이 프로젝트는 최근 n-gram을 프롬프트에서 찾아 뒤따르는 토큰을 제안하는 prompt-lookup을 사용했다. 문맥을 다시 인용하는 작업에는 잘 맞지만, 새로운 내용을 쓰는 산문에서는 채택률이 낮다.</p>
 <p>검증 경로인 <code>step_n</code>은 한 시퀀스의 여러 토큰을 행 방향으로 묶되, DeltaNet 재귀와 컨볼루션의 시간 순서를 유지한다. 검증된 폭에서는 순차 스텝과의 일관성을 확인했다. 그러나 초안이 일부만 채택되면 검증 과정에서 전진한 순환 상태를 되돌려야 한다. K/V의 유효 길이만 줄이는 것으로는 충분하지 않다.</p>
 <h3>고정 폭에 채택 마스크를 넣는다</h3>
 <p>트레이스 교대 제약을 피하는 방법은 검증 폭을 고정하고 채택 여부를 데이터로 전달하는 것이다. DeltaNet에서 거부된 위치의 감쇠 계수를 1, 갱신량을 0으로 만들면 그 위치는 상태를 바꾸지 않는다. 컨볼루션 링도 채택된 접두사에 맞게 복원한다. K/V는 유효 위치 밖의 값을 읽지 않는 조건에서 나중에 덮어쓸 수 있다.</p>
 <p>다만 채택 길이는 첫 검증이 끝난 뒤에야 알 수 있다. 부분 채택이면 상태를 복원하고 같은 폭을 마스크와 함께 다시 실행하는 비용이 든다. 폭을 무조건 키우면 거부될 토큰과 재실행 비용도 늘어난다. 적절한 폭은 초안의 길이와 전부 채택되는 라운드의 비율에 따라 달라진다.</p>
-<aside class="trap"><p class="trap-label">주의할 점</p><p><strong>국소 검증과 전체 생성의 동등성은 구분한다.</strong> 상태 마스크나 step_n의 개별 검사가 통과해도 전체 생성 루프의 정확성이 자동으로 보장되지는 않는다. 이 실험에는 비추측 기준선과의 불일치가 해결되지 않은 측정이 있어, 그 속도 수치를 검증된 최종 성능에 합치지 않았다.</p></aside>
+<aside class="trap"><p class="trap-label">주의할 점</p><p><strong>국소 검증과 전체 생성의 동등성은 구분한다.</strong> 최신 기록에서는 <code>step_n</code>의 k=2·4·8 경로가 예외로 종료되어, 앞선 다중 토큰 검증 성능을 현재 코드에서 재현할 수 없다. 컨볼루션 상태와 입력 버퍼의 레이아웃을 정리하고 전체 생성 루프를 다시 검증해야 한다. 복구 전까지 추측 디코딩의 과거 가속률은 현재 성능으로 사용하지 않는다.</p></aside>
 <p>추측 디코딩의 실용성은 초안 발동률, 채택 길이, 상태 복원 비용을 모두 포함해 판단한다. 초기의 유리한 프롬프트에서 얻은 가속률을 이후 더 빨라진 단일 토큰 디코더에도 그대로 적용할 수는 없다. 기준 디코더가 바뀌면 비교를 다시 해야 한다.</p>
 </div></section>
-<section class="chapter" id="c-09"><div class="chapter-head"><p class="chapter-tag">11</p><h2 class="chapter-title">성능 측정과 남은 한계</h2><p class="standfirst">최신 단일 사용자 스텝은 32.08 ms였다. 이 수치를 설명하려면 호스트, 디바이스 연산, 통신을 함께 봐야 한다.</p></div><div class="band">
-<p>최신 A/B 기록의 단일 사용자 디코드는 토큰당 32.08 ms, 초당 약 31.2토큰이다. 문서에 설정된 비교 목표인 RTX 5090의 32.6 ms보다 약 1.6% 짧다. 이 수치는 K-split 적용 전후를 비교한 결과이며, 앞선 실험의 중앙값 33.3 ms와는 측정 묶음이 다르다. 서로 다른 시점의 개선 폭을 더하는 대신, 최신 비교의 기준값 32.66 ms와 결과값 32.08 ms를 함께 본다.</p>
-<figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">항목</th><th scope="col">기록된 결과</th><th scope="col">해석</th></tr></thead><tbody><tr><td>단일 사용자 디코드</td><td>32.08 ms/토큰 · 31.2 tok/s</td><td>HANDOFF 42.2의 A/B 결과</td></tr><tr><td>K-split 적용 전후</td><td>32.66 → 32.08 ms/토큰</td><td>[2560, 352] 투영에만 적용</td></tr><tr><td>앞선 최적화 구간의 ttnn 호출</td><td>5640 → 약 2600</td><td>HANDOFF 40까지의 기록</td></tr><tr><td>최신 품질 평가</td><td>top-1 72.8%, top-5 91.1%, NLL 1.219</td><td>device_quality.py 192, 이전 200 위치 평가와 구분</td></tr><tr><td>청크 프리필</td><td>약 7.2 ms/입력 토큰</td><td>앞선 별도 측정, 128토큰 청크</td></tr><tr><td>배치 64, eager</td><td>107.6 tok/s</td><td>앞선 처리량 측정, 단일 사용자 지연과 구분</td></tr></tbody></table></div><figcaption>디코드와 최신 품질 수치는 HANDOFF 42.2의 결과다. 프리필·배치 처리량은 앞선 별도 측정이며, 모든 항목을 하나의 최종 구성으로 다시 측정한 표는 아니다.</figcaption></figure>
-<p>최신 변경 뒤에는 테스트 235개가 통과했고, 반복 실행의 결정성 검사에서 차이가 0으로 보고됐다. 트레이스와 eager 생성도 토큰 단위로 일치했다. 같은 평가 조건의 이전 결과와 비교하면 top-1과 NLL은 기존 범위 안에 있었고, top-5는 높아졌다.</p>
-<h3>측정 경로 안에서 변경의 값을 잰다</h3>
-<p>워밍업으로 컴파일과 첫 할당을 마친 뒤 반복 측정하고, 중앙값과 분산을 본다. 작은 변경은 같은 프로세스 안에서 조건을 바꾸어 비교한다. 이 프로젝트에서는 프로세스 간 약 1 ms의 변동이 관측되어, 2 ms 미만의 차이는 특히 짝지은 A/B 측정이 중요했다.</p>
-<p>호스트의 ttnn 호출 수, 디바이스 프로그램 실행 수, 트레이스 재생 시간은 서로 다른 지표다. reshape가 호스트의 뷰 변경으로 끝나는 경우도 있고, 원소별 연산은 텐서가 작아도 넓은 코어 격자를 사용할 수 있다. 따라서 호출 수에 단일 상수를 곱해 전체 시간을 설명하기 어렵다.</p>
-<p>실제 모델에 연산을 조금씩 추가하거나 제거해 그 경로에서의 비용을 잰다. 최신 그룹 정규화 변경은 실행 97회를 줄였지만 전체 스텝은 약 0.08 ms만 짧아졌다. 이 단계에서는 실행 횟수를 줄이는 것만으로 큰 개선을 기대하기 어렵다. 융합의 우선순위는 같은 데이터를 반복해서 읽는 일을 줄이거나 실제 계산량을 줄이는 데 있다.</p>
-<p>커널 비교에서도 기준 구현을 명확히 한다. K-split은 기본 <code>ttnn.linear</code>보다 국소적으로 약 1.9–3.4배 빨랐지만, 모델은 이미 더 빠른 <code>decode_matmul_config</code>를 사용하고 있었다. 실제 채택 여부는 이 튜닝된 경로와의 A/B로 정했다. 기본 연산 대비 배속을 전체 모델의 예상 이득으로 옮겨 쓰지 않는다.</p>
-<h3>부품을 제거한 시간은 조건부 비용이다</h3>
-<p>한 부품을 대체해 전후 시간을 비교하는 절제 실험은 최적화 후보를 찾는 데 유용하다. 다만 각각의 차이는 겹칠 수 있고, 대체 코드 자체에도 비용이 있다. 부품을 순서대로 제거하는 누적 절제는 전체 차이를 합산할 수 있지만, 각 항의 값은 제거 순서와 대체 구현에 의존한다. 마지막에 남은 시간을 순수한 하드웨어 하한으로 해석해서는 안 된다.</p>
-<h3>입력 업로드에도 패딩 비용이 있다</h3>
-<p>디바이스 연산이 빨라지면 호스트 입력 준비도 눈에 띈다. 임베딩 한 행을 타일 형식으로 만들어 올리면 5 KB의 데이터가 패딩으로 160 KB가 된다. row-major로 전송한 뒤 트레이스 안에서 타일화하는 방식으로 바꾸어 입력 준비와 전송에 드는 전체 비용을 약 3.5 ms에서 2.1 ms로 줄였다.</p>
-<h3>대역폭만으로 다음 목표를 정할 수는 없다</h3>
-<p>가중치 바이트 수를 최대 대역폭으로 나누면 이상적인 전송 시간을 얻는다. 실제 스텝에는 카드 간 집단 통신, 작은 프로그램의 실행 비용, 상태와 캐시 접근이 추가된다. 좁은 출력의 행렬곱은 최대 대역폭을 채우지 못하기도 한다.</p>
-<p>추가 측정에서는 <code>ttnn.linear</code>가 토큰당 9.58 ms를 사용했고, 같은 가중치의 이상적인 대역폭 기준은 5.80 ms였다. 차이는 좁은 출력에 집중되어 K-split의 적용 대상을 정하는 근거가 됐다. 반면 실행마다 일정한 비용을 더해 만든 전체 시간 하한은 최신 측정에 맞춰 재평가해야 한다. 다음 최적화도 이런 국소 분석으로 후보를 고른 뒤 전체 스텝에서 효과를 확인한다.</p>
-<p>이 작업에서 효과가 컸던 변경은 공통된 방향을 가진다. 자주 쓰지 않는 큰 표는 호스트에 두고, 디바이스에서는 패딩과 중간값을 덜 옮기며, 같은 입력을 받는 계산은 함께 실행했다. 그 과정에서 품질과 상태의 일관성을 계속 확인했기 때문에, 측정된 속도를 실제 생성에 사용할 수 있었다.</p>
+<section class="chapter" id="c-09"><div class="chapter-head"><p class="chapter-tag">11</p><h2 class="chapter-title">성능 측정과 남은 한계</h2><p class="standfirst">배치 1의 짧은 문맥은 약 32 ms다. 긴 문맥에서는 QSA 선택이 가장 큰 추가 비용이며, 두 경로를 나누어 평가해야 한다.</p></div><div class="band">
+<p>이후 작업의 목표는 배치 1을 유지하며 단일 토큰 지연을 줄이는 것으로 명확해졌다. 초기 비교 기준은 RTX 5090의 32.6 ms였고, 추가 목표는 7.9 ms, 약 127 tok/s다. 현재의 약 32 ms는 초기 기준에 근접한 결과이며, 추가 목표와는 여전히 큰 차이가 있다.</p>
+<figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">측정 조건</th><th scope="col">결과</th><th scope="col">의미</th></tr></thead><tbody>
+<tr><td>배치 1, 캐시 길이 8192, QSA 선택 꺼짐</td><td>32.3 ms · 31.0 tok/s</td><td>예산 아래의 엔진 경로</td></tr>
+<tr><td>같은 조건, QSA 선택 켜짐</td><td>61.5 ms · 16.3 tok/s</td><td>후보 범위 최적화 적용 뒤 선택 경로</td></tr>
+<tr><td>복합 all-reduce 채택</td><td>평균 −0.45 ms</td><td>다섯 쌍의 A/B에서 모두 단축</td></tr>
+<tr><td>복합 all-reduce 품질 검사</td><td>top-1 72.3% · top-5 90.6% · NLL 1.217</td><td>device_quality.py 192의 결과</td></tr>
+<tr><td>트레이스 경로 호출 집계</td><td>2218회 · 디바이스당 약 2.73 GB</td><td>배치 1, 선택 꺼짐; 호출 수와 실행 수는 구분</td></tr>
+<tr><td>프리필·배치 처리량</td><td>7.2 ms/입력 토큰 · 배치 64에서 107.6 tok/s</td><td>앞선 별도 측정, 이번에 재측정하지 않음</td></tr>
+</tbody></table></div><figcaption>HANDOFF 45.5–45.6, 45.26, 45.28–45.31, 45.44의 결과다. 선택 on/off는 같은 하네스·캐시 길이에서 비교한 값이다. 특정 위치에서 플래그를 바꾼 비용 비교를 긴 문맥 전체의 품질 검증으로 해석하지 않는다.</figcaption></figure>
+<p>all-reduce 개선 폭을 과거 최저 스텝에서 빼서 새 최고 속도를 만들지는 않는다. 서로 다른 측정 묶음의 절대값은 변동할 수 있다. 기록에 보고된 현재 범위는 약 32 ms이며, 변경의 효과는 같은 조건으로 짝지은 차이로 제시한다.</p>
+<h3>현재 병목은 레이어 안에 있다</h3>
+<p>배치 1, 캐시 길이 4096, 선택 꺼짐의 32.65 ms 스텝에서 부품을 하나씩 대체해 비용을 비교했다. DeltaNet이 가장 크고, 네 잔차를 혼합하는 하이퍼 커넥션과 MoE가 뒤를 이었다.</p>
+<figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">부품</th><th scope="col">대체 전후의 시간 차이</th><th scope="col">해석</th></tr></thead><tbody>
+<tr><td>DeltaNet 36개 레이어</td><td>8.36 ms</td><td>그중 재귀는 별도 측정에서 약 2.95 ms</td></tr>
+<tr><td>잔차 혼합</td><td>6.68 ms</td><td>정규화·투영·통신·게이트를 포함</td></tr>
+<tr><td>MoE</td><td>5.67 ms</td><td>넓게 모으는 전문가 경로</td></tr>
+<tr><td>집단 통신</td><td>3.86 ms</td><td>다른 부품의 통신과 중복되는 항목</td></tr>
+<tr><td>QSA 12개 레이어</td><td>3.66 ms</td><td>선택을 끈 경로; 긴 문맥의 선택 비용은 별도</td></tr>
+<tr><td>공유 전문가</td><td>1.18 ms</td><td>모든 토큰에서 실행</td></tr>
+</tbody></table></div><figcaption>부품별 대체 실험의 차이는 서로 겹치므로 합산하지 않는다. 실제 코드의 절대 실행 시간을 완전히 분해한 표가 아니라 최적화 우선순위를 정하는 비교다.</figcaption></figure>
+<p>48개 레이어 전체를 대체한 실행은 0.47 ms였다. 개별 부품을 모두 대체한 뒤 남았던 약 6 ms에는 대체 코드의 슬라이스와 미처 제거하지 않은 통신이 들어 있었다. 남은 시간을 고정 오버헤드나 하드웨어 하한으로 볼 수 없는 이유다. 대체 코드의 버퍼 소유권과 라우팅에 미치는 영향도 확인해야 한다. 특히 라우터 로짓을 모두 0으로 만들면 동점을 허용하는 선택 규칙이 모든 전문가를 선택할 수 있다.</p>
+<h3>측정 대상과 엔진의 실행 경로를 맞춘다</h3>
+<p>배치, 캐시 길이, 위치, QSA 선택 여부, <code>trace_safe_rings</code>를 함께 기록한다. 같은 <code>model.step</code>이라도 이 설정에 따라 다른 그래프를 실행한다. 워밍업 뒤 반복 측정하고, 작은 변경은 순서를 번갈아 가며 짝지어 비교한다. 멈춤이나 실패는 표본 수와 함께 별도로 보고하며, 성공한 실행만 골라 안정적이라고 결론 내리지 않는다.</p>
+<p>트레이스는 여전히 중요하다. 캐시 길이 512, 선택 꺼짐을 한 프로세스에서 비교한 결과 eager는 545.98 ms, traced는 약 32.0 ms였다. 다만 이미 트레이스로 실행 중인 그래프에서 호출 몇 개를 줄이는 효과는 훨씬 작다. 호스트 호출 제거와 디바이스 커널 융합을 같은 비용으로 계산해서는 안 된다.</p>
+<h3>바이트 수를 줄여도 그만큼 빨라지지는 않는다</h3>
+<p>배치 1에서는 가중치를 더 작게 나누면 출력 폭도 좁아져 코어 활용도가 떨어질 수 있다. 실제 shape 비교에서 QKV의 읽기량을 크게 줄인 재배치는 레이어당 약 2.2 µs만 줄였고, 공유 전문가의 샤딩은 down 투영이 느려져 전체적으로 손해였다. K-split의 국소 배속 역시 모델 안의 튜닝된 경로와 비교해야 한다.</p>
+<p>캐시 파일을 기준으로 센 가중치 읽기량은 디바이스당 토큰마다 약 3.17 GB였고, 실제 트레이스 경로의 연산 집계는 약 2.73 GB였다. 두 수치는 집계 대상과 방법이 다르므로 하나의 확정된 하한으로 합치지 않는다. 최대 대역폭으로 나눈 값은 이상적인 전송 시간일 뿐이며, 현재 그래프가 그 대역폭을 유지한다거나 바이트 절감이 같은 비율의 지연 감소로 이어진다는 뜻도 아니다.</p>
+<h3>다음 후보: 검증된 통신 경로를 네 카드로 확장하기</h3>
+<p>넓은 all-reduce 84회의 비용은 짝지은 실험에서 약 2.2 ms였다. 이를 사용자 fabric 커널로 줄이는 경로를 연구 중이다. 현재는 두 카드 사이에서 전송·신호·대기·합산·쓰기를 연결한 검증까지 완료했다. 기준 합과의 최대 절대오차는 약 0.030으로, 해당 입력 크기에서 bf16 반올림 수준이었다. 아직 모델에는 연결하지 않았다.</p>
+<p>네 카드의 실제 연결은 <code>0–1–3–2–0</code> 순서의 링이다. <code>MeshShape(1, 4)</code> 같은 논리 배열만 보고 <code>0→1→2→3</code>으로 전송할 수 있다고 가정하지 않는다. 연결에 맞춘 세 카드·네 카드 전달 체인은 중계 단계에서 멈춤이 남아 있다. 두 카드 검증을 통과한 사실만으로 네 카드 all-reduce가 구현됐다고 볼 수는 없다.</p>
+<aside class="trap"><p class="trap-label">주의할 점</p><p><strong>fabric 전송은 주소 공간과 실제 이웃을 확인한다.</strong> 사용한 전송 API는 L1의 데이터를 보낸다. DRAM의 <code>buffer_address()</code>를 그대로 전달하지 말고, 먼저 L1 버퍼로 읽어 온 뒤 수신 코어의 NoC 주소와 연결한다. 전송 시간뿐 아니라 수신한 값과 최종 합도 검증한다. 이 프로젝트의 두 카드 실험은 동일한 버퍼 목록으로 양쪽 L1 배치를 맞춘 조건에서 수행됐다.</p></aside>
+<h3>커널 확장 전에 풀어야 할 제약</h3>
+<p>라우터의 K-split 프로그램은 한 캡처에 4개를 넣으면 완료됐지만 16개부터 멈췄다. 프로그램 하나의 코어별 L1 예약량은 81,920 B였다. 기록은 이를 바탕으로 큰 입력 청크를 통째로 담는 서큘러 버퍼를 작은 파이프라인으로 바꾸는 방안을 제안한다. 다만 버퍼 축소 뒤의 안정성과 성능은 아직 검증되지 않았으며, 프로그램별 예약량을 단순히 더한 추정만으로 원인이 확정되지는 않는다.</p>
+<p>DeltaNet 재귀 융합도 상태 쓰기의 오차가 남아 기본 비활성이다. 단독 수치 검사, 실제 모델의 연속 상태 검사, 선택 on/off의 품질 검사를 모두 통과해야 채택할 수 있다. 재귀 전체가 DeltaNet 비용의 일부인 만큼, 이 커널 하나로 블록 전체의 시간을 줄일 수 있다고 기대해서도 안 된다.</p>
+<p>추가 목표인 7.9 ms를 달성할 검증된 구현 경로는 아직 없다. 기록의 12–16 ms 전망도 구현을 마친 결과가 아닌 추정이다. 현재 남은 과제는 짧은 문맥의 레이어 계산과 통신, 긴 문맥의 QSA 선택 비용을 각각 측정하고 줄이는 일이다.</p>
 </div></section>
-<section class="chapter" id="c-map"><div class="chapter-head"><p class="chapter-tag">부록</p><h2 class="chapter-title">코드를 읽기 위한 안내</h2><p class="standfirst">구현을 더 살펴볼 때 필요한 파일과 검증 도구만 모았다.</p></div><div class="band"><figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">영역</th><th scope="col">파일</th><th scope="col">담당 내용</th></tr></thead><tbody><tr><td>체크포인트</td><td><code>gguf/reader.py</code>, <code>gguf/quants.py</code></td><td>GGUF 읽기와 역양자화</td></tr><tr><td>기준 구현</td><td><code>reference/model.py</code>, <code>reference/layers.py</code></td><td>CPU 모델, DeltaNet과 QSA 규칙</td></tr><tr><td>변환·배치</td><td><code>tt/plan.py</code>, <code>tt/convert.py</code>, <code>tt/blockfloat.py</code></td><td>정밀도·샤딩 정책, 레이아웃 변환과 시뮬레이션</td></tr><tr><td>모델 연산</td><td><code>tt/model.py</code>, <code>tt/moe.py</code>, <code>tt/ops.py</code></td><td>전체 실행, 전문가 계산, 정규화와 게이트</td></tr><tr><td>DeltaNet</td><td><code>tt/linear_attn.py</code>, <code>tt/deltanet.py</code></td><td>디코드 재귀, 프리필 준비와 블록 역행렬</td></tr><tr><td>실행 관리</td><td><code>tt/traced.py</code>, <code>tt/engine.py</code></td><td>캡처, 입력 버퍼, 슬롯·접두사·추측 실행</td></tr><tr><td>사용자 커널</td><td><code>scripts/kernels/</code></td><td>데이터 이동과 융합 연산, gnorm1_*와 ksgemv_* 커널</td></tr><tr><td>품질·결정성</td><td><code>device_quality.py</code>, <code>determinism_check.py</code></td><td>다음 토큰 평가와 반복 실행 비교</td></tr><tr><td>성능 분석</td><td><code>ab_step.py</code>, <code>cumulative_ablation.py</code>, <code>marginal_op_cost.py</code>, <code>linear_shape_census.py</code></td><td>A/B 측정, 누적 절제, 한계 비용과 행렬곱 shape별 분석</td></tr><tr><td>추가 커널 검증</td><td><code>group_norm_check.py</code>, <code>ksgemv_check.py</code></td><td>그룹 정규화와 K-split의 수치·성능 비교</td></tr><tr><td>경계 검사</td><td><code>moe_rows_check.py</code>, <code>row_tile_boundary_check.py</code></td><td>행별 일관성과 타일 경계 검사</td></tr></tbody></table></div><figcaption>모듈 경로는 src/ttrunner_qwen38_flash_next/ 기준이다. 검증 스크립트는 scripts/dev/ 아래에 있다.</figcaption></figure></div></section>
+<section class="chapter" id="c-map"><div class="chapter-head"><p class="chapter-tag">부록</p><h2 class="chapter-title">코드를 읽기 위한 안내</h2><p class="standfirst">구현을 더 살펴볼 때 필요한 파일과 검증 도구만 모았다.</p></div><div class="band"><figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">영역</th><th scope="col">파일</th><th scope="col">담당 내용</th></tr></thead><tbody><tr><td>체크포인트</td><td><code>gguf/reader.py</code>, <code>gguf/quants.py</code></td><td>GGUF 읽기와 역양자화</td></tr><tr><td>기준 구현</td><td><code>reference/model.py</code>, <code>reference/layers.py</code></td><td>CPU 모델, DeltaNet과 QSA 규칙</td></tr><tr><td>변환·배치</td><td><code>tt/plan.py</code>, <code>tt/convert.py</code>, <code>tt/blockfloat.py</code></td><td>정밀도·샤딩 정책, 레이아웃 변환과 시뮬레이션</td></tr><tr><td>모델 연산</td><td><code>tt/model.py</code>, <code>tt/moe.py</code>, <code>tt/ops.py</code></td><td>전체 실행, 전문가 계산, 정규화와 게이트</td></tr><tr><td>DeltaNet</td><td><code>tt/linear_attn.py</code>, <code>tt/deltanet.py</code></td><td>디코드 재귀, 프리필 준비와 블록 역행렬</td></tr><tr><td>실행 관리</td><td><code>tt/traced.py</code>, <code>tt/engine.py</code></td><td>캡처, 입력 버퍼, 슬롯·접두사·추측 실행</td></tr><tr><td>사용자 커널</td><td><code>scripts/kernels/</code></td><td>데이터 이동과 융합 연산, gnorm1_*와 ksgemv_* 커널</td></tr><tr><td>품질·결정성</td><td><code>device_quality.py</code>, <code>determinism_check.py</code></td><td>다음 토큰 평가와 반복 실행 비교</td></tr><tr><td>성능 분석</td><td><code>ab_step.py</code>, <code>cumulative_ablation.py</code>, <code>marginal_op_cost.py</code>, <code>linear_shape_census.py</code></td><td>A/B 측정, 누적 절제, 한계 비용과 행렬곱 shape별 분석</td></tr><tr><td>추가 커널 검증</td><td><code>group_norm_check.py</code>, <code>ksgemv_check.py</code>, <code>recur_seq_check.py</code>, <code>fabric_reduce_check.py</code></td><td>정규화·K-split, 연속 상태 갱신, 카드 간 합산 검증</td></tr><tr><td>경계 검사</td><td><code>moe_rows_check.py</code>, <code>row_tile_boundary_check.py</code></td><td>행별 일관성과 타일 경계 검사</td></tr></tbody></table></div><figcaption>모듈 경로는 src/ttrunner_qwen38_flash_next/ 기준이다. 검증 스크립트는 scripts/dev/ 아래에 있다.</figcaption></figure></div></section>
 <footer class="end">
-<p>근거: <a href="iterations/">iterations/001–023</a>, <a href="HANDOFF.md">HANDOFF.md의 1–42.2절</a>, <a href="roadmap_low_batch.md">roadmap_low_batch.md</a>, <a href="upstream/trace_alternation_hang.md">트레이스 교대 재생 분석</a>. 그룹 정규화 융합과 K-split 적용 결과를 포함해, HANDOFF 42.2절까지의 확인된 결과와 남은 제약을 반영했다.</p>
+<p>근거: <a href="iterations/">iterations/001–023</a>, <a href="HANDOFF.md">HANDOFF.md의 1–46절</a>, <a href="roadmap_low_batch.md">roadmap_low_batch.md</a>, <a href="upstream/trace_alternation_hang.md">트레이스 교대 재생 분석</a>. 2026-09-06 기준 HANDOFF 46절과 그 안에 추가된 45.40–45.44절까지 반영했다. 실제 채택된 변경, 조건별 측정값, 검증 중인 커널을 구분했다.</p>
 <p>수치는 원문과 작업 기록에 보고된 결과다. 이 문서 개정에서 하드웨어 벤치마크를 다시 실행하지는 않았다. 빌드에 따른 제약과 측정 조건은 해당 본문에 명시했다.</p>
 </footer>
 </main></div>

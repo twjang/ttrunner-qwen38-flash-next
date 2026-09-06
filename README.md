@@ -14,9 +14,8 @@ n-gram embedding, and hyper-connections in place of every layer norm).
 ## Measured performance
 
 Four Blackhole p150a, UD-IQ4_XS weights (24.94 GB/device). Median of 25 samples
-after 5 warmup steps — a thinner harness (2 warmup, 3 samples) reported 107 tok/s
-for the same configuration, 26 % optimistic, because kernel JIT landed inside the
-measured window.
+after 5 warmup steps; warm up properly, because kernel JIT landing inside the
+measured window once made a thin harness read 26 % optimistic.
 
 | | before | after |
 |---|---|---|
@@ -31,34 +30,14 @@ with its regime attached — see the two regimes below. Tracing is worth 17x her
 `max_seq_len 512`), so any batch-1 figure taken eagerly is describing a
 different program's cost structure.
 
-```
-   B  median ms      p10      p90     tok/s   ms/tok
-   1      518.3    511.2    529.8      1.93   518.27
-  16      549.0    544.7    562.1     29.14    34.32
-  32      550.5    547.4    553.3     58.13    17.20
-  64      742.8    739.6    757.2     86.16    11.61
-```
-
 Batch 64 is the last valid step: batch pads to multiples of 32, so 65..96 all
-allocate as 96 and overflow L1 by ~22 %. The table above is the split-expert path;
-fusing the experts' gate and up projections into one `sparse_matmul` (built by
-`scripts/fuse_expert_gate_up.py`) gives **107.6 tok/s** at batch 64 with identical
-tokens, and is neutral-to-better at every batch size, so the engine uses it
-whenever the prebuilt weights are present:
+allocate as 96 and overflow L1 by ~22 %. Fusing the experts' gate and up
+projections into one `sparse_matmul` (built by `scripts/fuse_expert_gate_up.py`)
+is neutral-to-better at every batch size with identical tokens, so the engine
+uses it whenever the prebuilt weights are present.
 
-| batch | split | fused |
-|---|---|---|
-| 1 | 522.4 / 520.3 ms | 504.8 / 523.0 ms |
-| 32 | 57.57 / 57.97 tok/s | 59.51 / 58.49 tok/s |
-| 64 | 86.66 / 86.60 tok/s | **97.47 / 97.36 tok/s** |
-
-(That comparison is from before `docs/iterations/013`-`014`; what it establishes
-is the split-vs-fused *relationship*, which is why it is kept. The absolute
-figures on the fixed model are below.)
-
-Re-measured on the model that works, 5 warmup + 25 samples
-(`scripts/dev/bench_batch.py`), which is also the first run of the paged K/V
-cache above one sequence:
+Across batch, **eager**, 5 warmup + 25 samples (`scripts/dev/bench_batch.py`) --
+the batch-1 row here is the eager path, not the 32.0 ms traced figure above:
 
 | batch | ms/step | tok/s |
 |---|---|---|
@@ -88,24 +67,9 @@ experts at the top-k boundary. So a sequence's output does depend on how many
 others share its batch, above 32. That is a property to know about, not a bug to
 fix at this level.
 
-Trace capture replays a step with one dispatch. Through `TTModel` it is verified
-token-for-token against eager:
-
-| batch | eager | traced | gain |
-|---|---|---|---|
-| 1 | 515.7 ms | 255.3 ms | 2.02× |
-| 16 | 552.7 ms | 364.3 ms | 1.52× |
-| 32 | 538.7 ms | 417.8 ms | 1.29× |
-
-It is **off by default in the server** (`use_trace=False`): the same decoder
-driven through `TTEngine` emits corrupted text. Ten candidates were excluded by
-standalone reproductions that passed, and differential instrumentation showed the
-trace reads bit-identical inputs — only interleaving a full eager step restores
-it, which costs exactly what the trace saves. See `docs/iterations/011`.
-Correct and slower beats fast and wrong.
-
-End-to-end through the engine, greedy, 12 output tokens after a 5-token prompt
-(so 17 device steps produce 12 tokens — prompts are fed one token per step):
+Trace capture replays a step with one dispatch, is verified token-for-token
+against eager, and is **on by default** (`use_trace=True`). At batch 1 it is
+worth 17x, which is most of what makes the step 32 ms rather than 546.
 
 The server defaults to a single user: one slot at the model's full 262144-token
 context, traced.
@@ -182,18 +146,11 @@ re-measured at 262144 since; the current traced step is **32.0-32.7 ms** at
 at 262144 allocates a 6.4 GB K/V slot and a 65536-entry indexer block cache, so
 that configuration is slow to *set up* whatever the step costs.)
 
-(236.2 ms until `docs/iterations/022`, which found that the routed MoE was 65 %
-of the step and that almost none of that was the experts -- at M = 1 the row axis
-pads to 32, so every [1, 512, 1, 2560] tensor was 84 MB carrying 2.6 MB. Removing
-the per-expert input copy and combining the experts with one matmul took it to
-173.7 without giving up any accuracy: the first change is bit-identical, the
-second measurably closer to an exact float64 reference than what it replaced.
-Before that, 229 ms pre-`014`, when the model was wrong. With QSA's sparse
-selection on -- contexts in `(2048, 65536]` -- a step was 297.5 ms at 8192 tokens
-against 236.1 dense; the extra is almost all `ttnn.topk` at k=512, see
-`docs/iterations/015`. That diagnosis was right and the cost is now mostly gone:
-`HANDOFF.md` 45.44 restricts the search to the blocks that can actually be
-selected, which is **-44 ms**.)
+The two findings behind most of that, both still worth knowing: at M = 1 the row
+axis pads to 32, so a `[1, 512, 1, 2560]` expert tensor was 84 MB carrying 2.6 MB
+(`docs/iterations/022`); and the selecting regime's extra cost is almost all
+`ttnn.topk`, which `docs/HANDOFF.md` 45.44 cut by **-44 ms** by searching only
+the blocks that can actually be selected.
 
 ### Pointing an agent harness at it
 
@@ -234,28 +191,26 @@ pass (4.4x faster on short turns), and use the `system` role rather than
 ms/token: 32k of context is about seven minutes of prefill, and a bigger window
 mostly buys a longer wait.
 
-For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt at
-**~13 ms/token** instead of ~177, and keeps the traced decode step. The two used
-to be mutually exclusive -- a prefill allocating while a trace is live corrupts
-the replay -- so the engine now releases the trace around each prefill and
-captures it again afterwards, restoring the state the capture dirties. That costs
-~2.6 s on a request that ingests and pays for itself after about seven generated
-tokens. A 1051-token prompt with 200 tokens out takes **50.7 s**, against 125.6 s
-with the trace off and 221.4 s with no chunked prefill.
+For a prompt-heavy single user, `chunked_prefill=True` consumes the prompt in
+one pass per 128-token chunk rather than one step per token, and keeps the traced
+decode step. The two used to be mutually exclusive -- a prefill allocating while
+a trace is live corrupts the replay -- so the engine releases the trace around
+each prefill and captures it again afterwards, restoring the state the capture
+dirties. That costs ~2.6 s on a request that ingests and pays for itself after a
+handful of generated tokens.
 
 `speculate=k` drafts from the prompt and verifies k tokens in one pass. It is
-**exact** — the output is identical to decoding one token at a time — and worth
-1.10x on text that quotes its context (160.3 ms/token against 176.4 at
-`speculate=8`), and neutral on open prose, where the drafter rarely fires. It
-was worth 1.37x until the traced step itself got 1.36x faster; speculation
-amortises that step, so most of its advantage went with it. Off by default. Prefix reuse
-across chat turns is on unconditionally — a follow-up turn re-feeds only what it
-added, measured **2.27 s** to first token warm. Cold depends on how the prompt is
-fed and the earlier figure here did not say: **11.40 s** with
-`chunked_prefill=True`, **41.31 s** without it, for the same 73-token prompt
-(`scripts/dev/prefix_reuse_check.py`, with and without `--chunked`). Both cases
-reuse exactly the 69 tokens they should, miss correctly on an unrelated prompt,
-and return token-identical output warm and cold.
+**exact** — the output is identical to decoding one token at a time — and helps
+only on text that quotes its context; on open prose the drafter rarely fires.
+Speculation amortises the decode step, so its value shrinks every time that step
+gets faster. Off by default; re-measure before enabling it.
+
+Prefix reuse across chat turns is on unconditionally — a follow-up turn re-feeds
+only what it added, measured **2.27 s** to first token warm against **11.40 s**
+cold with `chunked_prefill=True` and **41.31 s** cold without, for the same
+73-token prompt (`scripts/dev/prefix_reuse_check.py`). Both cases reuse exactly
+the 69 tokens they should, miss correctly on an unrelated prompt, and return
+token-identical output warm and cold.
 
 Throughput-oriented configurations (more slots, shorter context):
 
@@ -267,15 +222,13 @@ Throughput-oriented configurations (more slots, shorter context):
 Two numbers because they answer different questions. *Sustained generation* is
 tokens over the span in which generation is actually running, which is what a
 loaded server settles at; *end to end* divides by the whole wall clock, so it
-carries prompt ingestion and is a function of how long the prompts are. The
-earlier figure here was 37.84 tok/s with no recorded methodology and was taken
-before the correctness fixes in `docs/iterations/013`-`014`, so it is not
-directly comparable to either. `scripts/dev/bench_server.py` is the harness.
+carries prompt ingestion and is a function of how long the prompts are.
+`scripts/dev/bench_server.py` is the harness.
 
-The server feeds prompts one token per step. `TTModel.prefill` is ~71× faster
-(7.2 vs 509.0 ms/token) and is on for one-slot engines; it is refused above that
-because it consumes a whole prompt before returning, which a shared lockstep
-batch cannot express.
+The server feeds prompts one token per step unless chunked prefill is on.
+`TTModel.prefill` is far faster per token and is used for one-slot engines; it is
+refused above that because it consumes a whole prompt before returning, which a
+shared lockstep batch cannot express.
 
 ## Layout
 
