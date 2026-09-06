@@ -7651,6 +7651,22 @@ chain to 9.613e-04, so `cb_dec` is right. Whatever inflates the state is
 downstream of a correct `decayed` and a correct `cb_ktm`, which leaves the final
 `add_binary_tile` loop, the pack into `cb_snew`, and the writer's pages.
 
+**`cb_dec` cannot be probed with STAGE 5, and does not need to be.** STAGE 5
+writes `decayed` out *as* the state, so the state becomes `state * g_exp` every
+step -- starting from zero it stays zero for ever, and the run duly reports
+`|fused state| 0.000e+00` against `|host decayed| 0.000e+00`. The probe is
+degenerate by construction. It is also unnecessary: `out = q . decayed + ...`
+reads `decayed` directly and matches the op chain to 9.613e-04 at STAGE 6, which
+is the evidence that `cb_dec` is right.
+
+So every input to the state write is now verified -- `decayed` via the output,
+`cb_ktm` via STAGE 7, the operands via the dump -- and the state is still nine
+times too large. **What is left is the write itself**: the final
+`add_binary_tile` loop, the indexed `pack_tile(2, cb_snew, i)`, and the writer's
+`head*DKT*DVT + i*DVT + j` pages. A core writing pages it does not own, or the
+same page written by several cores, produces exactly a state that is too large
+by a small integer factor while every ingredient is correct.
+
 **Three reproduction attempts outside the model, all negative.**
 `recur_seq_check.py` now takes `TT_RECUR_LAYERS_SIM`, `TT_RECUR_NOISE` and
 `TT_RECUR_CAST`:
