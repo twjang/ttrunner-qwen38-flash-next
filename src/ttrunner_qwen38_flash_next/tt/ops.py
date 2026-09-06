@@ -2215,6 +2215,120 @@ def _ksgemv_program(a, w, out, kt, nt, plan):
                    for i in range(max(2, _KSG_SEM + 1))], cbs=cbs)
 
 
+_RECUR_FELL_BACK = False
+_NO_FUSED_RECUR = os.environ.get("TT_FUSED_RECUR", "0") != "1"
+# Bisection knob for the compute kernel; 6 is the whole thing.
+_RECUR_STAGE = int(os.environ.get("TT_RECUR_STAGE", "6"))
+
+
+def _recur_program(state, q, k, kt, v, g, b, out, bh, dkt, dvt):
+    """One core per (head, output column-tile). See `scripts/kernels/recur_*`."""
+    dev = state.device()
+    grid = dev.compute_with_storage_grid_size()
+    n = bh * dvt
+    if n > grid.x * grid.y:
+        raise RuntimeError(f"recurrence wants {n} cores, grid has {grid.x * grid.y}")
+    cols = min(n, grid.x)
+    rows = -(-n // grid.x)
+    crs = ttnn.CoreRangeSet([ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+    used = [ttnn.CoreCoord(c % grid.x, c // grid.x) for c in range(cols * rows)]
+
+    acc = {}
+    for tag, t in (("s", state), ("q", q), ("k", k), ("v", v), ("g", g), ("b", b),
+                   ("kt", kt), ("o", out)):
+        ct = list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        if len(ct) != 2:
+            raise RuntimeError(f"fused recurrence: {tag} must be interleaved")
+        acc[tag] = ct
+    spage, vpage, opage = acc["s"][1], acc["q"][1], acc["o"][1]
+
+    r_args, c_args, w_args = {}, {}, {}
+    for c in used:
+        idx = c.y * grid.x + c.x
+        active = int(idx < n)
+        h, j = (idx // dvt, idx % dvt) if active else (0, 0)
+        r_args[c] = [state.buffer_address(), q.buffer_address(), k.buffer_address(),
+                     v.buffer_address(), g.buffer_address(), b.buffer_address(),
+                     h, j, active, kt.buffer_address()]
+        c_args[c] = [active]
+        w_args[c] = [out.buffer_address(), state.buffer_address(), h, j, active]
+
+    def kern(name, ct, args, cfgd):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs, compile_time_args=ct,
+            runtime_args=[(c, args[c]) for c in used], config=cfgd)
+
+    def cb(idx, tiles, t):
+        page = ttnn.TensorAccessorArgs(t).get_compile_time_args()[1]
+        return ttnn.CBDescriptor(
+            total_size=tiles * page, core_ranges=crs,
+            format_descriptors=[ttnn.CBFormatDescriptor(
+                buffer_index=idx, data_format=t.dtype, page_size=page)])
+
+    cbs = [cb(0, dkt, state), cb(1, dkt, q), cb(2, dkt, k), cb(3, 1, v),
+           cb(4, 1, g), cb(5, 1, b), cb(6, dkt, kt),
+           cb(7, dkt, state), cb(8, 1, state), cb(9, 1, state), cb(10, 1, state),
+           cb(11, 1, state), cb(12, 1, state), cb(13, 1, state), cb(14, dkt, state),
+           cb(16, 1, out), cb(17, dkt, state)]
+
+    return ttnn.ProgramDescriptor(kernels=[
+        kern("recur_reader.cpp",
+             [dkt, dvt, spage, vpage] + acc["s"] + acc["q"] + acc["k"]
+             + acc["v"] + acc["g"] + acc["b"] + acc["kt"],
+             r_args, ttnn.ReaderConfigDescriptor()),
+        kern("recur_compute.cpp", [dkt, _RECUR_STAGE], c_args,
+             ttnn.ComputeConfigDescriptor(fp32_dest_acc_en=True)),
+        kern("recur_writer.cpp", [dkt, dvt, spage, opage] + acc["o"] + acc["s"],
+             w_args, ttnn.WriterConfigDescriptor()),
+    ], semaphores=[], cbs=cbs)
+
+
+def fused_recurrence(state, q, k, kt, v, g_exp, beta, out):
+    """The whole delta rule in one launch, or None.
+
+    `decode_step` is 2.95 ms a token (handoff 45.23) and its cost is
+    materialising `decayed` and `update` -- 786 KB each, written by one launch
+    and read by the next -- not the launch count. This reads the state once,
+    keeps `decayed` in L1, and writes the state once.
+
+    Every operand must already share the state's dtype: a compute kernel
+    configures its unpacker from one circular buffer, so a float32 tile read
+    through a bfloat16 one is garbage (invariant 76). The caller casts.
+    """
+    global _RECUR_FELL_BACK
+    if _NO_FUSED_RECUR:
+        return None
+    try:
+        why = None
+        bh = int(state.shape[0])
+        dkt, dvt = int(state.shape[-2]) // _TILE, int(state.shape[-1]) // _TILE
+        if len(state.shape) != 4 or int(state.shape[1]) != 1:
+            why = f"state is {list(state.shape)}; this path is [BH, 1, Dk, Dv]"
+        elif int(state.shape[-2]) % _TILE or int(state.shape[-1]) % _TILE:
+            why = f"state {list(state.shape)} is not whole tiles"
+        elif any(t.dtype != state.dtype for t in (q, k, kt, v, g_exp, beta)):
+            why = ("operands must share the state's dtype (invariant 76): "
+                   f"state {state.dtype}, q {q.dtype}, k {k.dtype}, "
+                   f"kt {kt.dtype}, v {v.dtype}")
+        if why is not None:
+            if not _RECUR_FELL_BACK:
+                _RECUR_FELL_BACK = True
+                _declined("fused recurrence", why)
+            return None
+        ttnn.generic_op([state, q, k, v, g_exp, beta, kt, out],
+                        _recur_program(state, q, k, kt, v, g_exp, beta, out,
+                                       bh, dkt, dvt))
+        return out
+    except Exception as exc:                                        # noqa: BLE001
+        if not _RECUR_FELL_BACK:
+            _RECUR_FELL_BACK = True
+            _declined("fused recurrence", f"{type(exc).__name__}: {exc}")
+        return None
+
+
 def ksgemv(x, w, key=None):
     """`x @ w` with the reduction split across cores. Or None.
 
