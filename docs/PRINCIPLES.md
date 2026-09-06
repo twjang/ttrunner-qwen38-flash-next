@@ -67,12 +67,20 @@ Measured in one harness, one sequence length, changing only that flag:
 | `selection_active` | median | tok/s |
 |---|--:|--:|
 | False (positions 0..2047) | **32.3 ms** | 31.0 |
-| True (positions >= 2048) | **105.8 ms** | 9.5 |
+| True (positions >= 2048) | **61.5 ms** | 16.3 |
 
-**The selection costs 73.5 ms a token, 69 % of the long-context step.** Every
+**The selection costs ~29 ms a token**, and cost 73.5 until handoff 45.44. Every
 conversation decodes its first 2048 tokens in the cheap regime and everything
 after in the expensive one. A number quoted without its regime is meaningless
 here.
+
+The 44 ms that came out of it is this document's clearest example of 3.1, and of
+a rule worth stating on its own: **`ttnn.topk` is O(nb x k)** -- 4.4 ms for
+k=512 of nb=2048, 9.4 ms of 4096, linear in both, and `sorted=False` changes
+nothing, so it is the *search* and not the sort. It was being run over every
+block in the **allocated** context when only the first `p // ratio` are eligible
+and the rest carry a -inf bias they can never win from. Before reaching for a
+top-k, ask how many candidates can actually be returned.
 
 ### 2.2 Component map of the 32.65 ms step
 
@@ -84,7 +92,7 @@ Single-part ablation, `selection_active = False`:
 | `gated_residual_mix` | **6.68 ms** | 96 invocations a token, ~7 ops each |
 | MoE (48 layers) | **5.67 ms** | already on the wide-expert path |
 | collectives | **3.86 ms** | 181 calls |
-| QSA (12 layers) | **3.66 ms** | plus the 73.5 ms above once selecting |
+| QSA (12 layers) | **3.66 ms** | plus ~29 ms above once selecting |
 | shared expert | 1.18 ms | |
 | `reinject` | 0.04 ms | finished |
 | PLE | 0.03 ms | finished |
