@@ -7749,10 +7749,31 @@ zero tile into it, or restructure the loop to accumulate deliberately the way th
 `predicted` loop does) and re-run `TT_RECUR_VERIFY=1` at seq 2047. If the state
 column drops to ~1e-03, that is the bug and it has been there since 45.24.
 
-INVARIANT 155: `matmul_tiles` accumulates into `dst`. A loop that acquires,
-issues one `matmul_tiles`, and packs is only correct if `dst` starts at zero, and
-`tile_regs_acquire` is not documented here to guarantee that. Seed it, or
-structure the loop so the accumulation is the one you want.
+INVARIANT 155 (**weakened by its own evidence, stated as a lead not a law**):
+`matmul_tiles` accumulates into `dst`, so a loop that acquires, issues one
+`matmul_tiles` and packs is only correct if `dst` starts at zero.
+
+**But the same kernel argues against it.** The `predicted` loop issues four
+`matmul_tiles` in a *single* acquire window and relies on them summing; its
+result feeds `delta`, which feeds `out`, and `out` matches the op chain to
+9.613e-04. If `tile_regs_acquire` left stale data in `dst`, `predicted` would be
+wrong and `out` would not match. So `dst` evidently does start clean there, and
+the outer-product loop -- which acquires per iteration -- should be no worse.
+
+Which leaves the dst hypothesis as the *least bad* remaining one rather than a
+diagnosis, and it may well fall like the four before it. Test it anyway, because
+it is cheap; but note that seeding `dst` with a zero tile means a `copy_tile`
+(SFPU) inside a `matmul_tiles` (FPU) window, which invariant 87 forbids, so the
+fix is a restructure rather than an inserted line.
+
+**Honest status of this hunt.** Five mechanisms have now been proposed,
+committed, and refuted by a subsequent measurement: the transpose, the padding,
+"the state is ~0", the cross-device comparison, and the baked address. What is
+established is narrow and solid -- the output is right, every input is right and
+identical across devices, the pages are owned correctly, and the resulting
+replicated state disagrees across devices by nine times its own magnitude. What
+is not established is why. The next person should distrust any mechanism in this
+section that is not attached to a measurement, including the one above.
 
 **`cb_dec` cannot be probed with STAGE 5, and does not need to be.** STAGE 5
 writes `decayed` out *as* the state, so the state becomes `state * g_exp` every
