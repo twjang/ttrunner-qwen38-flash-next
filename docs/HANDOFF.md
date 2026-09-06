@@ -7146,6 +7146,86 @@ tree is safe. **The `-0.88 / -1.2 / -2.4 ms` figures in 45.24 and 45.25 are
 withdrawn**: every one of them was measured with `selection_active` left True,
 the configuration in which this kernel is silently correct.
 
+### 45.28 The op census was counting a code path that does not ship
+
+`step_op_census.py` is the tool this project aims its fusion work with. It runs
+an **eager** `model.step`, and `TTModel.trace_safe_rings` defaults to `False` --
+only `TracedDecoder` sets it True, before it captures. So the census took the
+host-rotated ring path and **never reached `fused_conv_step`** (model.py:778),
+nor the two other `trace_safe_rings` branches at model.py:1907 and 2405. The
+32 ms every plan is measured against is the *traced* step; the census described a
+different program.
+
+Corrected (`TTRUNNER_TRACE_RINGS`, default 1, and the run now prints which path
+it counted):
+
+| | calls |
+|---|--:|
+| eager path (what it used to report) | 2497 |
+| traced path (what ships) | **2218** |
+
+279 of the calls it attributed to the step do not exist in it -- 144 `multiply`
+and 108 `add` at model.py:803-804 alone, which is the unfused conv tap loop that
+the traced path replaces with one launch.
+
+INVARIANT 146: a census, profile or op count taken from `model.step` is the
+**eager** program unless it sets `trace_safe_rings`. Set it, and print it, or the
+count is of code the shipping step never runs. This is the same defaulting
+failure as invariant 145 (`selection_active`), in a third place: the model has
+several flags whose default is not the shipping value, and every one of them has
+now cost a measurement.
+
+### 45.29 The corrected budget, and where the 32.65 ms is
+
+Traced step, batch 1, `selection_active` False, `max_seq_len` 4096: **32.65 ms**.
+Census on the same path: **2218 calls, 2.73 GB a device**.
+
+    bytes          7.0 ms   2.73 GB at 388 GB/s
+    dispatch       3.1 ms   2218 calls at the 1.4 us traced floor
+    ------------------------------------------------------------
+    accounted     10.1 ms
+    remainder     22.5 ms
+
+And the remainder is located, not merely named. **460 `ttnn.linear` calls carry
+2.197 GB -- 80 % of all bytes moved -- and would take 5.66 ms at full
+bandwidth.** They are most of the step instead, which puts them at roughly a
+quarter of bandwidth. The reason is invariant 38: at M = 1 a matmul whose output
+is `nt` tiles runs on `nt` of 110 cores. The census's own shape list shows it:
+
+| weight tiles | calls | output tiles | cores used |
+|--:|--:|--:|--:|
+| 11520 (`attn_qkv` [2560, 4608]) | 36 | 144 | all 110 |
+| 3840 ([2560, 1536]) | 72 | 48 | 48 |
+| 3200 ([2560, 1280]) | 97 | 40 | 40 |
+| 1600 ([2560, 640]) | 48 | 20 | 20 |
+| 1280 ([2560, 512], the router) | 84 | 16 | **16** |
+
+The right-sizing model in the census puts only **3.94 ms** on the table for all
+2218 ops (and 0.04 ms of that on the 1000 widest), so the small ops are not where
+the 22.5 ms is. It is these five rows.
+
+**Which is exactly what `ksgemv` was built for, and 45.14 closed as buying
+nothing.** That verdict and this budget cannot both be right, and reconciling
+them is the next real piece of work -- not another fusion. Either the k-split's
+in-model measurement was confounded (it was taken against a baseline whose own
+spread is 31.4-33.0, and it was taken before `selection_active` was understood),
+or the 22.5 ms is somewhere the census cannot see.
+
+Call sites, for whoever picks this up (`/tmp/site_dump.json` from the census):
+
+| site | op | calls |
+|---|---|--:|
+| `ops.py:349` / `ops.py:346` | `ttnn.linear` | 460 total |
+| `ops.py:2621` / `2623` | `silu` / `slice` in GRM | 97 / 96 |
+| `ops.py:109` / `104` | `all_reduce` / `all_gather` | 96 / 84 |
+| `linear_attn.py:135,163,164,182,190,193` | the DeltaNet chain | 216 |
+| `moe.py:967,1042,1044` | expert tail | 144 |
+
+`gated_residual_mix` is the largest single consumer -- 96 invocations a token at
+~7 ops each, near 670 of the 2218 -- but its only visible cut is folding `silu`
+and `slice` into `fused_group_sum`, which is two ops and therefore below
+invariant 91's threshold.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite

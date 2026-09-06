@@ -112,6 +112,15 @@ def wrap(mod, name):
 
 
 mesh, cfg, m = open_model(max_seq_len=4096)
+# `TracedDecoder` sets this before it captures, and the traced step is what the
+# 32 ms is measured on -- but `TTModel.trace_safe_rings` defaults to False, so an
+# eager census takes the host-rotated ring path and never reaches
+# `fused_conv_step` (model.py:778) or the other two branches at 1907/2405. Left
+# at the default this script counts a code path that does not ship.
+# TTRUNNER_TRACE_RINGS=0 restores the eager path for comparison.
+import os as _os
+m.trace_safe_rings = _os.environ.get("TTRUNNER_TRACE_RINGS", "1") == "1"
+print(f"RESULT trace_safe_rings {m.trace_safe_rings}", flush=True)
 
 for n in NAMES:
     wrap(ttnn, n)
