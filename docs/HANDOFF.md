@@ -6787,6 +6787,12 @@ INVARIANT 137: DeltaNet's cost is the recurrence, not its projections. 2.95 of
 
 ### 45.24 The fused recurrence: built, correct on device, one step from engaging
 
+> **RETRACTED by 45.27.** The kernel is wrong in the regime the engine
+> actually decodes in (`selection_active = False`, the first 2048 positions of
+> every sequence): 52.4 % top-1 against the op chain's 79.4 %. Every timing
+> figure below was taken with `selection_active` left True, where it is silently
+> correct. Read 45.27 before using anything here.
+
 `scripts/kernels/recur_{reader,compute,writer}.cpp` and `ops.fused_recurrence`
 do the whole delta rule in **one launch**, reading the 786 KB state once and
 writing it once where the chain makes five passes. Against float64 on the
@@ -6832,6 +6838,12 @@ next hours would have gone into a phantom. Invariant 128, earning itself back.
 
 ### 45.25 The fused recurrence in model: -0.88 ms, on the *pessimistic* form
 
+> **RETRACTED by 45.27.** The kernel is wrong in the regime the engine
+> actually decodes in (`selection_active = False`, the first 2048 positions of
+> every sequence): 52.4 % top-1 against the op chain's 79.4 %. Every timing
+> figure below was taken with `selection_active` left True, where it is silently
+> correct. Read 45.27 before using anything here.
+
 Paired and alternating, with the fusion engaged:
 
 | | off | on | diff |
@@ -6866,6 +6878,259 @@ INVARIANT 139: a fused kernel's **output dtype** is part of its interface. Chang
 it and the next fused kernel downstream may silently decline, turning a win into
 a loss -- `reinject` did exactly that here, and only the decline warning made it
 visible. Check what consumes the output before choosing its dtype.
+
+### 45.25a The upstream-dtype route is blocked, and by page size, not dtype
+
+Tried exactly what 45.25 proposes: an opt-in `out_dtype` on `fused_qkv_heads`
+and `fused_delta_scalars`, with model.py asking both for the state's dtype. It
+does not work, and the paragraph above ("costs nothing -- 48 tiles each") is
+**wrong**:
+
+```
+model.py:906: fused qkv heads unavailable, using the ops:
+    RuntimeError: fused qkv heads: every operand must share a page size
+model.py:1964: fused reinject unavailable ...          <- still declines
+RESULT eager  ' UIT闪老赵搭近codPutr%，斋2'              <- garbage
+RESULT traced 'eutsun纳 HIGH cp多 AmxFA RossAO Levin灵'  <- different garbage
+RESULT DIFFER
+```
+
+Two things to take from it.
+
+**`fused_qkv_heads` cannot emit float32 at all.** Its own guard requires every
+operand to share a page size, and a float32 output tile is 4096 bytes against a
+bfloat16 input's 2048. This is a constraint of how that kernel is built -- one
+page size across its CBs -- not a dtype check that can be relaxed by editing the
+guard. So the route dies here regardless of anything downstream.
+
+**And the fallback was not merely slower, it was wrong.** Eager itself produced
+garbage, and eager involves no trace, so this is not a trace-capture artifact.
+With `fused_qkv_heads` declined to the ops path and `fused_delta_scalars`
+emitting float32, the model's output was incoherent. I did not isolate which of
+the two produced the bad numbers -- the route is dead either way -- but the
+lesson stands on its own:
+
+INVARIANT 140: widening a fused kernel's output dtype is not a free, local
+change even when it type-checks and the tensor is tiny. Page size is derived
+from dtype, and page size is a *structural* property of a kernel's CBs. A dtype
+change can therefore trip a page-size guard in the same kernel, and can produce
+**silently wrong numbers rather than a decline or a hang**. Gate any dtype
+change on `traced_vs_eager` MATCH before believing a timing number taken with
+it.
+
+Reverted; `36aab49` is the good state, and `traced_vs_eager` MATCHes there
+(' Paris. The capital of Germany is Berlin. The capital of').
+
+### 45.25b The two handicaps, re-priced -- and both fixes are small
+
+With the upstream route dead, I read the two handicaps again. Neither needs the
+thing 45.25 asked for.
+
+**`reinject` declining is the cheap one, and the fix is one line.** Its guard is
+a *page-size* comparison, not a dtype comparison:
+
+```python
+tile_bytes = acc["h"][1]
+if acc["b"][1] != tile_bytes or acc["o"][1] != tile_bytes:
+    raise RuntimeError("fused reinject wants one dtype for hyper, branch and out")
+```
+
+So it declines only because the fused recurrence hands it a float32 branch where
+`hyper` and `out` are bfloat16. Casting the fused *output* back down at the call
+site -- `return fused_all if fused_all.dtype == v.dtype else ttnn.typecast(...)`
+-- costs one small cast a layer and buys back `reinject`'s fusion for the whole
+rest of the layer. This is not the narrowing *pack* that hung (45.25): the pack
+happens inside the kernel into a float32 CB exactly as now, and the cast is an
+ordinary `ttnn.typecast` afterwards, which is trace-safe.
+
+**The five input casts need one kernel line, not an upstream change.** The CB
+descriptors already carry per-tensor formats (`cb(1, dkt, q)` takes `q.dtype`),
+and almost every init in `recur_compute.cpp` is handed the CBs it operates on --
+`matmul_init(cb_k, cb_dec)`, `init_bcast<ELWMUL,SCALAR>(cb_s, cb_g, cb_dec)`,
+`mul_tiles_bcast_scalar_init_short(cb_diff, cb_b)` -- so each of those already
+reconfigures the unpacker across a dtype boundary. Auditing all of them, mixed
+bfloat16 inputs against a float32 state leaves exactly **one** conflict:
+
+```cpp
+init_sfpu(cb_v, cb_diff);      // configures the unpacker from cb_v ...
+copy_tile(cb_v,    0, 0);
+copy_tile(cb_pred, 0, 1);      // ... but cb_pred is the state's dtype
+```
+
+That is invariant 76 in one spot, fixable with a `reconfig_data_format_srca`
+between the two `copy_tile`s (or by reordering so the float32 CB is the one
+`init_sfpu` sees). Every other `copy_tile` pair -- `(cb_q, cb_k)`,
+`(cb_qdec, cb_upd)`, `(cb_dec, cb_op)` -- is same-dtype under that plan.
+
+Order of work: gate and ship the fused recurrence as it stands first (the casts
+are real but small), then take the `reinject` one-liner, then the kernel audit.
+`recur_check.py` validates the kernel change against float64 with no model load,
+so the third step is cheap to try and cheap to abandon.
+
+**What remains open** is the other direction: leave `q/k/v/g/beta` bfloat16 and
+teach `recur_compute.cpp` to read them against a float32 state. The CB
+descriptors already carry per-tensor formats -- `cb(1, dkt, q)` takes `q.dtype`
+-- so nothing structural forbids it; what invariant 76 actually costs is an
+explicit `reconfig_data_format` at each unpacker switch. That is kernel work,
+not a guard edit. Size the prize first: the casts are 180 launches a token
+(5 x 36) on 48-tile tensors, which at the traced marginal cost of invariant 101
+is nearer 0.15-0.35 ms than the 0.9 ms guessed above.
+
+### 45.26 There are two decode regimes, and I had been measuring only one
+
+Running `bench_step.py` to time the fused recurrence produced 105.7 ms where
+every number in this section says ~32 ms. Neither is wrong; they are different
+regimes, and the difference is `selection_active`.
+
+`indexer_budget = 2048` (from GGUF `attention.indexer.top_k`). Below that
+position the sparse selection is provably a no-op -- at position p there are
+p//4 eligible blocks against a top-k of 512 -- so `TTEngine` starts with
+`selection_active = False` and only flips it at `max(state.positions) + 1 >=
+indexer_budget` (engine.py:801). The two harnesses disagree about this:
+
+| harness | max_seq_len | selection | median |
+|---|--:|---|--:|
+| `cumulative_ablation.py` | 4096 | **explicitly False** | ~32 ms |
+| `bench_step.py` | 8192 | defaults **True** | ~105 ms |
+
+`bench_step.py` steps at position **1000**, which is below the budget, so the
+engine would have selection off there -- but the script never sets the flag and
+`TTModel.selection_active` defaults to True (model.py:138). It therefore pays
+the full `ttnn.topk` over 1024 blocks (22.3 ms across the twelve QSA layers, per
+engine.py:681) to build a mask that is exactly plain causal attention. The
+output is still correct; the time is not representative.
+
+INVARIANT 141: `bench_step.py` measures the *selecting* regime at whatever
+position it steps, because `selection_active` defaults on and the script never
+clears it. Below 2048 that is ~22 ms of provably-useless `topk`. Set the flag to
+match the position being modelled, or state which regime a number belongs to --
+a 32 and a 105 in this document can both be right.
+
+The consequence for the goal is worth being blunt about. The 7.9 ms target is a
+short-context, batch-1 figure, so the ~32 ms regime is the comparable one and
+the road in section 46 stands. But **real long-context decoding is the 105 ms
+regime**, and there the single largest line item is a `topk` that this project
+has already measured at 22.3 ms. Nothing in 45 has touched it.
+
+### 45.27 The fused recurrence is broken in the engine's real decode path
+
+Gating the fused recurrence on `device_quality.py` -- the thing 45.25 said to do
+before flipping its default -- killed it. Scoring the same text, 64 stepped
+tokens, `max_seq_len 8192`, with **`selection_active = False`, which is what
+`TTEngine` actually runs below `indexer_budget`**:
+
+| | top-1 | NLL mean |
+|---|--:|--:|
+| op chain | 79.4 % | 0.794 |
+| fused | **52.4 %** | **4.526** |
+
+That is the common case, not a corner: every conversation decodes its first 2048
+tokens with the selection off, because below the budget it is provably a no-op
+(engine.py:681). The fused recurrence is wrong there.
+
+**How this was nearly missed, and the harness bug that hid it.** Run the same
+comparison with `selection_active` left at its default `True` and the fused path
+scores **81.0 %, NLL 0.781** -- indistinguishable from the op chain. Every
+earlier "the fusion is fine at seq 8192" reading in this section was taken that
+way, because `device_quality.py` never set the flag and `TTModel.selection_active`
+defaults to True (model.py:138). The engine sets it False at low positions; the
+harness did not. `TTRUNNER_SELECTION=0` now models the engine's state, and the
+`RESULT max_seq_len` line prints `selection` so a run says which regime it is.
+
+INVARIANT 145: `selection_active` is a **correctness** variable for anything that
+touches the decode path, not just a performance one. It is False for the first
+2048 positions of every sequence and True after, the two regimes run different
+op graphs, and a kernel can be right in one and wrong in the other. Score both.
+The same defaulting also inflates timing (invariant 141) -- one flag, two ways
+to measure the wrong thing.
+
+**What the failure looks like.** Deterministic (repeated runs agree to three
+decimals), and cumulative in the number of fused layers -- at `max_seq_len 2047`,
+where the selection cannot run at all:
+
+| DeltaNet layers fused | top-1 | NLL |
+|--:|--:|--:|
+| 0 (control) | 79.4 % | 0.794 |
+| 1 | 79.4 % | 0.769 |
+| 9 | 73.0 % | 1.338 |
+| 36 | 22.2 % | 8.557 |
+
+and at 128 stepped tokens it reaches 12.6 %, at 192 it dies with a **bus error**
+inside an ordinary ttnn matmul on a program-cache hit
+(`handle_mesh_adapter_cache_hit` -> `write_program_command_sequence`), i.e. in
+model code downstream, not in `generic_op`.
+
+**Four hypotheses killed, each cleanly.**
+
+INVARIANT 142: a kernel that **writes back state it will read again next step**
+must be validated over a *sequence* of steps, never a single one. Per-step error
+compounds, and the per-step number gives no warning: `recur_check.py` scored this
+kernel at 1.09e-03 against float64 on one step and called it good. A one-shot
+numerical check cannot certify a recurrence.
+
+INVARIANT 143: and the timing harnesses did not catch it either. `traced_vs_eager`
+MATCHed and `bench_step` reported -1.2 ms, because both run ~30 steps from a
+fresh state, at one `max_seq_len`, with `selection_active` left at its default,
+and neither scores the text. **Gate on quality, in the regime the engine
+actually runs, before believing a timing number.**
+
+*Not the arithmetic.* `scripts/dev/recur_seq_check.py` (new) iterates the
+recurrence N steps against a float64 reference in lockstep, feeding each step's
+device state back in -- what invariant 142 demands. At the model's exact shapes
+(BH 12, Dk = Dv = 128, float32), over 64 steps:
+
+| step | op chain | fused |
+|--:|--:|--:|
+| 0 | 7.056e-04 | 8.913e-04 |
+| 15 | 1.850e-04 | 3.681e-04 |
+| 63 | 9.760e-05 | 2.789e-04 |
+
+Fused sits ~2.5x the op chain and **both shrink**. No compounding: the kernel is
+sound in isolation, so the model-level failure is interference.
+
+(That script said nothing until it was fixed: `decode_step` itself takes the
+fused path when `TT_FUSED_RECUR=1`, so the first version ran the same kernel in
+both arms and printed identical columns. INVARIANT 144: an A/B harness whose
+control calls `decode_step` must force `ops._NO_FUSED_RECUR` per arm, because
+the flag is read *inside* the function under test.)
+
+*Not the partial core grid.* The program covers 11x5 of the 11x10 grid, and
+partial `CoreRangeSet` coverage is the known hazard that made `_ksgemv_plan`
+decline such layouts. Rebuilding over the whole grid, inactive cores taking the
+`active == 0` exit, moved the seq-2047 score by nothing: 22.2 %, NLL 8.557,
+identical. Reverted.
+
+*Not ordering.* A `ttnn.synchronize_device` after every fused call, draining the
+queue before anything downstream runs, changed nothing -- 22.2 %, identical to
+three decimals. So it is not a race or a write-after-read hazard.
+
+*Not a single-layer kernel fault.* One fused layer is indistinguishable from the
+control (79.4 %). The damage needs many layers, and grows with them.
+
+**What that leaves.** Deterministic, sync-independent, grid-independent,
+per-layer cumulative, correct in isolation, and switched by whether
+`_indexer_select` runs. The only mechanism consistent with all of it is **device
+memory layout**: `_indexer_select` allocates large temporaries, which moves where
+the 36 lazily-allocated `_recur_out` buffers land, and the kernel is sensitive to
+that. The reader's and writer's page indices check out arithmetically for these
+shapes (`head*DVT + j` for out and v, `head*DKT*DVT + i*DVT + j` for state,
+`head*DKT + i` for q/k/kt, `head` for the scalars, all within bounds), so the
+suspicion is not an index but an *aliasing* one: two of those cached output
+buffers, or an output buffer and something else live, overlapping in one layout
+and not the other.
+
+**Next step**, and it is cheap: `_recur_out` keys its cache on
+`(id(state), shape, dtype)`. `id()` is a Python object address and is **reused
+after garbage collection** -- if any `st.recurrent` is ever replaced, two layers
+can collide on one key and share one output buffer, which is exactly an
+aliasing bug that depends on allocation order. Replace the key with something
+stable and unique per layer, and re-run the `TTRUNNER_SELECTION=0` comparison.
+That is the first thing to try before reading any more kernel assembly.
+
+Until then `TT_FUSED_RECUR` stays defaulted **off**, where it already is, so the
+tree is safe. **The `-0.88 / -1.2 / -2.4 ms` figures in 45.24 and 45.25 are
+withdrawn**: every one of them was measured with `selection_active` left True,
+the configuration in which this kernel is silently correct.
 
 ## 46. Where this leaves the goal, and the order to work in
 

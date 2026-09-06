@@ -77,7 +77,13 @@ TEXT = (
 
 SEQ = int(os.environ.get("TTRUNNER_MAX_SEQ", "512"))
 mesh, cfg, m = open_model(max_seq_len=SEQ)
-print(f"RESULT max_seq_len {SEQ}  indexer {'on' if m.use_indexer else 'off'}", flush=True)
+# TTRUNNER_SELECTION=0 models what `TTEngine` actually does below
+# `indexer_budget`: the indexer wired up but the selection skipped, because
+# below the budget it is provably a no-op (engine.py:681). The default here is
+# `selection_active = True`, which is NOT the engine's state at low positions.
+if os.environ.get("TTRUNNER_SELECTION") == "0":
+    m.selection_active = False
+print(f"RESULT max_seq_len {SEQ}  indexer {'on' if m.use_indexer else 'off'}  selection {m.selection_active}", flush=True)
 tok = tokenizer(cfg)
 ids = tok.encode(TEXT)[:N]
 
