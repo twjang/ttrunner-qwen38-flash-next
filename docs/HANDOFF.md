@@ -7817,10 +7817,24 @@ by a small integer factor while every ingredient is correct.
 | 36 interleaved states, as the model has | 4.187e-01 vs op chain's 4.193e-01 -- **they agree** |
 | 8 junk matmuls between every launch | 4.193e-04, unchanged |
 | operands built bfloat16 then `typecast`, as the model does | 3.204e-04 |
+| model-scale magnitudes **and `g_exp` spanning [0,1] with exact zeros** | 4.774e-03 vs op chain's 1.727e-03 |
 
-None reproduces it. So it is not the number of live states, not dirty memory
-between launches, and not the operands' provenance -- and the debug loop is
-still a 7-minute `device_quality.py` run per probe.
+None reproduces it. The last row matters most: the model's decay reaches exactly
+**0.0**, where this harness's `rand*0.5 + 0.5` never leaves [0.5, 1], and a zero
+decay makes the state the bare outer product -- the one term the kernel computes
+differently from everything else. Even that is clean; both arms simply scale
+with the operands and keep their ~2.8x ratio.
+
+So it is not the number of live states, not dirty memory between launches, not
+the operands' provenance, and not their scale or decay range. **Four attempts,
+four negatives**, and the debug loop is still a 7-minute `device_quality.py` run
+per probe.
+
+What is left that the model has and this harness does not: the other 47 layers'
+programs running between two DeltaNet launches (junk matmuls are not the same
+thing -- the real ones are `all_gather`s, expert gathers, `sdpa_decode`), and a
+device whose DRAM and L1 are full of resident weights rather than nearly empty.
+The second is the harder one to fake and the more likely one to matter.
 
 **Interleaved states do not reproduce it.** `recur_seq_check.py` gained
 `TT_RECUR_LAYERS_SIM=L`, which keeps L independent states and cycles them the way

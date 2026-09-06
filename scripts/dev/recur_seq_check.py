@@ -72,15 +72,32 @@ def main() -> None:
             return max(float((a[:n] - a[i * n:(i + 1) * n]).abs().max())
                        for i in range(1, 4))
 
-        s0 = torch.randn(BH, 1, DK, DV) * 0.1
+        s0 = torch.randn(BH, 1, DK, DV) * (
+            2.0 if __import__("os").environ.get("TT_RECUR_MODELSCALE") == "1"
+            else 0.1)
         # The same operand sequence for every arm, rounded through the device so
         # the float64 reference sees exactly what the kernels see.
         seq = []
+        # `TT_RECUR_MODELSCALE=1` matches what the model actually feeds the
+        # kernel, measured with TT_RECUR_DUMP=1: |fk| 0.99, |fv| 4.38, state
+        # growing to ~6.8, and -- the one this harness could never hit --
+        # **g_exp spanning [0.0000, 1.0000], zeros included**, where the default
+        # here is rand*0.5+0.5 and never leaves [0.5, 1]. A decay of exactly
+        # zero makes `decayed` vanish and the state become the bare outer
+        # product, a regime the standalone has never exercised.
+        MS = __import__("os").environ.get("TT_RECUR_MODELSCALE") == "1"
         for _ in range(STEPS):
-            q = torch.randn(BH, 1, 1, DK) * 0.1
-            k = torch.randn(BH, 1, 1, DK) * 0.1
-            v = torch.randn(BH, 1, 1, DV) * 0.1
-            g = torch.rand(BH, 1, 1, 1) * 0.5 + 0.5
+            if MS:
+                q = torch.randn(BH, 1, 1, DK) * 0.09
+                k = torch.randn(BH, 1, 1, DK) * 0.09
+                v = torch.randn(BH, 1, 1, DV) * 1.4
+                g = torch.rand(BH, 1, 1, 1)          # [0, 1), zeros included
+                g[torch.rand(BH, 1, 1, 1) < 0.25] = 0.0
+            else:
+                q = torch.randn(BH, 1, 1, DK) * 0.1
+                k = torch.randn(BH, 1, 1, DK) * 0.1
+                v = torch.randn(BH, 1, 1, DV) * 0.1
+                g = torch.rand(BH, 1, 1, 1) * 0.5 + 0.5
             b = torch.rand(BH, 1, 1, 1)
             seq.append((q, k, v, g, b))
 
