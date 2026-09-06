@@ -87,6 +87,28 @@ def _verify(state, q, k, v, g_exp, beta, got):
     sb = ttnn.to_torch(ref_state, mesh_composer=ttnn.ConcatMeshToTensor(ref_state.device(), dim=0))
     m = min(sa.shape[0], sb.shape[0])
     ds = float((sa[:m].float() - sb[:m].float()).abs().max())
+    # Decompose the state error by term (handoff 45.35, invariant 152). The
+    # kernel writes `decayed + kt (x) delta`; comparing the fused state against
+    # each term separately says which one is wrong, where comparing against the
+    # op chain only says that something is.
+    pre = _VERIFY_PRE.pop("pristine", None)
+    if pre is not None:
+        def th(t):
+            return ttnn.to_torch(
+                t, mesh_composer=ttnn.ConcatMeshToTensor(t.device(), dim=0)
+            )[:m].to(torch.float64)
+        P, G, K, V, B = th(pre), th(g_exp), th(k), th(v), th(beta)
+        decayed_h = P * G
+        delta_h = (V - K @ decayed_h) * B
+        state_h = decayed_h + K.transpose(-2, -1) @ delta_h
+        f = sa[:m].to(torch.float64)
+        w2 = _VERIFY_WORST
+        w2["vs_full"] = max(w2.get("vs_full", 0.0),
+                            float((f - state_h).abs().max()))
+        w2["vs_decayed"] = max(w2.get("vs_decayed", 0.0),
+                               float((f - decayed_h).abs().max()))
+        w2["outer_mag"] = max(w2.get("outer_mag", 0.0),
+                              float((state_h - decayed_h).abs().max()))
     w = _VERIFY_WORST
     w["out"] = max(w["out"], do)
     w["state"] = max(w["state"], ds)
@@ -94,6 +116,11 @@ def _verify(state, q, k, v, g_exp, beta, got):
     if w["n"] % 360 == 0:
         print(f"RESULT verify after {w['n']} calls: worst out {w['out']:.3e}  "
               f"worst state {w['state']:.3e}", flush=True)
+        if "vs_full" in w:
+            print(f"RESULT   fused state vs host full   {w['vs_full']:.3e}\n"
+                  f"RESULT   fused state vs host decayed {w['vs_decayed']:.3e}\n"
+                  f"RESULT   host |outer| magnitude      {w['outer_mag']:.3e}",
+                  flush=True)
 
 
 _VERIFY_PRE: dict = {}
@@ -194,6 +221,7 @@ def decode_step(
     elif not ops._NO_FUSED_RECUR:
         if os.environ.get("TT_RECUR_VERIFY") == "1":
             _VERIFY_PRE["state"] = ttnn.clone(state)
+            _VERIFY_PRE["pristine"] = ttnn.clone(state)
             if os.environ.get("TT_RECUR_VERIFY_CONTROL") == "1":
                 _VERIFY_PRE["ctrl"] = ttnn.clone(state)
         # The model hands this bfloat16 q/k/v/g/beta against a float32 state, and

@@ -7587,6 +7587,47 @@ probe **every** term of the state expression before believing any one of them.
 This section spent four rounds on the outer product because it was the
 interesting term, and the arithmetic never required that it be the guilty one.
 
+### 45.36 The state is wrong by more than the computation contains
+
+Decomposed it. `_verify` now also rebuilds the whole step on the host in float64
+from a pristine clone of the pre-call state, and compares the fused state
+against each term. At seq 2047, worst over 360 calls:
+
+    fused state vs host full      6.200e+01
+    fused state vs host decayed   6.209e+01
+    host |outer| magnitude        6.830e+00
+
+Read those together. The true outer product's largest element is **6.83**, so a
+kernel that dropped the outer product entirely would be wrong by 6.83. This one
+is wrong by **62** -- and by essentially the same 62 against `decayed` alone and
+against `decayed + outer`.
+
+**So no term of the expression is the answer.** The written state is not
+`decayed`, not `decayed + outer`, and not `decayed` plus a wrong outer product:
+it contains values an order of magnitude larger than anything the step computes.
+That is the signature of *foreign data* -- uninitialised L1, a stale CB page, or
+a write landing at an address that belongs to something else -- rather than of
+arithmetic that is merely incorrect.
+
+Which also explains, at last, why it tracks `_indexer_select`: what the foreign
+data *is* depends on what ran before, and 12 QSA layers of allocations a step
+change that completely. The `inf` and the 62 are the same defect seen through
+two different sets of leftovers.
+
+**Where to look, given that:** not at the arithmetic, which every probe now
+exonerates -- `cb_ktm` is exact, the operands are finite and sane, the output
+matches to 9.613e-04, and the op chain reproduces itself to 0.000e+00. Look at
+the write path: `cb_snew`'s reservation and push, the writer's page indices
+(`head*DKT*DVT + i*DVT + j` against a 192-page state), and whether every one of
+the 48 active cores writes exactly the four pages it owns and no others. A core
+writing another core's pages would produce precisely this -- values that are
+real, but belong somewhere else.
+
+INVARIANT 153: an error much **larger** than any term of the expression is not a
+numerical bug. Stop looking at the maths. Something is reading or writing memory
+it does not own, and the question is which core and which page -- not which
+formula.
+
 **Next step**, and it is small: read one `kt` tile back with `to_torch` and see
 where the data sits. If it is in row 0, the fix is either `transpose_wh_tile` in
 the compute kernel (the codebase already uses it) or dropping `kt` entirely and
