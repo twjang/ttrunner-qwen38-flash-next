@@ -7706,10 +7706,26 @@ replicated state diverge from each other by 62.** Replicated operands, a
 replicated program, and the same 48-core layout on every device should give four
 identical states. They do not.
 
-INVARIANT 154: check per-device agreement on any replicated tensor a
-`generic_op` writes. A replicated computation that disagrees across devices is
-reading something that is not replicated -- and no amount of reasoning about the
-arithmetic will find it, because the arithmetic is the same on all four.
+**RETRACTED, same session.** The DeltaNet state is **not replicated**:
+
+    self.n_v_local = config.linear_num_v_heads // self.n_dev     # model.py:158
+
+The v-heads are split across the four devices, so each holds twelve *different*
+heads and `st.recurrent` legitimately differs device to device. The
+"device0-vs-device1 spread of 62" is the model working correctly, and the
+standalone's spread of 0.000e+00 is only because `recur_seq_check.py` builds its
+state with `ReplicateTensorToMesh`. There is no per-device divergence to explain.
+
+INVARIANT 154 (rewritten): before reading a mesh tensor's device-to-device
+difference as a defect, check whether it is replicated or **sharded**. A name
+like `n_v_local` is the tell. This section spent a round treating a sharded
+state's expected spread as the signature of a bug.
+
+What survives from that round is narrower but still real: sliced to device 0
+alone -- twelve heads that device genuinely owns -- the fused state is wrong by
+the same 6.200e+01. So the error is not a comparison artifact, and it is not
+per-device divergence either. It is simply wrong, on each device, in its own
+heads.
 
 That reframes the whole hunt. Everything verified so far -- `decayed` via the
 output, `cb_ktm` via STAGE 7, the page ownership, the operands -- was verified
@@ -7729,10 +7745,10 @@ six operands in the model's own allocation order:
 
 All four devices agree on every one. Hypothesis dead.
 
-**So every input is bit-identical across devices and the program is identical,
-and the output still diverges.** The only thing left that can differ per device
-is L1 the kernel *reads without having written* -- leftovers from whatever ran on
-that core before, which are per-device by nature.
+**So every input is bit-identical across devices and the program is identical.**
+With the sharding understood there is no cross-device mystery left to explain --
+only the original one: on its own twelve heads, with correct inputs, the kernel
+writes a state nine times too large.
 
 The specific suspect that fits every measurement: `tile_regs_acquire()` does not
 zero the destination registers, and the outer-product loop packs `dst0`

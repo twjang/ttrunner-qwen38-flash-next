@@ -56,6 +56,22 @@ def main() -> None:
         def back(t):
             return ttnn.to_torch(t, mesh_composer=comp)[:BH].to(torch.float64)
 
+        def spread(t):
+            """Do the four devices agree on a *replicated* tensor?
+
+            Handoff 45.38: in the model the fused recurrence's state disagrees
+            across devices by nine times its own magnitude. Every check in this
+            script so far read `[:BH]` -- device 0 alone -- so it could not have
+            seen that. If the spread is nonzero here, this file is the fast
+            reproduction the hunt has been missing.
+            """
+            a = ttnn.to_torch(t, mesh_composer=comp).to(torch.float64)
+            n = a.shape[0] // 4
+            if n == 0:
+                return 0.0
+            return max(float((a[:n] - a[i * n:(i + 1) * n]).abs().max())
+                       for i in range(1, 4))
+
         s0 = torch.randn(BH, 1, DK, DV) * 0.1
         # The same operand sequence for every arm, rounded through the device so
         # the float64 reference sees exactly what the kernels see.
@@ -119,7 +135,7 @@ def main() -> None:
                 else:
                     got = la.decode_step(dq, dk, dv_, dg, db, st)
                 errs.append(float((back(got) - ref_outs[i]).abs().max()))
-            return errs, back(sts[0])
+            return errs, back(sts[0]), spread(sts[0])
 
         base = arm(False)
         fus = arm(True)
@@ -127,8 +143,10 @@ def main() -> None:
         if fus is None:
             print("RESULT fused recurrence declined -- see the warning above")
             return
-        base_errs, base_state = base
-        fus_errs, fus_state = fus
+        base_errs, base_state, base_spread = base
+        fus_errs, fus_state, fus_spread = fus
+        print(f"RESULT device spread   op chain {base_spread:.3e}   "
+              f"fused {fus_spread:.3e}", flush=True)
 
         print(f"RESULT steps {STEPS}   out error by step "
               f"(op chain -> fused)", flush=True)
