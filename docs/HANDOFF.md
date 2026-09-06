@@ -7455,6 +7455,69 @@ Two readings, and they have not been separated yet:
 chain. The state column must then read ~0. If it reads 62, the verifier is
 wrong and 45.33's numbers say nothing about the kernel.
 
+### 45.34 The verifier is sound, and `kt`'s data is not in the column the kernel reads
+
+45.33 asked whether the probe or the kernel was wrong. Settled: with
+`TT_RECUR_VERIFY_CONTROL=1` both arms run the op chain on separate clones of the
+same pre-call state, and over 360 calls
+
+    worst out 0.000e+00   worst state 0.000e+00
+
+exactly. The verifier is sound and the state errors it reports are real.
+
+Then the mask, at seq 2047, over the same 360 calls:
+
+| `cb_mask` | worst `state` | |
+|---|--:|---|
+| all **ones** (identity) | **inf** | reproduces the pre-mask kernel exactly |
+| **column 0** only | 6.200e+01 | |
+| all **zeros** | 6.200e+01 | outer product contributes nothing |
+
+The identity mask reproducing `inf` proves the mask multiply is faithful -- the
+new CBs, the SFPU window and the indexed pack all work. And then the column-0
+mask lands on **the same number as the all-zeros mask**: keeping only column 0
+of `kt` keeps nothing.
+
+**So `kt`'s real data is not in column 0, and the outer product has never been an
+outer product.** `recur_reader.cpp` says as much, in a comment that reads as
+reassurance and is actually the bug:
+
+```
+// kt is [Dk, 1]: Wt is 1, so tile (i, 0) is page head*DKT + i, the same
+// index as k's.
+```
+
+The *page index* being the same as `k`'s is true. What was assumed and never
+checked is that the tile's **contents** were transposed. `k` is
+`[BH, 1, 1, Dk]` -- one row, data along row 0. `kt` is `[BH, 1, Dk, 1]` -- one
+column, data expected along column 0. If `ttnn.transpose(fk, -2, -1)` does not
+materialise a transposed tile, page `head*DKT + i` of `kt` holds `k`'s tile,
+data still in **row 0**. Then
+
+    result[a,b] = sum_c kt[a,c] * delta[c,b]
+
+is a *dot product* in row 0 and garbage in rows 1..31 -- which is exactly an
+infinite state, exactly a state that does not change when the outer product is
+zeroed, and exactly a column-0 mask that keeps nothing.
+
+INVARIANT 151: `matmul_tiles` reads a tile's **contents**, and a ttnn shape
+change is not a promise about them. Before treating tile (i,0) of a transposed
+tensor as a column, verify it on device -- `to_torch` one tile and look. The
+comment in `recur_reader.cpp` reasoned from the page *index* to the page
+*contents* and was wrong for eight sessions of work built on top of it.
+
+**Next step**, and it is small: read one `kt` tile back with `to_torch` and see
+where the data sits. If it is in row 0, the fix is either `transpose_wh_tile` in
+the compute kernel (the codebase already uses it) or dropping `kt` entirely and
+transposing `k`'s tile in place -- the reader's extra `kt` read then goes away
+too. Gate on `TT_RECUR_VERIFY=1` at seq **2047**: the state column must come
+back near 1e-03.
+
+Everything in 45.24 through 45.27 -- "correct on device", the -0.88 ms, the
+-1.2 ms -- rests on a kernel whose central expression was never the operation it
+was documented to be. `recur_check.py` missed it because a single step's *output*
+is pad- and layout-insensitive, and the output is all it scored until 45.27.
+
 The mask stays in -- it is strictly more correct than assuming pad contents, and
 `TT_FUSED_RECUR` is off by default so it is dormant. Invariant 150 stands on its
 own: the infinity was real and the assumption that produced it was real.

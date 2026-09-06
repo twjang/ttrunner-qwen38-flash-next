@@ -70,6 +70,15 @@ def _verify(state, q, k, v, g_exp, beta, got):
     if ref_state is None:
         return
     ref_out = decode_step(q, k, v, g_exp, beta, ref_state, _no_fuse=True)
+    if os.environ.get("TT_RECUR_VERIFY_CONTROL") == "1":
+        # Control (handoff 45.33): compare the op chain against *itself* on a
+        # second clone of the same pre-call state. Both arms are then the same
+        # deterministic computation, so every column must read ~0. Anything else
+        # is the probe, not the kernel.
+        ctrl = _VERIFY_PRE.pop("ctrl", None)
+        if ctrl is not None:
+            got = decode_step(q, k, v, g_exp, beta, ctrl, _no_fuse=True)
+            state = ctrl
     a = ttnn.to_torch(got, mesh_composer=ttnn.ConcatMeshToTensor(got.device(), dim=0))
     b = ttnn.to_torch(ref_out, mesh_composer=ttnn.ConcatMeshToTensor(ref_out.device(), dim=0))
     n = min(a.shape[0], b.shape[0])
@@ -160,6 +169,8 @@ def decode_step(
     elif not ops._NO_FUSED_RECUR:
         if os.environ.get("TT_RECUR_VERIFY") == "1":
             _VERIFY_PRE["state"] = ttnn.clone(state)
+            if os.environ.get("TT_RECUR_VERIFY_CONTROL") == "1":
+                _VERIFY_PRE["ctrl"] = ttnn.clone(state)
         # The model hands this bfloat16 q/k/v/g/beta against a float32 state, and
         # one compute kernel configures its unpacker from one circular buffer
         # (invariant 76), so they have to agree. Casting here is the *measurable*

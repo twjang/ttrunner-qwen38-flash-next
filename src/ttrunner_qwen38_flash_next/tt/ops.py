@@ -2242,6 +2242,9 @@ def _recur_col_mask(like):
         t[..., :, 0] = 1.0
         if os.environ.get("TT_RECUR_MASK_ZERO") == "1":
             t[...] = 0.0        # diagnostic: does the mask path apply at all?
+        if os.environ.get("TT_RECUR_MASK_ONES") == "1":
+            t[...] = 1.0        # diagnostic: identity mask -- must reproduce
+                                # the pre-mask behaviour (state inf) exactly.
         got = ttnn.from_torch(t, dtype=like.dtype, layout=ttnn.TILE_LAYOUT,
                               device=like.device(),
                               mesh_mapper=ttnn.ReplicateTensorToMesh(like.device()))
