@@ -118,12 +118,18 @@ sequence length, changing only that flag:
 | `selection_active` | ms/step | tok/s |
 |---|--:|--:|
 | False — positions 0..2047 | **32.3** | 31.0 |
-| True — positions >= 2048 | **105.8** | 9.5 |
+| True — positions >= 2048 | **61.5** | 16.3 |
 
-So the *attention* is budget-limited at 2048 selected tokens, but **the selection
-itself costs 73.5 ms a token**, 69 % of the long-context step. Long context costs
-memory *and* time, and a batch-1 number quoted without its regime says little.
-The `ms/step` column below is the below-budget regime.
+So the *attention* is budget-limited at 2048 selected tokens, but the selection
+itself still costs ~29 ms a token. Long context costs memory *and* time, and a
+batch-1 number quoted without its regime says little. The `ms/step` column below
+is the below-budget regime.
+
+(105.8 ms until `docs/HANDOFF.md` 45.44. `ttnn.topk` there is O(nb x k) — 4.4 ms
+for k=512 of nb=2048, twelve QSA layers a token — and it was searching every
+block in the allocated context when only the first `p // 4` can ever be
+selected; the rest carry a -inf bias. Restricting the search to the eligible
+prefix is **-44 ms** with next-token accuracy identical to the digit.)
 
 ### Where the 32 ms goes, and how far the roofline is
 
