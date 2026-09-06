@@ -7872,6 +7872,39 @@ The mask stays in -- it is strictly more correct than assuming pad contents, and
 `TT_FUSED_RECUR` is off by default so it is dormant. Invariant 150 stands on its
 own: the infinity was real and the assumption that produced it was real.
 
+### 45.39 The biggest lever is behind a reproducible hang
+
+45.29 left a contradiction: the budget puts ~22.5 ms in 460 `ttnn.linear` calls
+running at about a quarter of bandwidth, while 45.14 closed `ksgemv` -- which
+targets exactly those -- as buying nothing. 45.14's verdict came from single
+runs compared against a baseline whose own spread is 31.4-33.0, so it could not
+have resolved a 0.5-1 ms effect. Re-ran it properly, alternating, three pairs:
+
+| rep | ksgemv off | `TT_KSG_WIDE=router` |
+|---|--:|---|
+| 1 | 32.65 | **HUNG** |
+| 2 | 32.44 | **HUNG** |
+| 3 | 31.42 | **HUNG** |
+
+**Three of three.** The baseline arm completed every time, so this is not the
+machine. Against 45.14's own pooled base rate of ~12 %, 3-of-3 is p = 0.0017.
+
+45.14 recorded `router` at **0 hangs in 8** and used that to argue the site was
+stable and merely useless. In this tree it hangs every time. Either something
+since has changed it, or that sample was lucky in the way 45.14's own invariant
+131 warns about -- and the sample sizes cannot separate those.
+
+**The consequence for the goal is the point.** The largest identified lever in
+the step -- the narrow-output GEMVs that hold most of the 22.5 ms -- cannot even
+be *evaluated* right now, because the only mechanism built to address them hangs
+the traced capture on contact. Not "measured and rejected": unmeasurable.
+
+INVARIANT 156: `ksgemv` at the `router` site hangs the trace 3/3 in this tree
+while the baseline runs clean 3/3. Fixing that hang is the gating task for the
+biggest remaining lever, and it is a prerequisite for ever settling 45.29's
+contradiction. Do not re-close the k-split on 45.14's numbers -- they were taken
+when the site still ran.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
