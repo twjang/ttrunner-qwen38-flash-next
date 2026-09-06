@@ -7919,11 +7919,37 @@ path and poking group 0's head semaphore -- **cannot fire here**. The comment in
 `_ksgemv_program` even names this plan as one of the ones that runs.
 
 So the current hang is a *different* defect from the one that section closed,
-and the guard that fixed 45.10 does not cover it. That is where the next
-session should start: not by re-deriving the plan, which is correct, but by
-bisecting what 48 identical `ksgemv` programs in one capture do that one does
-not -- 45.14 already observed the instability scaling with program count, and
-that observation is the last live thread on it.
+and the guard that fixed 45.10 does not cover it.
+
+**Bisected against program count.** `TT_KSG_MAX=N` (new) caps how many *call
+sites* get a `ksgemv` program, selected by `key` so the captured graph is the
+same every step:
+
+| `ksgemv` programs in the capture | result |
+|--:|---|
+| 4 | runs, 33.02 ms |
+| 16 | **HUNG** |
+| 48 (all of `router`) | **HUNG** |
+
+**The hang is a function of how many `ksgemv` programs are in one capture, and
+the threshold is in (4, 16].** That turns 45.14's qualitative "it scales with
+program count" into something bisectable, and it is the concrete handle the next
+session needs: capture with 8 and 12, find the exact edge, then look at what is
+allocated per program -- five CBs and `max(2, _KSG_SEM+1)` semaphores over the
+whole 110-core grid, every one of them replicated per program in the trace.
+
+INVARIANT 157: `ksgemv`'s trace hang is a **capacity** failure, not a logic one.
+One program runs, four run, sixteen do not. Whatever is exhausted scales with
+programs x (CBs + semaphores) x cores, so the fix is either fewer programs
+(share one descriptor across layers -- the weights differ, but the *shape* does
+not) or a smaller per-program footprint. Bisecting the kernel logic will not
+find it.
+
+**And it still buys nothing where it runs.** Four sites gave 33.02 ms against a
+baseline of 31.4-32.7 -- no gain, if anything slightly worse. Four of 48 layers
+is only 8 % of the router's calls, so this cannot refute 45.29's 22.5 ms on its
+own; but it is one more reading that does not support the k-split, taken this
+time with a stable capture instead of a single run.
 
 ## 46. Where this leaves the goal, and the order to work in
 

@@ -2363,6 +2363,22 @@ def fused_recurrence(state, q, k, kt, v, g_exp, beta, out):
         return None
 
 
+# Handoff 45.39: `TT_KSG_WIDE=router` hangs the capture 3/3, and it is not the
+# idle-core bug -- the router's plan covers all 110 cores. 45.14 observed the
+# instability scaling with the number of `ksgemv` programs in the capture, and
+# the router contributes one per layer (48). `TT_KSG_MAX=N` caps how many get
+# built, so the capture can be bisected against that count.
+# Counting *calls* does not work: the counter is process-global, the warmup
+# steps consume the budget before the capture, and every arm then runs with
+# ksgemv effectively off -- which is exactly what the first attempt measured
+# (4, 16 and 48 all returned a clean ~32-33 ms because none of them had a
+# single ksgemv program in the captured step). Select by **call site** instead:
+# `key` carries the weight's identity, so the same layers are chosen every
+# step and the captured graph is stable.
+_KSG_MAX = int(os.environ.get("TT_KSG_MAX", "0"))
+_ksg_sites: dict = {}
+
+
 def ksgemv(x, w, key=None):
     """`x @ w` with the reduction split across cores. Or None.
 
@@ -2376,6 +2392,13 @@ def ksgemv(x, w, key=None):
     global _KSG_FELL_BACK
     if _NO_KSGEMV:
         return None
+    if _KSG_MAX and key is not None:
+        slot = _ksg_sites.get(key)
+        if slot is None:
+            slot = len(_ksg_sites)
+            _ksg_sites[key] = slot
+        if slot >= _KSG_MAX:
+            return None
     try:
         why = None
         if len(x.shape) != 4 or x.shape[0] != 1 or x.shape[1] != 1:
