@@ -14,7 +14,9 @@ import ttrunner_qwen38_flash_next.tt.moe as moe
 import ttrunner_qwen38_flash_next.tt.model as mm
 import ttrunner_qwen38_flash_next.tt.linear_attn as la
 
-ORDER = sys.argv[1].split(",") if len(sys.argv) > 1 else []
+# `""` for the baseline, the way every runner in scratchpad passes it:
+# `"".split(",")` is `[""]`, not `[]`, and that was a KeyError.
+ORDER = sys.argv[1].split(",") if len(sys.argv) > 1 and sys.argv[1] else []
 mesh, cfg, m = open_model(max_seq_len=4096)
 m.selection_active = False
 

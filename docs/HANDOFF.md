@@ -6659,6 +6659,39 @@ optimistic bound, the probe is eager rather than traced, and 45.14 is the
 standing warning that adding `generic_op` programs to the traced step
 destabilises it. The build is justified; it is not de-risked.
 
+### 45.22 The "6.11 ms floor" does not exist: everything outside the layers is 0.47 ms
+
+The component decomposition (43, and quoted through 44 and 46) ends with an
+irreducible **6.11 ms** after moe, shared, grm, deltanet, qsa, reinject and ple
+are all stubbed. That row has been read for two sessions as "the embedding, the
+LM head, the final norm and sampling", and at 19 % of the step it was the largest
+thing nobody had decomposed. `cumulative_ablation.py` has a `layers` stub that
+replaces the whole 48-layer loop with identity and had never been run:
+
+| | base | `layers` stubbed |
+|---|--:|--:|
+| rep 1 | 32.30 | **0.47** |
+| rep 2 | 33.06 | **0.47** |
+
+**0.47 ms, identical twice.** So the embedding upload, the final
+`gated_residual_mix`, the LM head and greedy sampling cost *half a millisecond
+between them*, and the 48 layers are 31.8 of the 32.3.
+
+The 6.11 ms was never out-of-layer work. It is `_layer`'s own glue with every
+component stubbed -- the residual adds, `reinject`, and the ~97 slices the stubs
+themselves introduce -- which 5.4 suspected in passing and nobody measured. It is
+an artifact of the *method*, and subtracting it from anything was wrong.
+
+INVARIANT 136: a cumulative ablation's residue is not a component. Stubbing
+every named piece leaves the scaffolding that called them, and here that
+scaffolding was mistaken for a 6 ms fixed cost. If a decomposition has an
+"irreducible" row, stub the *container* and find out.
+
+Two consequences. There is no out-of-layer overhead to attack -- that lever is
+gone before it was ever priced. And the accounting in 44.2 has to lose its floor
+term, which means the step is more concentrated in the layers than this file has
+been assuming, not less.
+
 ## 46. Where this leaves the goal, and the order to work in
 
 The step began this session at 32.08 ms (31.2 tok/s) and the composite
