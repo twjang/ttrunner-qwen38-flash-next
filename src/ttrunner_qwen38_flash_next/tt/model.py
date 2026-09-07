@@ -2486,19 +2486,27 @@ class TTModel:
         """
         k = self.cfg.conv_kernel
         depth = k - 1
-        # The decode path keeps this window as a *ring* of single [1,1,C,1]
-        # columns, so prefill has to speak the same representation: it consumes
-        # the ring left by any earlier chunk and leaves one the decode step can
-        # pick up. (Before this it took a single [1,1,C,k-1] tensor and died in
-        # concat the moment the two paths met.)
+        # Prefill has to leave behind the ring a *decode* step will pick up, and
+        # since the row-form conv landed that ring is [1,1,1,C] rows, not the
+        # [1,1,C,1] columns this chunk works in. The chunk's own arithmetic is
+        # channel-major either way -- the window is built by concatenating along
+        # the position axis -- so the orientation is converted at the two ends
+        # and nothing in between changes. Leaving columns here is what made
+        # `prefill` unusable ahead of a traced decoder: the handoff died in
+        # `_causal_conv_step` with "conv ring is [1,1,C,1] ... wants rows".
+        rows = not _NO_ROW_CONV
         if state is None:
+            shape = (1, 1, 1, channels) if rows else (1, 1, channels, 1)
             state = [
-                ttnn.zeros((1, 1, channels, 1), dtype=ttnn.bfloat16,
+                ttnn.zeros(shape, dtype=ttnn.bfloat16,
                            layout=ttnn.TILE_LAYOUT, device=self.mesh)
                 for _ in range(depth)
             ]
+        prior = self._ring_oldest_first(state, step)
+        if rows:
+            prior = [ttnn.transpose(t, -2, -1) for t in prior]
         # oldest first, then this chunk: [1,1,C,depth+seq]
-        window = ttnn.concat([*self._ring_oldest_first(state, step), x], dim=-1)
+        window = ttnn.concat([*prior, x], dim=-1)
         acc = None
         # Keyed by layer, like the decode path. Keyed by channel count alone (as
         # this was), every DeltaNet layer after the first silently reused layer
@@ -2517,6 +2525,8 @@ class TTModel:
             ttnn.slice(window, (0, 0, 0, total - depth + i), (1, 1, channels, total - depth + i + 1))
             for i in range(depth)
         ]                                   # oldest .. newest
+        if rows:
+            cols = [ttnn.transpose(t, -2, -1) for t in cols]
         new_step = step + seq
         # `state` is the ring this chunk consumed; writing back into it keeps the
         # buffers where a captured trace expects them.
@@ -2901,10 +2911,18 @@ class TTModel:
                 moe_chunk: int = 32, deltanet_batch: int = 1):
         """Consume a prompt in chunks; returns the final hidden state for the last token.
 
-        **Not verified yet -- do not wire this into the engine.** It runs, and it
-        is worth having: 128 prompt tokens in 5.77 s against 65.15 s through the
-        decode path, 11.3x, which is the difference between a 100k-token prompt
-        being minutes or hours.
+        `TTEngine` uses this when `chunked_prefill` is on, releasing and
+        recapturing the decode trace around the call. Measured through that path
+        at batch 1: 117 tok/s at 1984 prompt tokens, 188 at 4032, 157 at 8128 --
+        against ~30 tok/s stepping the same prompt through the decode path.
+
+        The handoff back to decode is the part that has actually bitten. Both
+        paths keep the DeltaNet conv window as a ring, but decode's is row form
+        (`[1, B, 1, C]`, what the projection produces) and this path works
+        channel-major -- so `_causal_conv_chunk` converts at its two ends. It
+        used to leave columns, which took out the whole path: with a decoder
+        already built the ring concat failed `shapes_match`, and without one the
+        first traced step failed with "conv ring is [1,1,C,1] ... wants rows".
 
         Status (2026-09-02, per-layer bisection against the decode path on a
         4-token prompt; `self.probe` is the hook, `docs/HANDOFF.md` the recipe):

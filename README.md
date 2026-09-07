@@ -8,12 +8,67 @@ n-gram embedding, and hyper-connections in place of every layer norm).
 |---|---|---|
 | 1 | download the 4-bit checkpoint | **done** — UD-IQ4_XS, 93.68 GB, verified |
 | 2 | plain PyTorch CPU reference engine | **done** — token-exact vs llama.cpp |
-| 3 | ttnn engine + custom kernels + async core | **done** — 107.6 tok/s at batch 64; bit-exact vs single-sequence up to batch 32 |
-| 4 | OpenAI-compatible server | **done** — streaming, continuous batching, 70.3 tok/s at 32 concurrent |
+| 3 | ttnn engine + custom kernels + async core | **done** — 31.3 tok/s at batch 1, short context |
+| 4 | OpenAI-compatible server | **done** — streaming, continuous batching, chunked prefill |
 
 ## Measured performance
 
-Re-measured from scratch; see the table this section is being rebuilt around.
+**Batch 1, traced, at a genuinely filled context.** This model is served to a
+coding agent, so batch 1 *is* the product and the batch axis is not measured:
+one user, one stream, latency per token. Each row prefills a real prompt through
+`TTModel.prefill` and then times `TracedDecoder.step` at that position, median
+of 15 after 3 warm-up steps (`scripts/dev/bench_matrix.py <ctx>`).
+
+| context | position | QSA selection off | QSA selection on |
+|---|---|---|---|
+| 256 | 192 | **31.99 ms** · 31.3 tok/s | not built below the budget |
+| 2048 | 1984 | **34.93 ms** · 28.6 tok/s | not built below the budget |
+| 4096 | 4032 | **39.74 ms** · 25.2 tok/s | 67.26 ms · 14.9 tok/s |
+| 8192 | 8128 | **45.77 ms** · 21.9 tok/s | 105.80 ms · 9.5 tok/s |
+
+The engine chooses the column: below `indexer_budget` (2048) it decodes with the
+selection off, above it on. The right-hand column is therefore what a long
+session actually costs, and the two columns together are the price of the
+sparse-attention path -- 60 ms a token at 8192, more than the entire rest of the
+model.
+
+End to end through `TTEngine.generate` -- scheduling, sampling, detokenisation
+and the async loop on top of the same step (`bench_matrix.py <ctx> --e2e`):
+
+| context | e2e | vs the step alone |
+|---|---|---|
+| 256 | 35.50 ms · 28.2 tok/s | +3.5 ms |
+| 2048 | 39.76 ms · 25.2 tok/s | +4.8 ms |
+
+Those are the runs that returned. **`TTEngine.generate` hangs intermittently**
+-- the identical ctx-256 command produced 35.50 ms twice and then hung for 30
+minutes -- so the two rows above are single successful samples, not a
+characterisation, and 4096/8192 have none yet. `TracedDecoder` at the same
+contexts is entirely reliable, so the fault is the engine's loop around the
+step, not the step; `docs/PRINCIPLES.md` 6b has what is known and the false
+trail it laid first. This path was dead code until the conv-ring fix below, so
+it has never run before.
+
+Prefill, measured on the same runs: 117 tok/s at 1984 tokens, 188 at 4032,
+157 at 8128 -- roughly 5x the rate the same prompt would cost stepped through
+the decode path.
+
+### How to read these
+
+Two things make a decode number mean nothing if they are not stated, and both
+were got wrong here before they were got right.
+
+**The position, not the allocation.** A context opened at 8192 but decoded from
+position 0 runs a *different amount of work* than the same graph at position
+8128: the paged attention reads fewer pages, and the indexer's `topk` searches
+only the blocks a position could have filled. Measured at position 0 the
+8192 selection-on step reads 61 ms; at 8128 it is 105.8 ms. Only the second is
+a number a user would experience.
+
+**Which regime.** `selection_active` is a Python bool the trace bakes at
+capture, and it defaults on while the engine runs it off below the budget. A
+timing taken with the default that then gets compared against an engine
+measurement is comparing two different models.
 
 ### Pointing an agent harness at it
 
@@ -114,6 +169,8 @@ src/ttrunner_qwen38_flash_next/
   server/     OpenAI-compatible FastAPI app (backend-agnostic)
 scripts/      codebook generation, Telegram progress notifier
   dev/        the measurement harnesses. The ones to reach for first:
+                bench_matrix.py         the table above: one traced batch-1
+                                        step per context, function or --e2e
                 bench_step.py           batch-1 step, eager and traced
                                         (TTRUNNER_SELECTION=0 for the
                                         below-budget regime; pass a seq length,

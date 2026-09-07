@@ -369,19 +369,19 @@ h3[id]{scroll-margin-top:2rem}
 <li><a href="#c-05"><span class="n">07</span><span>트레이스와 연속 배칭의 상태 관리</span></a></li>
 <li><a href="#c-06"><span class="n">08</span><span>QSA: 선택은 생략해도 상태는 유지한다</span></a></li>
 <li><a href="#c-07"><span class="n">09</span><span>MoE와 커널 최적화: 적게 옮기고 넓게 계산한다</span></a></li>
-<li><a href="#c-09"><span class="n">10</span><span>현재 성능과 다음 과제</span></a></li>
+<li><a href="#c-09"><span class="n">10</span><span>측정 결과를 읽는 법과 다음 과제</span></a></li>
 <li><a href="#c-map"><span class="n">부록</span><span>코드를 읽기 위한 안내</span></a></li></ol></nav>
 <div class="shell"><main id="content">
 <header class="masthead">
 <p class="eyebrow">Tenstorrent Blackhole · 모델 이식과 최적화</p>
 <h1>네 장의 블랙홀</h1>
-<p class="dek">Qwen3.8-Flash-Next를 128 GB 메모리에 배치하고, QSA 선택을 생략하는 구간의 단일 사용자 디코딩을 토큰당 약 32 ms까지 줄였다. 그 설계를 이해하는 데 필요한 하드웨어 원리와 정확성의 함정, 효과가 있었던 최적화를 정리했다.</p>
+<p class="dek">Qwen3.8-Flash-Next를 Blackhole 네 장에 옮기며 확인한 아키텍처, 메모리 배치, 정확성의 경계와 디코드 최적화 원칙을 정리했다. 성능 수치는 배치 1을, 각 문맥을 실제로 채운 위치에서 다시 측정한 값이다.</p>
 <p class="byline"><span>Qwen3.8-Flash-Next · UD-IQ4_XS</span><span>4 × p150a · 128 GB</span><span>2026-09-06 · HANDOFF 46까지</span></p>
 </header>
 <div class="stats" aria-label="주요 결과">
-<div class="stat"><b>32.3 ms</b><span>배치 1 · QSA 선택 꺼짐 · 캐시 길이 8192</span></div>
-<div class="stat"><b>61.5 ms</b><span>배치 1 · QSA 선택 켜짐 · 후보 범위 최적화 적용</span></div>
-<div class="stat"><b>−44.0 ms</b><span>QSA 후보 범위 축소 · 선택 경로 A/B</span></div>
+<div class="stat"><b>31.99 ms</b><span>배치 1 · 문맥 256 · 위치 192</span></div>
+<div class="stat"><b>45.77 ms</b><span>배치 1 · 문맥 8192를 채운 위치 8128 · 선택 off</span></div>
+<div class="stat"><b>105.80 ms</b><span>같은 위치 · 선택 on</span></div>
 </div>
 <nav class="toc" aria-label="차례"><h2>차례</h2><ol><li><a href="#c-00"><span class="n">01</span><span>모델과 메모리부터 이해하기</span></a></li>
 <li><a href="#c-arch"><span class="n">02</span><span>아키텍처: 기억하고, 찾아보고, 나누어 계산하기</span></a></li>
@@ -392,7 +392,7 @@ h3[id]{scroll-margin-top:2rem}
 <li><a href="#c-05"><span class="n">07</span><span>트레이스와 연속 배칭의 상태 관리</span></a></li>
 <li><a href="#c-06"><span class="n">08</span><span>QSA: 선택은 생략해도 상태는 유지한다</span></a></li>
 <li><a href="#c-07"><span class="n">09</span><span>MoE와 커널 최적화: 적게 옮기고 넓게 계산한다</span></a></li>
-<li><a href="#c-09"><span class="n">10</span><span>현재 성능과 다음 과제</span></a></li>
+<li><a href="#c-09"><span class="n">10</span><span>측정 결과를 읽는 법과 다음 과제</span></a></li>
 <li><a href="#c-map"><span class="n">부록</span><span>코드를 읽기 위한 안내</span></a></li></ol></nav>
 <section class="chapter" id="c-00"><div class="chapter-head"><p class="chapter-tag">01</p><h2 class="chapter-title">모델과 메모리부터 이해하기</h2><p class="standfirst">카드에 무엇을 올리고 무엇을 남길지 정하려면, 먼저 모델이 토큰 하나를 만들 때 실제로 사용하는 데이터를 알아야 한다.</p></div><div class="band">
 <p>목표는 Qwen3.8-Flash-Next의 GGUF 체크포인트를 Blackhole p150a 네 장에서 실행하고, 단일 사용자의 생성 속도를 높이는 것이었다. 카드마다 GDDR6 메모리가 32 GB씩 있어 전체 용량은 128 GB다. 선택한 UD-IQ4_XS 체크포인트는 약 93.7 GB지만, 파일이 들어간다는 사실만으로 실행 메모리가 충분하다고 판단할 수는 없다. 디바이스 형식으로 변환한 가중치에 캐시, 순환 상태, 임시 버퍼까지 더해야 한다.</p>
@@ -521,14 +521,15 @@ S = S̄ + kᵀ @ 보정량
 <section class="chapter" id="c-06"><div class="chapter-head"><p class="chapter-tag">08</p><h2 class="chapter-title">QSA: 선택은 생략해도 상태는 유지한다</h2><p class="standfirst">긴 문맥에서는 선택 규칙의 정확성과 선택을 적용하는 비용을 함께 다뤄야 한다.</p></div><div class="band">
 <p><a href="#arch-qsa">QSA의 두 단계 구조</a>를 구현할 때는 인덱서 상태 갱신, 블록 선택, 본 어텐션을 구분한다. 선택을 생략해도 되는 구간과, 생략하면 안 되는 상태 갱신을 나누는 것이 첫 번째 최적화다.</p>
 <p>선택 예산보다 짧은 구간에서는 모든 유효 블록이 선택된다. 이때 점수 계산, top-k, 선택 마스크 구성을 생략해도 인과 어텐션과 결과가 같다. 그러나 인덱서의 키 투영, 링 갱신, 블록 캐시 쓰기는 계속 수행해야 한다. 예산을 넘어 처음 선택하는 순간에 과거 블록이 준비되어 있어야 하기 때문이다.</p>
-<p>선택을 켜고 끄는 조건이 파이썬 분기라면 트레이스에는 캡처 당시 경로만 남는다. 구현은 예산 경계에서 트레이스를 다시 캡처해 선택 경로로 전환했다. 이 비용은 길어지는 시퀀스마다 한 번 발생한다. 최신 비교에서는 <code>max_seq_len=8192</code>와 배치 1을 고정하고 이 플래그만 바꾸었을 때 32.3 ms와 61.5 ms가 측정됐다. 따라서 최적화 뒤 선택 경로의 추가 비용은 약 29 ms다. 약 32 ms라는 수치는 모든 문맥 길이의 생성 속도를 뜻하지 않는다.</p>
+<p>선택을 켜고 끄는 조건이 파이썬 분기라면 트레이스에는 캡처 당시 경로만 남는다. 구현은 예산 경계에서 트레이스를 다시 캡처해 선택 경로로 전환했다. 이 비용은 길어지는 시퀀스마다 한 번 발생한다. 실제 프롬프트를 prefill해 캐시를 채운 뒤 배치 1로 이 플래그만 바꾸면, 위치 4032에서 39.74 ms와 67.26 ms, 위치 8128에서 45.77 ms와 105.80 ms가 측정된다. 즉 선택 경로의 추가 비용은 28 ms에서 60 ms로 <em>위치와 함께 자란다</em>. 약 32 ms라는 수치는 짧은 문맥 하나의 값일 뿐, 모든 문맥 길이의 생성 속도가 아니다.</p>
 <aside class="trap"><p class="trap-label">주의할 점</p><p><strong>선택 여부는 품질 검사에도 명시한다.</strong> 선택을 켠 경로와 끈 경로는 서로 다른 그래프다. QSA 자체와 무관해 보이는 커널 변경도 두 경로에서 모두 검증한다. 하네스는 엔진의 실제 설정과 위치를 따르고, 결과에 <code>selection_active</code>, 캐시 길이, 배치를 함께 기록한다.</p></aside>
 <h3>선택한 K/V만 작은 창으로 다시 주소화한다</h3>
 <p>선택된 블록은 페이지드 K/V 캐시의 작은 페이지 테이블로 다시 배열한다. 본 어텐션이 읽는 폭은 선택 예산 2048토큰과 현재의 미완성 블록을 담는 여유분으로 고정된다. 전체 캐시는 그대로 보존하지만 SDPA는 이 압축된 창만 읽으므로, 문맥이 길어져도 본 어텐션의 폭은 커지지 않는다.</p>
 <p>조밀 마스크의 scatter 인덱스는 uint16이라 65,536 위치를 넘길 수 없다. 압축 창은 선택된 페이지만 수천 칸 안에서 다시 주소화해 이 한계를 피하고, 모델의 설정상 최대 문맥 262,144토큰까지 선택 경로를 유지한다. 같은 페이지가 여러 슬롯에 나타날 때도 각 슬롯이 맡은 4토큰만 열어 중복 계산을 막는다.</p>
 <h3>top-k에는 이길 수 있는 후보만 보낸다</h3>
 <p>선택 경로의 가장 큰 병목은 <code>ttnn.topk</code>였다. 이 연산은 후보 수와 <code>k</code>에 모두 비례하며, <code>k=512</code>에서 후보 2048개는 QSA 레이어마다 약 4.4 ms, 후보 4096개는 약 9.4 ms가 걸렸다. 기존 구현은 보이지 않는 블록에 음의 무한대를 주고도 할당된 전체 문맥을 검색했다.</p>
-<p>현재 위치에서 완전히 보이는 후보만 잘라 검색하도록 바꾸자, 길이 8192의 선택 경로가 105.5 ms에서 61.5 ms로 44.0 ms 줄었다. 검색 폭은 트레이스 shape의 종류를 제한하도록 2의 거듭제곱으로 올린다. 64토큰 A/B에서 이전 경로와 새 경로는 top-1 79.4%, top-5 96.8%, NLL 0.794로 같았고, traced와 eager도 토큰 단위로 일치했다.</p>
+<p>현재 위치에서 완전히 보이는 후보만 잘라 검색하도록 바꿨다. 검색 폭은 트레이스 shape의 종류를 제한하도록 2의 거듭제곱으로 올린다. 64토큰 A/B에서 이전 경로와 새 경로는 top-1 79.4%, top-5 96.8%, NLL 0.794로 같았고, traced와 eager도 토큰 단위로 일치했다.</p>
+<p>다만 이 변경의 효과는 <em>위치에 달려 있고</em>, 처음 보고한 105.5 → 61.5 ms는 위치 0 근처에서 잰 값이었다. 비율이 4이므로 위치 p에서 후보는 <code>p // 4</code>개다. 8192를 실제로 채운 위치 8128에서는 2048개 블록 중 2032개가 후보라서 잘라낼 것이 남지 않고, 두 경로 모두 105.8 ms로 같다. 최적화 자체는 옳고 비용이 없으며 문맥 앞부분에서는 실제로 이득이지만, 44 ms라는 헤드라인은 측정 조건의 산물이었다. 위치에 따라 작업량이 달라지는 변경은 사용자가 실제로 있을 위치에서 재야 한다.</p>
 <aside class="trap"><p class="trap-label">주의할 점</p><p><strong>후보, 미완성 블록, 패딩을 서로 구분한다.</strong> top-k에는 실제로 이길 수 있는 완성 블록만 넣고, 현재의 미완성 블록은 별도로 포함한다. 빈 선택 슬롯이 토큰 0을 가리키거나 패딩이 어텐션에 열리지 않게 마스크를 구성한다.</p></aside>
 <aside class="trap"><p class="trap-label">주의할 점</p><p><strong>국소 시간을 전체 이득으로 옮겨 쓰지 않는다.</strong> 마스크를 만드는 두 원소별 연산은 따로 재면 토큰당 약 5.3 ms였지만, 이를 접은 전체 스텝은 0.2 ms만 줄었다. 변경은 되돌렸다. 채택 여부는 실제 그래프의 짝지은 A/B로 정한다.</p></aside>
 </div></section>
@@ -563,17 +564,23 @@ down:    전문가별 활성값과 가중치를 축소 축으로 연결
 <p><code>ttnn.generic_op</code>으로 작성한 커널은 보통 읽기, 계산, 쓰기 세 부분으로 구성된다. 파이썬에서 코어 범위와 서큘러 버퍼를 지정하고, 토큰마다 변하는 전문가 인덱스는 디바이스 입력 텐서로 전달한다. 이렇게 하면 하나의 트레이스가 서로 다른 라우팅 결과를 처리할 수 있다.</p>
 <aside class="trap"><p class="trap-label">주의할 점</p><p><strong>유휴 코어도 명시적으로 처리한다.</strong> 코어 수에 맞춰 작업 계획을 패딩했다면 세 커널 모두 작업 없음 조건을 따라야 한다. 읽기만 생략하고 계산·쓰기를 계속하면 남아 있던 값을 출력 타일에 쓰거나 여러 코어가 같은 주소에서 경쟁할 수 있다. 실제 출력, 반복 실행의 결정성, 커널이 호출되었는지를 함께 확인한다.</p></aside></div></section>
 <aside class="note" id="c-08"><p class="note-num">현재 성능에서 제외한 경로</p><h3>추측 디코딩은 다시 검증하기 전까지 보류한다</h3><p><code>step_n</code>의 k=2·4·8 경로가 현재 코드에서 예외로 종료되므로, 과거의 추측 디코딩 속도는 최신 성능에 포함하지 않는다. 복구할 때는 채택된 접두사만큼 DeltaNet 상태와 컨볼루션 링을 전진시키는지 전체 생성으로 다시 확인해야 한다. prompt-lookup은 문맥을 되풀이하는 입력에 편향되므로 실제 요청 분포의 채택률도 함께 측정한다.</p></aside>
-<section class="chapter" id="c-09"><div class="chapter-head"><p class="chapter-tag">10</p><h2 class="chapter-title">현재 성능과 다음 과제</h2><p class="standfirst">배치 1 디코드는 QSA 선택 전후에 32.3 ms와 61.5 ms다. 숫자마다 실행 경로와 문맥 위치를 붙여 읽어야 한다.</p></div><div class="band">
-<p>현재 목표는 한 시퀀스의 단일 토큰 지연이다. 약 32 ms는 QSA 선택 예산에 도달하기 전의 값이고, 선택이 시작되면 약 61.5 ms로 늘어난다. 추가 목표인 7.9 ms, 약 127 tok/s에 이르는 검증된 구현 경로는 아직 없다.</p>
+<section class="chapter" id="c-09"><div class="chapter-head"><p class="chapter-tag">10</p><h2 class="chapter-title">측정 결과를 읽는 법과 다음 과제</h2><p class="standfirst">배치 1을, 실제 프롬프트로 채운 문맥에서 하나의 하네스로 다시 측정했다. 이 코딩 에이전트용 API에서는 배치 1이 곧 제품이므로 배치 축은 재지 않는다.</p></div><div class="band">
+<p>저장소의 기존 성능표에는 서로 다른 세션, 설정과 하네스에서 얻은 값이 섞여 있었다. 아래는 하나의 코드 상태에서, 각 문맥마다 실제 프롬프트를 prefill한 뒤 그 위치에서 <code>TracedDecoder.step</code>을 15회 측정한 중앙값이다.</p>
+<figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">문맥</th><th scope="col">위치</th><th scope="col">선택 off</th><th scope="col">선택 on</th></tr></thead><tbody>
+<tr><td>256</td><td>192</td><td><b>31.99 ms</b> · 31.3 tok/s</td><td>예산 아래라 경로 자체가 없음</td></tr>
+<tr><td>2048</td><td>1984</td><td><b>34.93 ms</b> · 28.6 tok/s</td><td>예산 아래라 경로 자체가 없음</td></tr>
+<tr><td>4096</td><td>4032</td><td><b>39.74 ms</b> · 25.2 tok/s</td><td>67.26 ms · 14.9 tok/s</td></tr>
+<tr><td>8192</td><td>8128</td><td><b>45.77 ms</b> · 21.9 tok/s</td><td>105.80 ms · 9.5 tok/s</td></tr>
+</tbody></table></div><figcaption>엔진은 위치가 예산(2048)을 넘으면 오른쪽 열로 전환한다. 따라서 긴 세션의 실제 비용은 오른쪽 열이다. prefill은 같은 실행에서 1984토큰 117 tok/s, 4032토큰 188 tok/s, 8128토큰 157 tok/s였다.</figcaption></figure>
+<p><strong>같은 그래프라도 위치가 다르면 작업량이 다르다.</strong> 8192로 열어 두고 위치 0에서 재면 paged attention이 읽는 페이지가 적고, 인덱서의 <code>topk</code>도 그 위치가 채울 수 있었던 블록만 뒤진다. 선택 경로는 위치 0에서 61 ms, 위치 8128에서 105.8 ms다. 사용자가 겪는 값은 뒤쪽이다.</p>
 <figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">측정 조건</th><th scope="col">결과</th><th scope="col">의미</th></tr></thead><tbody>
-<tr><td>배치 1, 캐시 길이 8192, QSA 선택 꺼짐</td><td>32.3 ms · 31.0 tok/s</td><td>예산 아래의 엔진 경로</td></tr>
-<tr><td>같은 조건, QSA 선택 켜짐</td><td>61.5 ms · 16.3 tok/s</td><td>후보 범위 최적화 적용 뒤 선택 경로</td></tr>
-<tr><td>QSA 후보 범위 축소</td><td>105.5 → 61.5 ms</td><td>품질 지표와 traced/eager 토큰 일치 유지</td></tr>
+<tr><td>QSA 선택 off/on</td><td>45.77 ↔ 105.80 ms</td><td>배치 1·8192를 실제로 채운 위치 8128에서 플래그만 변경</td></tr>
+<tr><td>QSA 후보 범위 축소</td><td>가득 찬 문맥에서는 0 ms</td><td>품질은 동일. 이득은 문맥 앞부분에 한정된다</td></tr>
 <tr><td>복합 all-reduce 채택</td><td>평균 −0.45 ms</td><td>다섯 쌍 모두 단축; 품질·결정성 통과</td></tr>
 <tr><td>트레이스 경로 호출 집계</td><td>2218회 · 디바이스당 약 2.73 GB</td><td>배치 1, 선택 꺼짐; 호출 수와 실행 수는 구분</td></tr>
-</tbody></table></div><figcaption>서로 다른 시점의 절대값과 개선 폭을 더해 새 최고 기록을 만들지 않았다. 선택 on/off는 같은 하네스와 캐시 길이에서 비교했고, 작은 변경은 같은 프로세스의 짝지은 A/B로 평가했다.</figcaption></figure>
-<h3>현재 병목은 레이어 안에 있다</h3>
-<p>배치 1, 캐시 길이 4096, 선택 꺼짐의 32.65 ms 스텝에서 부품을 하나씩 대체해 비용을 비교했다. DeltaNet이 가장 크고, 네 잔차를 혼합하는 하이퍼 커넥션과 MoE가 뒤를 이었다.</p>
+</tbody></table></div><figcaption>절대값과 개선 폭을 다른 측정 묶음에 이어 붙이지 않았다. 성능 행렬은 traced 경로에서 배치 1과 문맥 256·2048·4096·8192를, 각 문맥을 실제로 채운 위치에서 측정한다.</figcaption></figure>
+<h3>기존 병목 지도는 다음 실험의 출발점이다</h3>
+<p>배치 1, 캐시 길이 4096, 선택 off에서 측정한 한 시점의 절제 결과다. 최신 종합 성능표는 아니지만, DeltaNet과 잔차 혼합, MoE가 어디에 시간을 쓰는지 보여 준다.</p>
 <figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">부품</th><th scope="col">대체 전후의 시간 차이</th><th scope="col">해석</th></tr></thead><tbody>
 <tr><td>DeltaNet 36개 레이어</td><td>8.36 ms</td><td>그중 재귀는 별도 측정에서 약 2.95 ms</td></tr>
 <tr><td>잔차 혼합</td><td>6.68 ms</td><td>정규화·투영·통신·게이트를 포함</td></tr>
@@ -585,7 +592,7 @@ down:    전문가별 활성값과 가중치를 축소 축으로 연결
 <p>이 수치는 부품 하나씩을 대체한 조건부 차이다. 부품 사이의 통신과 입력 준비가 겹치므로 합산해 전체 시간을 만들 수 없다. 대체 코드가 남긴 작업도 포함되므로 마지막 잔여 시간을 고정 오버헤드나 하드웨어 하한으로 해석하지 않는다.</p>
 <h3>현재 기본 경로와 실험 경로를 구분한다</h3>
 <figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">경로</th><th scope="col">상태</th><th scope="col">판정 근거</th></tr></thead><tbody>
-<tr><td>단일 사용자 디코드 트레이스</td><td>기본 사용</td><td>eager와 토큰 일치; 545.98 → 약 32.0 ms</td></tr>
+<tr><td>단일 사용자 디코드 트레이스</td><td>기본 사용</td><td>eager와 토큰 일치; 같은 프로세스 A/B에서 큰 이득</td></tr>
 <tr><td>QSA 예산 전 선택 생략·후보 prefix·압축 K/V 창</td><td>기본 사용</td><td>경계 및 선택 경로 품질 검사 통과</td></tr>
 <tr><td>복합 all-reduce</td><td>기본 사용</td><td>다섯 쌍 모두 단축; 품질·결정성 통과</td></tr>
 <tr><td><code>ksgemv</code></td><td><code>[2560, 352]</code>에만 사용</td><td>확장 적용은 이득이 없거나 트레이스 용량 문제 발생</td></tr>
@@ -596,7 +603,7 @@ down:    전문가별 활성값과 가중치를 축소 축으로 연결
 <p>배치, 캐시 길이, 현재 위치, QSA 선택 여부와 트레이스 설정을 결과에 함께 기록한다. 워밍업 뒤 반복하고, 작은 변경은 순서를 번갈아 같은 프로세스에서 비교한다. 국소 커널 배속, 호출 수 감소, 바이트 절감은 후보를 고르는 근거일 뿐 채택 근거는 전체 스텝의 A/B와 품질 검사다.</p>
 <p>배치 1의 좁은 행렬곱은 출력 타일이 적어 모든 코어와 대역폭을 쓰지 못한다. 캐시 파일로 센 가중치는 디바이스당 약 3.17 GB, 실제 트레이스 호출 집계는 약 2.73 GB지만 두 수치는 범위가 다르다. 바이트를 최대 대역폭으로 나눈 값은 이상적인 하한이며, 그만큼 줄이면 시간이 같은 비율로 줄어든다는 뜻은 아니다.</p>
 <h3>남은 큰 과제</h3>
-<p>선택 경로는 8192토큰에서 61.5 ms까지 줄었지만, <code>topk</code>의 후보 수는 현재 위치와 함께 계속 늘어난다. 262,144토큰의 설정을 지원한다는 사실과 그 위치에서 실용적인 지연을 얻는 것은 별개의 문제다. 다음 QSA 개선은 고정된 2048토큰의 본 어텐션보다 커지는 후보 검색을 겨냥해야 한다.</p>
+<p>선택 경로는 8192를 채운 위치에서 105.8 ms이고, <code>topk</code>의 후보 수는 현재 위치와 함께 계속 늘어난다. 262,144토큰의 설정을 지원한다는 사실과 그 위치에서 실용적인 지연을 얻는 것은 별개의 문제다. 다음 QSA 개선은 고정된 2048토큰의 본 어텐션보다 커지는 후보 검색 자체를 겨냥해야 한다 — 검색 범위를 줄이는 것으로는 가득 찬 문맥에서 얻을 것이 없다는 사실이 방금 확인됐다.</p>
 <p>넓은 all-reduce 84회는 모델 안에서 약 2.2 ms를 차지한다. 사용자 fabric 경로는 두 카드에서 합산 정확성을 확인했지만, 실제 네 카드는 <code>0–1–3–2–0</code> 링으로 연결되며 중계 노드를 넣은 세·네 카드 체인은 멈춘다. 다중 칩 중계를 먼저 고친 뒤 모델에 연결하고 두 QSA 실행 경로의 품질을 다시 확인해야 한다.</p>
 <aside class="trap"><p class="trap-label">주의할 점</p><p><strong>fabric에서는 전송 시간과 값, 실제 배선을 함께 검증한다.</strong> 전송 API는 DRAM 주소가 아니라 L1 데이터를 사용한다. 논리적 <code>MeshShape</code>도 물리 연결을 보장하지 않는다. 두 카드에서 맞는 합과 빠른 단독 프로브만으로 네 카드 collective의 정확성이나 이득을 주장할 수 없다.</p></aside>
 <p>좁은 출력 GEMV에도 큰 시간이 남지만, 현재 <code>ksgemv</code> 확장은 네 프로그램에서 이득이 없었고 16개부터 트레이스가 멈췄다. 프로그램마다 큰 스트리밍 버퍼를 예약해 L1을 소모하는 것이 유력한 원인이다. 다시 시도한다면 버퍼를 전체 청크가 아니라 파이프라인 깊이에 맞춰 줄인 뒤, 실제 모델에서 이득이 생기는지부터 확인해야 한다.</p>
@@ -605,7 +612,7 @@ down:    전문가별 활성값과 가중치를 축소 축으로 연결
 <section class="chapter" id="c-map"><div class="chapter-head"><p class="chapter-tag">부록</p><h2 class="chapter-title">코드를 읽기 위한 안내</h2><p class="standfirst">구현을 더 살펴볼 때 필요한 파일과 검증 도구만 모았다.</p></div><div class="band"><figure class="wide"><div class="tablewrap"><table><thead><tr><th scope="col">영역</th><th scope="col">파일</th><th scope="col">담당 내용</th></tr></thead><tbody><tr><td>체크포인트</td><td><code>gguf/reader.py</code>, <code>gguf/quants.py</code></td><td>GGUF 읽기와 역양자화</td></tr><tr><td>기준 구현</td><td><code>reference/model.py</code>, <code>reference/layers.py</code></td><td>CPU 모델, DeltaNet과 QSA 규칙</td></tr><tr><td>변환·배치</td><td><code>tt/plan.py</code>, <code>tt/convert.py</code>, <code>tt/blockfloat.py</code></td><td>정밀도·샤딩 정책, 레이아웃 변환과 시뮬레이션</td></tr><tr><td>모델 연산</td><td><code>tt/model.py</code>, <code>tt/moe.py</code>, <code>tt/ops.py</code></td><td>전체 실행, 전문가 계산, 정규화와 게이트</td></tr><tr><td>DeltaNet</td><td><code>tt/linear_attn.py</code>, <code>tt/deltanet.py</code></td><td>디코드 재귀, 프리필 준비와 블록 역행렬</td></tr><tr><td>실행 관리</td><td><code>tt/traced.py</code>, <code>tt/engine.py</code></td><td>캡처, 입력 버퍼, 슬롯·접두사·추측 실행</td></tr><tr><td>사용자 커널</td><td><code>scripts/kernels/</code></td><td>데이터 이동과 융합 연산, gnorm1_*와 ksgemv_* 커널</td></tr><tr><td>품질·결정성</td><td><code>device_quality.py</code>, <code>determinism_check.py</code></td><td>다음 토큰 평가와 반복 실행 비교</td></tr><tr><td>성능 분석</td><td><code>ab_step.py</code>, <code>cumulative_ablation.py</code>, <code>marginal_op_cost.py</code>, <code>linear_shape_census.py</code></td><td>A/B 측정, 누적 절제, 한계 비용과 행렬곱 shape별 분석</td></tr><tr><td>추가 커널 검증</td><td><code>group_norm_check.py</code>, <code>ksgemv_check.py</code>, <code>recur_seq_check.py</code>, <code>fabric_reduce_check.py</code></td><td>정규화·K-split, 연속 상태 갱신, 카드 간 합산 검증</td></tr><tr><td>경계 검사</td><td><code>moe_rows_check.py</code>, <code>row_tile_boundary_check.py</code></td><td>행별 일관성과 타일 경계 검사</td></tr></tbody></table></div><figcaption>모듈 경로는 src/ttrunner_qwen38_flash_next/ 기준이다. 검증 스크립트는 scripts/dev/ 아래에 있다.</figcaption></figure></div></section>
 <footer class="end">
 <p>근거: <a href="PRINCIPLES.md">PRINCIPLES.md</a>, <a href="HANDOFF.md">HANDOFF.md의 1–46절</a>, <a href="iterations/">iterations/001–023</a>, <a href="roadmap_low_batch.md">roadmap_low_batch.md</a>, <a href="upstream/trace_alternation_hang.md">트레이스 교대 재생 분석</a>. 2026-09-06 기준 HANDOFF 46절과 그 안에 추가된 45.40–45.44절까지 반영했다. 현재 기본 경로, 조건별 측정값, 검증 중인 실험을 구분했다.</p>
-<p>수치는 원문과 작업 기록에 보고된 결과다. 이 문서 개정에서 하드웨어 벤치마크를 다시 실행하지는 않았다. 빌드에 따른 제약과 측정 조건은 해당 본문에 명시했다.</p>
+<p>수치는 원문과 작업 기록에 보고된 조건별 결과다. 이 문서 개정에서 하드웨어 벤치마크를 다시 실행하지 않았으며, 최신 종합 성능표는 통일된 측정 행렬이 완성된 뒤 갱신한다.</p>
 </footer>
 </main></div>
 <script>

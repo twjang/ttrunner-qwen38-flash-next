@@ -62,25 +62,34 @@ a no-op — at position p there are `p // 4` eligible blocks against a top-k of
 512 — so `TTEngine` runs with `selection_active = False` and only flips it at
 `max(positions) + 1 >= indexer_budget`.
 
-Measured in one harness, one sequence length, changing only that flag:
+Measured in one harness at a *filled* context, changing only that flag:
 
-| `selection_active` | median | tok/s |
-|---|--:|--:|
-| False (positions 0..2047) | **32.3 ms** | 31.0 |
-| True (positions >= 2048) | **61.5 ms** | 16.3 |
+| context | position | selection off | selection on |
+|---|--:|--:|--:|
+| 4096 | 4032 | **39.74 ms** | **67.26 ms** |
+| 8192 | 8128 | **45.77 ms** | **105.80 ms** |
 
-**The selection costs ~29 ms a token**, and cost 73.5 until handoff 45.44. Every
+**The selection costs 28-60 ms a token and the cost grows with position.** Every
 conversation decodes its first 2048 tokens in the cheap regime and everything
-after in the expensive one. A number quoted without its regime is meaningless
-here.
+after in the expensive one. A number quoted without its regime *and its
+position* is meaningless here.
 
-The 44 ms that came out of it is this document's clearest example of 3.1, and of
-a rule worth stating on its own: **`ttnn.topk` is O(nb x k)** -- 4.4 ms for
-k=512 of nb=2048, 9.4 ms of 4096, linear in both, and `sorted=False` changes
-nothing, so it is the *search* and not the sort. It was being run over every
-block in the **allocated** context when only the first `p // ratio` are eligible
-and the rest carry a -inf bias they can never win from. Before reaching for a
-top-k, ask how many candidates can actually be returned.
+That last clause is the correction handoff 45.44 needed. **`ttnn.topk` is
+O(nb x k)** -- 4.4 ms for k=512 of nb=2048, 9.4 ms of 4096, linear in both, and
+`sorted=False` changes nothing, so it is the *search* and not the sort. Running
+it over every block in the **allocated** context when only the first
+`p // ratio` are eligible is genuinely wasted work, and slicing to the eligible
+prefix genuinely removes it -- but only while the context is not yet full. At
+p = 8128 with ratio 4, `p // ratio` is 2032 of 2048 blocks: the slice rounds up
+to the whole thing and buys nothing. The 105.5 -> 61.5 ms that was reported for
+it was measured near position 0, where three quarters of the search really is
+skippable. Re-measured at a filled 8192 the two arms are the same 105.8 ms.
+
+The optimisation is kept: it is correct, it is free, and it does help early in a
+context. What is withdrawn is the headline. The lesson is 4.x's, sharpened --
+**an ablation whose effect depends on position must be measured at the position
+the user will be at**, and a harness that decodes from an empty cache into a
+large allocation will flatter exactly the changes that scale with fill.
 
 ### 2.2 Component map of the 32.65 ms step
 
@@ -341,6 +350,57 @@ Each was closed by measurement, and the measurement is in `HANDOFF.md`:
 * **extending the k-split to more call sites** — no measurable gain, and it
   destabilises the capture in proportion to how many programs are added;
 * **merging collectives**, **replicating `hc_down`**, **`TT_GG_COLS=1`**.
+
+## 6b. `TTEngine.generate` hangs intermittently, and the false trail it laid
+
+**The defect.** The engine's e2e path does not reliably return. It is *not* a
+function of context length, prompt length, or anything else that has been found
+to correlate. The same command, run twice, does both things:
+
+| ctx | prompt | result |
+|---|--:|---|
+| 256 | 192 | 35.50 ms/token |
+| 256 | 192 | 35.50 ms/token (again) |
+| 256 | 192 | **hung**, killed at 30 min |
+| 2048 | 1984 | **hung**, killed at 25 min |
+| 2048 | 192 | **hung**, killed at 2 min (abandoned) |
+| 2048 | 1984 | 39.76 ms/token, in 35 s |
+
+`TracedDecoder` at the same contexts and positions is entirely reliable -- the
+whole function-only table in the README was taken that way, and
+`device_quality.py` runs in 37 s. So it is the engine's loop around the step,
+not the step. Chunked prefill's release-and-recapture of the trace, and the
+async engine thread, are where to look; note that this path was dead code until
+the conv-ring fix, so it has never actually run before.
+
+**The false trail, which is the more useful part.** Before the intermittency was
+visible, the same evidence supported a clean and completely wrong conclusion:
+ctx 256 worked, ctx 2048 hung, ctx 2048 with a *short* prompt also hung --
+therefore "the trigger is context size, not prompt length". It had a
+discriminating experiment, a sharp boundary and a consistent mechanism. It was
+an artifact of two runs that happened to fall on either side.
+
+Then `device_quality.py` -- 48 eager decode steps, no prefill, sharing no code
+with the engine -- also timed out at 30 minutes, and the cards were drawing
+109-118 W with nothing attached. That was a third state: the cards had been left
+wedged by `kill -9` through a live trace, which several of these runs used to
+free the device. After `tt-smi -r all` the gate ran in 37 s. So some of the
+hangs were the machine and some were the engine, and *from inside a single run
+the two are indistinguishable*.
+
+What to take from it:
+
+* **Reset the cards after a hard kill.** Otherwise the next hour measures the
+  kill. Prefer letting a run hit its own timeout.
+* **A clean bisection is not evidence.** Before believing one, run a control:
+  something known-good, in the same window, that the hypothesis says should be
+  unaffected. Here that control existed (`device_quality.py`) and running it
+  earlier would have saved an hour.
+* **Never conclude from one run per cell** when the failure mode is a hang. Both
+  the "context size" story and its retraction came from single samples.
+* `PYTHONUNBUFFERED=1` whenever the process may be killed: Python block-buffers
+  stdout into a file and loses it on SIGTERM, so the log ends at device init and
+  reads as a much earlier hang than it was.
 
 ## 7. What the target needs, honestly
 
